@@ -389,9 +389,28 @@ SONG_PROMPTS = {
     'song_saved_listen': 'להאזנה לרשימה עכשיו, הקישו 1. לחיפוש שיר נוסף, הקישו 2.',
     'lib_pick': 'הקישו את מספר הרשימה, ואז סולמית. לחזרה לתפריט הראשי, הקישו 0 וסולמית.',
     'lib_bad': 'אין רשימה עם המספר הזה. הקישו מספר רשימה, ואז סולמית. לחזרה לתפריט הראשי, הקישו 0 וסולמית.',
+    'song_name_offer': 'רוצים לתת שם לרשימה? להקלטת שם, הקישו 1. להמשך בלי שם, הקישו 2.',
+    'name_rec': 'אמרו את שם הרשימה אחרי הצליל, ולסיום הקישו סולמית.',
+    'name_saved': 'השם נשמר!',
+    'lib_choose': 'בחרו רשימה להאזנה.',
+    'lib_for': 'לרשימה',
+    'lib_for_list': 'לרשימה מספר',
+    'lib_press_1': 'הקישו 1',
+    'lib_press_2': 'הקישו 2',
+    'lib_press_3': 'הקישו 3',
+    'lib_press_4': 'הקישו 4',
+    'lib_press_5': 'הקישו 5',
+    'lib_press_6': 'הקישו 6',
+    'lib_press_7': 'הקישו 7',
+    'lib_press_8': 'הקישו 8',
+    'lib_tail': 'להקלטת שם לרשימה, הקישו 9. לחזרה לתפריט הראשי, הקישו 0.',
+    'lib_name_pick': 'הקישו את מספר הרשימה שרוצים לתת לה שם, ואז סולמית. לחזרה לתפריט, הקישו 0 וסולמית.',
+    'lib_name_bad': 'אין רשימה עם המספר הזה.',
 }
 
-LIB_PROMPTS = ('lib_pick', 'lib_bad')
+LIB_PROMPTS = ('lib_pick', 'lib_bad', 'lib_choose', 'lib_for', 'lib_for_list', 'lib_tail',
+               'lib_name_pick', 'lib_name_bad', 'name_rec', 'name_saved') + \
+    tuple(f'lib_press_{i}' for i in range(1, 9))
 
 LIB_DIR = os.environ.get('YM_LIB_EXT', '/16')            # playlists root extension
 
@@ -412,6 +431,12 @@ def playlist_next_number():
 def playlist_exists(n):
     for f in ym_list_files(f'ivr2:{LIB_DIR}'):
         if f.get('fileType') == 'EXT' and f.get('name') == str(n):
+            return True
+    return False
+
+def playlist_named(n):
+    for f in ym_list_files('ivr2:/5'):
+        if f.get('name') == f'plname_{n}.wav':
             return True
     return False
 
@@ -590,8 +615,35 @@ def yemot_song():
             if seq is None:
                 job.update(stage='ask', status='idle')
                 return text_response(f'read=f-error.f-song_more=S{turn+1},no,record,{IN_DIR},,no')
-            job.update(stage='saved_listen', playlist=pl)
+            job['playlist'] = pl
+            if not playlist_named(pl):
+                job['stage'] = 'name_offer'
+                return text_response(f'read=f-song_saved.n-{pl}.f-song_name_offer=S{turn+1},,1,1,Digits,yes')
+            job['stage'] = 'saved_listen'
             return text_response(f'read=f-song_saved.n-{pl}.f-song_saved_listen=S{turn+1},,1,1,Digits,yes')
+
+        if stage == 'name_offer':
+            pl = job.get('playlist')
+            if s_val == '1':
+                job['stage'] = 'name_rec'
+                return text_response(f'read=f-name_rec=S{turn+1},no,record,{IN_DIR},,no')
+            job['stage'] = 'saved_listen'
+            return text_response(f'read=f-song_saved_listen=S{turn+1},,1,1,Digits,yes')
+
+        if stage == 'name_rec':
+            pl = job.get('playlist')
+            rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
+            try:
+                wav = ym_download(rec_path)
+                if pl:
+                    ym_upload(wav, f'plname_{pl}.wav', f'/5/plname_{pl}.wav')
+                ym_delete(rec_path)
+            except Exception as e:
+                log.warning('song name save failed pl=%s: %s', pl, e)
+                job['stage'] = 'saved_listen'
+                return text_response(f'read=f-song_saved_listen=S{turn+1},,1,1,Digits,yes')
+            job['stage'] = 'saved_listen'
+            return text_response(f'read=f-name_saved.f-song_saved_listen=S{turn+1},,1,1,Digits,yes')
 
         if stage == 'saved_listen':
             pl = job.get('playlist')
@@ -609,22 +661,101 @@ def yemot_song():
         log.exception('song call=%s error: %s', call_id, e)
         return text_response('id_list_message=f-error')
 
+lib_jobs = {}
+
+def lib_playlists():
+    nums = []
+    for f in ym_list_files(f'ivr2:{LIB_DIR}'):
+        if f.get('fileType') == 'EXT' and f.get('name', '').isdigit():
+            nums.append(int(f['name']))
+    return sorted(nums)
+
+def lib_menu_chain(job):
+    files = ['f-lib_choose']
+    job['keys'] = {}
+    i = 0
+    for n in lib_playlists():
+        i += 1
+        if i > 8:
+            break
+        job['keys'][str(i)] = n
+        if playlist_named(n):
+            files.append('f-lib_for')
+            files.append(f'f-plname_{n}')
+        else:
+            files.append('f-lib_for_list')
+            files.append(f'n-{n}')
+        files.append(f'f-lib_press_{i}')
+    files.append('f-lib_tail')
+    return '.'.join(files)
+
 @app.route('/yemot-lib', methods=['GET', 'POST'])
 def yemot_lib():
     params = request.values
     if params.get('secret') != BRIDGE_SECRET:
         return 'forbidden', 403
+    call_id = params.get('ApiCallId') or str(time.time_ns())
+    if params.get('hangup') == 'yes':
+        with lock:
+            lib_jobs.pop(call_id, None)
+        return text_response('')
     s_val, turn = None, 0
     for k, v in params.items():
         if re.fullmatch(r'S\d+', k):
             s_val, turn = v, int(k[1:])
-    if s_val is None:
-        return text_response(f'read=f-lib_pick=S1,,1,2,Digits,yes')
-    if s_val == '0' or not s_val.strip():
-        return text_response('go_to_folder=/')
-    if s_val.isdigit() and playlist_exists(int(s_val)):
-        return text_response(f'go_to_folder={LIB_DIR}/{int(s_val)}')
-    return text_response(f'read=f-lib_bad=S{turn+1},,1,2,Digits,yes')
+    with lock:
+        job = lib_jobs.setdefault(call_id, {'stage': 'menu'})
+
+    try:
+        stage = job.get('stage', 'menu')
+
+        if stage == 'menu':
+            if s_val is None:
+                return text_response(f'read={lib_menu_chain(job)}=S1,,1,1,Digits,yes')
+            if s_val == '0':
+                with lock:
+                    lib_jobs.pop(call_id, None)
+                return text_response('go_to_folder=/')
+            if s_val == '9':
+                job['stage'] = 'name_pick'
+                return text_response(f'read=f-lib_name_pick=S{turn+1},,1,2,Digits,yes')
+            n = job.get('keys', {}).get(s_val)
+            if n:
+                with lock:
+                    lib_jobs.pop(call_id, None)
+                return text_response(f'go_to_folder={LIB_DIR}/{n}')
+            return text_response(f'read=f-lib_bad.{lib_menu_chain(job)}=S{turn+1},,1,1,Digits,yes')
+
+        if stage == 'name_pick':
+            if s_val == '0':
+                job['stage'] = 'menu'
+                return text_response(f'read={lib_menu_chain(job)}=S{turn+1},,1,1,Digits,yes')
+            if s_val and s_val.strip().isdigit() and playlist_exists(int(s_val.strip())):
+                job.update(stage='name_rec', name_target=int(s_val.strip()))
+                return text_response(f'read=f-name_rec=S{turn+1},no,record,{IN_DIR},,no')
+            return text_response(f'read=f-lib_name_bad.f-lib_name_pick=S{turn+1},,1,2,Digits,yes')
+
+        if stage == 'name_rec':
+            n = job.get('name_target')
+            rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
+            try:
+                wav = ym_download(rec_path)
+                if n:
+                    ym_upload(wav, f'plname_{n}.wav', f'/5/plname_{n}.wav')
+                ym_delete(rec_path)
+            except Exception as e:
+                log.warning('lib name save failed pl=%s: %s', n, e)
+                job['stage'] = 'menu'
+                return text_response(f'read=f-error.{lib_menu_chain(job)}=S{turn+1},,1,1,Digits,yes')
+            job['stage'] = 'menu'
+            return text_response(f'read=f-name_saved.{lib_menu_chain(job)}=S{turn+1},,1,1,Digits,yes')
+
+        job['stage'] = 'menu'
+        return text_response(f'read={lib_menu_chain(job)}=S{turn+1},,1,1,Digits,yes')
+
+    except Exception as e:
+        log.exception('lib call=%s error: %s', call_id, e)
+        return text_response('id_list_message=f-error')
 
 
 # ---------- Podcasts (extension 3) ----------
