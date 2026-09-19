@@ -397,9 +397,13 @@ def pot_test():
         out.append('PING ERR: ' + str(e)[:150])
     try:
         ea = request.args.get('ea', 'fetch_pot=always')
-        r = sp.run(['/opt/venv/bin/yt-dlp', '-v', '--skip-download',
-                    '--extractor-args', 'youtube:' + ea,
-                    'https://www.youtube.com/watch?v=UE29iz8zi34'],
+        args = ['/opt/venv/bin/yt-dlp', '-v', '--skip-download',
+                '--extractor-args', 'youtube:' + ea]
+        js = request.args.get('js')
+        if js:
+            args += ['--js-runtimes', js]
+        args += ['https://www.youtube.com/watch?v=UE29iz8zi34']
+        r = sp.run(args,
                    capture_output=True, text=True, timeout=150)
         ver = sp.run(['/opt/venv/bin/yt-dlp', '--version'], capture_output=True, text=True)
         out.append('VERSION: ' + ver.stdout.strip())
