@@ -886,7 +886,10 @@ def yemot_news():
 # ---------- TV news editions (extension 8) ----------
 
 NED_PROMPTS = {
-    'ned_menu': 'מהדורות החדשות המרכזיות. למהדורת כאן 11, הקישו 1. לחזרה לתפריט הראשי, הקישו 0.',
+    'ned_menu': 'מהדורות ותכנים. למהדורת כאן 11, הקישו 1. לתכנים חדשים מערוץ הטלגרם, הקישו 2. לחזרה לתפריט הראשי, הקישו 0.',
+    'tg_listing': 'רגע, מביאה את רשימת התכנים העדכנית מהטלגרם.',
+    'tg_searching': 'רגע, מביאה את התוכנית. תוכנית ארוכה יכולה לקחת גם שלוש דקות להתחיל.',
+    'tg_notfound': 'סליחה, לא הצלחתי להביא את התוכנית. נסו תוכנית אחרת, או חזרו מאוחר יותר.',
     'ned_searching': 'רגע, מביאה את המהדורה העדכנית. מהדורה מלאה, אז זה יכול לקחת דקה או שתיים.',
     'ned_wait': 'עוד קצת, המהדורה מתכוננת.',
     'ned_notfound': 'סליחה, לא הצלחתי להביא את המהדורה עכשיו. נסו שוב מאוחר יותר.',
@@ -955,6 +958,123 @@ def fetch_ned(call_id):
         log.warning('ned fetch failed call=%s: %s', call_id, e)
         job.update(status='error', err=str(e)[:200])
 
+
+def upload_chunks_loop(proc, tmp, prefix, job, ferr_name):
+    import glob as _glob
+    uploaded = 0
+    while True:
+        existing = sorted(_glob.glob(tmp + '-*.wav'))
+        complete = existing[:-1] if proc.poll() is None else existing
+        while uploaded < len(complete):
+            name = f'{prefix}_{uploaded+1:02d}'
+            with open(complete[uploaded], 'rb') as f:
+                ym_upload(f.read(), name + '.wav', f'/8/{name}.wav')
+            job['chunks'].append(name)
+            log.info('chunks call=%s chunk %d up', job.get('cid'), uploaded + 1)
+            uploaded += 1
+            try: os.remove(complete[uploaded - 1])
+            except OSError: pass
+        if proc.poll() is not None and uploaded >= len(existing):
+            break
+        time.sleep(3)
+    if not job['chunks']:
+        try:
+            tail = open(ferr_name, 'rb').read()[-400:].decode('utf-8', 'ignore')
+        except OSError:
+            tail = ''
+        raise ValueError('no audio chunks | ffmpeg: ' + tail[-300:])
+
+TG_CHANNEL = 'Yedioth_Bnei_Brak_Movies'
+
+def tg_client():
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    return TelegramClient(StringSession(os.environ['TELEGRAM_SESSION']),
+                          int(os.environ['TELEGRAM_API_ID']), os.environ['TELEGRAM_API_HASH'])
+
+def tg_main_title(caption):
+    t = (caption or '').split('\n')[0]
+    t = t.split('הצטרפו לערוץ')[0].strip(' .|/')
+    if len(t) > 90:
+        t = t[:90].rsplit(' ', 1)[0].strip(' .|,')
+    return t or 'תוכנית ללא שם'
+
+def tg_list(call_id):
+    job = ned_jobs[call_id]
+    try:
+        async def _go():
+            c = tg_client()
+            await c.connect()
+            ent = await c.get_entity(TG_CHANNEL)
+            items = []
+            async for m in c.iter_messages(ent, limit=40):
+                if m.video:
+                    items.append({'id': m.id, 'title': tg_main_title(m.message)})
+                if len(items) >= 9:
+                    break
+            await c.disconnect()
+            return items
+        items = asyncio.run(_go())
+        if not items:
+            raise ValueError('no video posts found')
+        job['tg_items'] = items
+        for i, it in enumerate(items, 1):
+            ym_upload(tts_wav(f'מקש {i}. {it["title"]}'),
+                      f'tg_i{call_id[-6:]}_{i}.wav', f'/8/tg_i{call_id[-6:]}_{i}.wav')
+        ym_upload(tts_wav('בחרו תוכנית. לחזרה, הקישו 0.'),
+                  f'tg_pick{call_id[-6:]}.wav', f'/8/tg_pick{call_id[-6:]}.wav')
+        job.update(status='listed')
+        log.info('tg listed call=%s: %d items', call_id, len(items))
+    except Exception as e:
+        log.warning('tg list failed call=%s: %s', call_id, e)
+        job.update(status='error', err=str(e)[:200])
+
+def fetch_tg(call_id, idx):
+    import imageio_ffmpeg
+    job = ned_jobs[call_id]
+    tmp = f'/tmp/tg-{call_id}'
+    job['cid'] = call_id
+    try:
+        items = job.get('tg_items') or []
+        it = items[idx]
+        try:
+            ym_upload(tts_wav(it['title']),
+                      f'tg_t{call_id[-6:]}.wav', f'/8/tg_t{call_id[-6:]}.wav')
+            job['title_wav'] = f'tg_t{call_id[-6:]}'
+        except Exception:
+            pass
+        ff = shutil.which('ffmpeg') or imageio_ffmpeg.get_ffmpeg_exe()
+        ferr = open(tmp + '.log', 'wb')
+        proc = subprocess.Popen([ff, '-y', '-i', 'pipe:0',
+                                 '-ar', '16000', '-ac', '1', '-f', 'segment', '-segment_time', '600',
+                                 '-reset_timestamps', '1', tmp + '-%03d.wav'],
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ferr)
+        async def _dl():
+            c = tg_client()
+            await c.connect()
+            ent = await c.get_entity(TG_CHANNEL)
+            m = await c.get_messages(ent, ids=it['id'])
+            log.info('tg dl call=%s msg=%s size=%s', call_id, it['id'], getattr(m.document, 'size', '?'))
+            async for chunk in c.iter_download(m.media, chunk_size=512 * 1024):
+                try:
+                    proc.stdin.write(chunk)
+                except (BrokenPipeError, OSError):
+                    break
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            await c.disconnect()
+        import threading as _th
+        t = _th.Thread(target=lambda: asyncio.run(_dl()), daemon=True)
+        t.start()
+        upload_chunks_loop(proc, tmp, f'tg{re.sub(chr(92) + "D", "", call_id)[-6:]}', job, tmp + '.log')
+        job.update(done=True, status='ready')
+        log.info('tg ready call=%s: %d chunks', call_id, len(job['chunks']))
+    except Exception as e:
+        log.warning('tg fetch failed call=%s: %s', call_id, e)
+        job.update(status='error', err=str(e)[:200])
+
 @app.route('/yemot-ned', methods=['GET', 'POST'])
 def yemot_ned():
     params = request.values
@@ -998,22 +1118,52 @@ def yemot_ned():
         if stage == 'menu':
             v = (s_val or '').strip()
             if v == '1':
-                job.update(stage='wait_start', status='working', started=time.time())
+                job.update(stage='wait_start', status='working', started=time.time(), mode='kan')
                 threading.Thread(target=fetch_ned, args=(call_id,), daemon=True).start()
                 return text_response(f'read=f-ned_searching=S{turn+1},no,no')
+            if v == '2':
+                job.update(stage='tg_list_wait', status='working', started=time.time(), mode='tg')
+                threading.Thread(target=tg_list, args=(call_id,), daemon=True).start()
+                return text_response(f'read=f-tg_listing=S{turn+1},no,no')
+            with lock:
+                ned_jobs.pop(call_id, None)
+            return text_response('go_to_folder=/')
+
+        if stage == 'tg_list_wait':
+            if job.get('status') == 'error':
+                job['stage'] = 'menu'
+                return text_response(f'read=f-tg_notfound.f-ned_menu=S{turn+1},,1,1,Digits,yes')
+            if job.get('status') == 'listed':
+                job['stage'] = 'tg_menu'
+                sfx = call_id[-6:]
+                chain = ''.join(f"f-tg_i{sfx}_{i}." for i in range(1, len(job['tg_items']) + 1))
+                return text_response(f'read={chain}f-tg_pick{sfx}=S{turn+1},,1,1,Digits,yes')
+            if time.time() - job.get('started', 0) > 180:
+                job['stage'] = 'menu'
+                return text_response(f'read=f-tg_notfound.f-ned_menu=S{turn+1},,1,1,Digits,yes')
+            return text_response(f'read=f-tg_listing=S{turn+1},no,no')
+
+        if stage == 'tg_menu':
+            v = (s_val or '').strip()
+            items = job.get('tg_items') or []
+            if v.isdigit() and 1 <= int(v) <= len(items):
+                job.update(stage='wait_start', status='working', started=time.time())
+                threading.Thread(target=fetch_tg, args=(call_id, int(v) - 1), daemon=True).start()
+                return text_response(f'read=f-tg_searching=S{turn+1},no,no')
             with lock:
                 ned_jobs.pop(call_id, None)
             return text_response('go_to_folder=/')
 
         if stage == 'wait_start':
+            nf = 'tg_notfound' if job.get('mode') == 'tg' else 'ned_notfound'
             if job.get('status') == 'error':
                 job['stage'] = 'menu'
-                return text_response(f'read=f-ned_notfound.f-ned_menu=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read=f-{nf}.f-ned_menu=S{turn+1},,1,1,Digits,yes')
             if job['chunks']:
                 return serve_next()
             if time.time() - job.get('started', 0) > 600:
                 job['stage'] = 'menu'
-                return text_response(f'read=f-ned_notfound.f-ned_menu=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read=f-{nf}.f-ned_menu=S{turn+1},,1,1,Digits,yes')
             return text_response(f'read=f-ned_wait=S{turn+1},no,no')
 
         if stage == 'play':
