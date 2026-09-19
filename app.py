@@ -279,6 +279,15 @@ def tts_wav(text, rate=None):
 
 # ---------- Helpers ----------
 
+@app.before_request
+def _log_every_request():
+    try:
+        args = {k: (v[:60] if k != 'secret' else '<set>' if v else '<EMPTY>')
+                for k, v in request.values.items()}
+        log.info('REQ %s %s args=%s', request.method, request.path, args)
+    except Exception:
+        pass
+
 def text_response(body):
     return Response(body, mimetype='text/plain; charset=utf-8')
 
