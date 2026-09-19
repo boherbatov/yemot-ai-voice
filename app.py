@@ -318,7 +318,7 @@ def setup():
     report = {}
     # root menu greeting lives at /000.wav (played by the root menu extension)
     try:
-        ym_upload(tts_wav('ברוכים הבאים! לשיחה עם אוזן, הקישו 1. לשיר מיוטיוב, הקישו 2. לפודקאסטים, הקישו 3. לויקיפדיה, הקישו 4. לרשימות השירים שלכם, הקישו 5. לתרגום, הקישו 6. למבזק חדשות, הקישו 7.'), '000.wav', '/000.wav')
+        ym_upload(tts_wav('ברוכים הבאים! לשיחה עם אוזן, הקישו 1. לשיר מיוטיוב, הקישו 2. לפודקאסטים, הקישו 3. לויקיפדיה, הקישו 4. לרשימות השירים שלכם, הקישו 5. לתרגום, הקישו 6. למבזק חדשות, הקישו 7. למהדורות החדשות, הקישו 8.'), '000.wav', '/000.wav')
         report['menu_000.wav'] = 'ok'
     except Exception as e:
         report['menu_000.wav'] = f'FAIL: {e}'
@@ -347,6 +347,11 @@ def setup():
     for name, text in NEWS_PROMPTS.items():
         try:
             report[name] = 'OK' if ym_upload(tts_wav(text), name + '.wav', f'/7/{name}.wav') else 'FAIL'
+        except Exception as e:
+            report[name] = f'FAIL: {e}'
+    for name, text in NED_PROMPTS.items():
+        try:
+            report[name] = 'OK' if ym_upload(tts_wav(text), name + '.wav', f'/8/{name}.wav') else 'FAIL'
         except Exception as e:
             report[name] = f'FAIL: {e}'
     for name in LIB_PROMPTS:
@@ -875,6 +880,160 @@ def yemot_news():
 
     except Exception as e:
         log.exception('news call=%s error: %s', call_id, e)
+        return text_response('id_list_message=f-error')
+
+
+# ---------- TV news editions (extension 8) ----------
+
+NED_PROMPTS = {
+    'ned_menu': 'מהדורות החדשות המרכזיות. למהדורת כאן 11, הקישו 1. לחזרה לתפריט הראשי, הקישו 0.',
+    'ned_searching': 'רגע, מביאה את המהדורה העדכנית. מהדורה מלאה, אז זה יכול לקחת דקה או שתיים.',
+    'ned_wait': 'עוד קצת, המהדורה מתכוננת.',
+    'ned_notfound': 'סליחה, לא הצלחתי להביא את המהדורה עכשיו. נסו שוב מאוחר יותר.',
+    'ned_after': 'המהדורה הסתיימה. תודה שהאזנתם! לתפריט הראשי, הקישו 0.',
+}
+
+def kan_latest_edition(program_id='11544'):
+    d = requests.get(f'https://mobapi.kan.org.il/api/mobile/program?id={program_id}',
+                     headers={'User-Agent': 'Mozilla/5.0'}, timeout=20).json()
+    entries = d.get('entry') or []
+    if not entries:
+        raise ValueError('no episodes')
+    ep = entries[0]
+    eid = ep['id']
+    html = requests.get(f'https://mobapi.kan.org.il/content/kan/kan-actual/p-{program_id}/{eid}/',
+                        headers={'User-Agent': 'Mozilla/5.0'}, timeout=30).text
+    m = re.search(r'"hls":"(//[^"]+)"', html)
+    if not m:
+        raise ValueError('no hls url')
+    return 'https:' + m.group(1), (ep.get('title') or '')
+
+ned_jobs = {}
+
+def fetch_ned(call_id):
+    import imageio_ffmpeg, glob as _glob
+    job = ned_jobs[call_id]
+    tmp = f'/tmp/ned-{call_id}'
+    try:
+        url, title = kan_latest_edition()
+        log.info('ned call=%s: %s -> %s', call_id, title, url[:80])
+        date = title.split('|')[-1].strip() if '|' in title else ''
+        try:
+            ym_upload(tts_wav(f'מהדורת כאן חדשות, {date}' if date else 'מהדורת כאן חדשות'),
+                      f'ned_t{call_id[-6:]}.wav', f'/8/ned_t{call_id[-6:]}.wav')
+            job['title_wav'] = f'ned_t{call_id[-6:]}'
+        except Exception:
+            pass
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+        proc = subprocess.Popen([ff, '-y', '-headers', 'User-Agent: Mozilla/5.0\r\n', '-i', url,
+                                 '-ar', '16000', '-ac', '1', '-f', 'segment', '-segment_time', '600',
+                                 '-reset_timestamps', '1', tmp + '-%03d.wav'],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        uploaded = 0
+        while True:
+            existing = sorted(_glob.glob(tmp + '-*.wav'))
+            complete = existing[:-1] if proc.poll() is None else existing
+            while uploaded < len(complete):
+                name = f'ned{re.sub(chr(92) + "D", "", call_id)[-6:]}_{uploaded+1:02d}'
+                with open(complete[uploaded], 'rb') as f:
+                    ym_upload(f.read(), name + '.wav', f'/8/{name}.wav')
+                job['chunks'].append(name)
+                log.info('ned call=%s chunk %d up', call_id, uploaded + 1)
+                uploaded += 1
+                try: os.remove(complete[uploaded - 1])
+                except OSError: pass
+            if proc.poll() is not None and uploaded >= len(existing):
+                break
+            time.sleep(3)
+        if not job['chunks']:
+            raise ValueError('no audio chunks')
+        job.update(done=True, status='ready')
+        log.info('ned ready call=%s: %d chunks', call_id, len(job['chunks']))
+    except Exception as e:
+        log.warning('ned fetch failed call=%s: %s', call_id, e)
+        job.update(status='error', err=str(e)[:200])
+
+@app.route('/yemot-ned', methods=['GET', 'POST'])
+def yemot_ned():
+    params = request.values
+    if params.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    call_id = params.get('ApiCallId') or str(time.time_ns())
+    if params.get('hangup') == 'yes':
+        with lock:
+            ned_jobs.pop(call_id, None)
+        return text_response('')
+
+    s_val, turn = None, 0
+    for k, v in params.items():
+        if re.fullmatch(r'S\d+', k):
+            s_val, turn = v, int(k[1:])
+
+    with lock:
+        job = ned_jobs.setdefault(call_id, {'stage': 'menu', 'status': 'idle', 'chunks': [],
+                                            'done': False, 'playing': -1, 'started': time.time()})
+
+    try:
+        stage = job.get('stage', 'menu')
+
+        if s_val is None:
+            return text_response('read=f-ned_menu=S1,,1,1,Digits,yes')
+
+        def serve_next():
+            chunks = job['chunks']
+            nxt = job['playing'] + 1
+            if nxt < len(chunks):
+                job['playing'] = nxt
+                job['stage'] = 'play'
+                head = f"f-{job['title_wav']}." if nxt == 0 and job.get('title_wav') else ''
+                return text_response(f"read={head}f-{chunks[nxt]}=S{turn+1},no,no")
+            if job.get('done') or job.get('status') == 'error':
+                job['stage'] = 'after'
+                return text_response(f'read=f-ned_after=S{turn+1},,1,1,Digits,yes')
+            job['stage'] = 'wait_more'
+            return text_response(f'read=f-ned_wait=S{turn+1},no,no')
+
+        if stage == 'menu':
+            v = (s_val or '').strip()
+            if v == '1':
+                job.update(stage='wait_start', status='working', started=time.time())
+                threading.Thread(target=fetch_ned, args=(call_id,), daemon=True).start()
+                return text_response(f'read=f-ned_searching=S{turn+1},no,no')
+            with lock:
+                ned_jobs.pop(call_id, None)
+            return text_response('go_to_folder=/')
+
+        if stage == 'wait_start':
+            if job.get('status') == 'error':
+                job['stage'] = 'menu'
+                return text_response(f'read=f-ned_notfound.f-ned_menu=S{turn+1},,1,1,Digits,yes')
+            if job['chunks']:
+                return serve_next()
+            if time.time() - job.get('started', 0) > 600:
+                job['stage'] = 'menu'
+                return text_response(f'read=f-ned_notfound.f-ned_menu=S{turn+1},,1,1,Digits,yes')
+            return text_response(f'read=f-ned_wait=S{turn+1},no,no')
+
+        if stage == 'play':
+            return serve_next()
+
+        if stage == 'wait_more':
+            if job.get('status') == 'error':
+                job['stage'] = 'after'
+                return text_response(f'read=f-ned_after=S{turn+1},,1,1,Digits,yes')
+            return serve_next()
+
+        if stage == 'after':
+            with lock:
+                ned_jobs.pop(call_id, None)
+            return text_response('go_to_folder=/')
+
+        with lock:
+            ned_jobs.pop(call_id, None)
+        return text_response('go_to_folder=/')
+
+    except Exception as e:
+        log.exception('ned call=%s error: %s', call_id, e)
         return text_response('id_list_message=f-error')
 
 
