@@ -189,7 +189,14 @@ def ym_upload_text(text, ym_path):
 
 def ym_delete(ym_path):
     try:
-        return ym_get('FileAction', action='delete', target=ym_p(ym_path)).json()
+        r = requests.get(f'{YM_API}/FileAction',
+                         params={'token': YM_TOKEN, 'action': 'delete', 'path': ym_p(ym_path)},
+                         timeout=20)
+        r.raise_for_status()
+        j = r.json()
+        if not j.get('success'):
+            log.warning('delete rejected %s: %s', ym_path, str(j)[:150])
+        return j
     except Exception as e:
         log.warning('delete failed %s: %s', ym_path, e)
         return None
