@@ -69,10 +69,13 @@ def yt_search_video_id(query):
         if isinstance(o, dict):
             lv = o.get('lockupViewModel')
             if lv and 'VIDEO' in str(lv.get('contentType', '')) and lv.get('contentId'):
-                found.append(lv['contentId'])
+                title = (((lv.get('metadata') or {}).get('lockupMetadataViewModel') or {})
+                         .get('title') or {}).get('content')
+                found.append((lv['contentId'], title))
             vr = o.get('videoRenderer')
             if vr and vr.get('videoId'):
-                found.append(vr['videoId'])
+                t = (vr.get('title') or {}).get('runs', [{}])[0].get('text')
+                found.append((vr['videoId'], t))
             for v in o.values():
                 walk(v)
         elif isinstance(o, list):
@@ -83,30 +86,49 @@ def yt_search_video_id(query):
         raise ValueError('no video results')
     return found[0]
 
+def yt_player(video_id):
+    """Direct authenticated TV player call; returns (title, duration, status)."""
+    import json as J, urllib.request as U
+    _yt_cfg()
+    body = {'context': _yt_tv_context(), 'videoId': video_id, 'params': '2AMB',
+            'contentCheckOk': True, 'racyCheckOk': True}
+    if _YT['sts']:
+        body['playbackContext'] = {'contentPlaybackContext': {
+            'html5Preference': 'HTML5_PREF_WANTS', 'signatureTimestamp': int(_YT['sts'])}}
+    r = J.load(U.urlopen(U.Request(
+        f'https://www.youtube.com/youtubei/v1/player?prettyPrint=false&key={_YT["key"]}',
+        data=J.dumps(body).encode(), headers=_yt_headers()), timeout=30))
+    ps = r.get('playabilityStatus', {})
+    vd = r.get('videoDetails') or {}
+    return vd.get('title') or 'שיר', vd.get('lengthSeconds'), ps.get('status')
+
 def yt_download(video_id, outtmpl):
     """yt-dlp download through the authenticated TV client (PS4 UA) with deno decipher."""
     import yt_dlp
     from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS
-    _yt_cfg()
+    title, duration, status = yt_player(video_id)
+    if status != 'OK':
+        raise ValueError(f'player status {status}')
+    if duration and int(duration) > 600:
+        raise ValueError('song too long')
     tv = INNERTUBE_CLIENTS['tv']
     tv['INNERTUBE_CONTEXT']['client']['userAgent'] = PS4_UA
     tv['INNERTUBE_CONTEXT']['client']['clientVersion'] = TV_CLIENT_VER
     opts = {
-        'format': 'bestaudio/best',
+        'format': '18/bestaudio/best',
         'outtmpl': outtmpl,
         'quiet': True, 'no_warnings': True, 'noplaylist': True,
+        'remote_components': ['ejs:github'],
         'http_headers': {'Authorization': f'Bearer {_yt_token()}',
-                         'X-Goog-Visitor-Id': _YT['vd'],
                          'User-Agent': PS4_UA},
-        'extractor_args': {'youtube': {'player_client': ['tv'], 'player_skip': ['webpage', 'configs', 'initial_data']}},
+        'extractor_args': {'youtube': {'player_client': ['tv'],
+                                       'player_skip': ['webpage', 'configs', 'initial_data'],
+                                       'visitor_data': [_YT['vd']]}},
     }
     url = f'https://www.youtube.com/watch?v={video_id}'
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        if info.get('duration') and info['duration'] > 600:
-            raise ValueError('song too long')
         ydl.download([url])
-        return info.get('title') or 'שיר', info.get('duration')
+    return title, duration
 EDGE_VOICE = os.environ.get('EDGE_VOICE', 'he-IL-HilaNeural')
 EXT_DIR = os.environ.get('YM_AI_EXT', '/1')          # the api extension folder
 IN_DIR = '/AI/in'                                    # caller recordings
@@ -342,9 +364,15 @@ def fetch_song(call_id, query):
         if not YT_REFRESH_TOKEN:
             raise ValueError('YT_REFRESH_TOKEN not set')
         m = re.search(r'(?:v=|youtu\.be/|/shorts/)([\w-]{11})', query)
-        video_id = m.group(1) if m else yt_search_video_id(query)
+        search_title = None
+        if m:
+            video_id = m.group(1)
+        else:
+            video_id, search_title = yt_search_video_id(query)
         log.info('song search q=%r -> video %s', query[:60], video_id)
         title, _dur = yt_download(video_id, tmp + '.%(ext)s')
+        if title == 'שיר' and search_title:
+            title = search_title
         files = sorted(_glob.glob(tmp + '.*'))
         if not files:
             raise ValueError('no file downloaded')
@@ -444,9 +472,15 @@ def song_test():
         if not YT_REFRESH_TOKEN:
             return {'ok': False, 'error': 'YT_REFRESH_TOKEN not set'}
         m = re.search(r'(?:v=|youtu\.be/|/shorts/)([\w-]{11})', q)
-        video_id = m.group(1) if m else yt_search_video_id(q)
+        search_title = None
+        if m:
+            video_id = m.group(1)
+        else:
+            video_id, search_title = yt_search_video_id(q)
         t1 = time.time()
         title, dur = yt_download(video_id, tmp + '.%(ext)s')
+        if title == 'שיר' and search_title:
+            title = search_title
         info = {'entries': None}
         ent = {'duration': dur, 'title': title}
         log.info('song-test video=%s dl=%.1fs', video_id, time.time() - t1)
