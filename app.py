@@ -1240,6 +1240,74 @@ def yemot_ned():
         return text_response('id_list_message=f-error')
 
 
+
+# ---------- Penalty box (extension 9) ----------
+
+chulin_jobs = {}
+
+@app.route('/yemot-chulin', methods=['GET', 'POST'])
+def yemot_chulin():
+    params = request.values
+    if params.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    call_id = params.get('ApiCallId') or str(time.time_ns())
+    if params.get('hangup') == 'yes':
+        with lock:
+            chulin_jobs.pop(call_id, None)
+        return text_response('')
+
+    s_val, turn = None, 0
+    for k, v in params.items():
+        if re.fullmatch(r'S\d+', k):
+            s_val, turn = v, int(k[1:])
+
+    with lock:
+        job = chulin_jobs.setdefault(call_id, {'stage': 'intro', 'empty': 0})
+
+    try:
+        if s_val is None:
+            return text_response(f'read=f-chulin_intro=S1,no,record,/9/in,,no')
+
+        if job.get('stage') == 'intro':
+            rec_path = None
+            if s_val and s_val.endswith('.wav'):
+                rec_path = s_val if s_val.startswith('/') else f'/9/in/{s_val}'
+            else:
+                try:
+                    rec_path = ym_newest_file('/9/in')
+                except Exception:
+                    rec_path = None
+            if not rec_path:
+                job['empty'] += 1
+                if job['empty'] >= 2:
+                    with lock:
+                        chulin_jobs.pop(call_id, None)
+                    return text_response('read=f-chulin_end=S99,no,no')
+                return text_response(f'read=f-chulin_intro=S{turn+1},no,record,/9/in,,no')
+            name = 'chul' + re.sub(r'\D', '', call_id)[-6:]
+            try:
+                wav = ym_download(rec_path if rec_path.startswith('ivr2:') else 'ivr2:' + rec_path)
+                ym_upload(wav, name + '.wav', f'/9/{name}.wav')
+                ym_delete(rec_path if rec_path.startswith('ivr2:') else 'ivr2:' + rec_path)
+                job['wav'] = name
+            except Exception as e:
+                log.warning('chulin record move failed call=%s: %s', call_id, e)
+                with lock:
+                    chulin_jobs.pop(call_id, None)
+                return text_response('id_list_message=f-error')
+            job['stage'] = 'done'
+            return text_response(
+                f'read=f-chulin_taunt.f-{name}.f-chulin_taunt2.f-{name}.f-chulin_end=S{turn+1},no,no')
+
+        with lock:
+            chulin_jobs.pop(call_id, None)
+        return text_response('go_to_folder=/')
+
+    except Exception as e:
+        log.exception('chulin call=%s error: %s', call_id, e)
+        return text_response('id_list_message=f-error')
+
+
 # ---------- Podcasts (extension 3) ----------
 
 PODCASTS = [
