@@ -391,18 +391,17 @@ def pot_test():
     import subprocess as sp
     out = []
     try:
-        ping = sp.run(['curl', '-s', '--max-time', '10', 'http://127.0.0.1:4416/ping'],
-                      capture_output=True, text=True, timeout=15)
-        out.append('PING: ' + (ping.stdout or ping.stderr)[:200])
+        import urllib.request
+        out.append('PING: ' + urllib.request.urlopen('http://127.0.0.1:4416/ping', timeout=10).read().decode()[:200])
     except Exception as e:
         out.append('PING ERR: ' + str(e)[:150])
     try:
-        r = sp.run(['/opt/venv/bin/yt-dlp', '-v', '--skip-download', '--no-warnings',
+        r = sp.run(['/opt/venv/bin/yt-dlp', '-v', '--skip-download',
                     '--extractor-args', 'youtube:player_client=web',
                     'https://www.youtube.com/watch?v=UE29iz8zi34'],
                    capture_output=True, text=True, timeout=150)
         keep = [l for l in (r.stdout + r.stderr).splitlines()
-                if any(k in l.lower() for k in ('bgutil', 'pot', 'plugin', 'visitor', 'sign in', 'error', 'po token'))]
+                if any(k in l.lower() for k in ('bgutil', 'pot', 'plugin', 'visitor', 'sign in', 'error', 'warning', 'po token', 'http'))]
         out.append('YTDLP:\n' + '\n'.join(keep[:50]))
     except Exception as e:
         out.append('YTDLP ERR: ' + str(e)[:200])
