@@ -131,6 +131,7 @@ def yt_download(video_id, outtmpl):
         ydl.download([url])
     return title, duration
 EDGE_VOICE = os.environ.get('EDGE_VOICE', 'he-IL-HilaNeural')
+EDGE_RATE = os.environ.get('EDGE_RATE', '+0%')
 EXT_DIR = os.environ.get('YM_AI_EXT', '/1')          # the api extension folder
 IN_DIR = '/AI/in'                                    # caller recordings
 HIST_DIR = '/AI/history'                             # per-caller history json (as .txt)
@@ -252,11 +253,11 @@ def groq_chat(messages, max_tokens=180):
 
 # ---------- TTS ----------
 
-def tts_wav(text):
+def tts_wav(text, rate=None):
     import edge_tts
     mp3_path = f'/tmp/tts-{time.time_ns()}.mp3'
     async def gen():
-        await edge_tts.Communicate(text, EDGE_VOICE).save(mp3_path)
+        await edge_tts.Communicate(text, EDGE_VOICE, rate=rate or EDGE_RATE).save(mp3_path)
     asyncio.run(gen())
     import miniaudio
     snd = miniaudio.decode_file(mp3_path, output_format=miniaudio.SampleFormat.SIGNED16,
@@ -331,6 +332,11 @@ def setup():
     for name, text in POD_PROMPTS.items():
         try:
             report[name] = 'OK' if ym_upload(tts_wav(text), name + '.wav', f'/3/{name}.wav') else 'FAIL'
+        except Exception as e:
+            report[name] = f'FAIL: {e}'
+    for name, text in WIKI_PROMPTS.items():
+        try:
+            report[name] = 'OK' if ym_upload(tts_wav(text), name + '.wav', f'/4/{name}.wav') else 'FAIL'
         except Exception as e:
             report[name] = f'FAIL: {e}'
     for name in LIB_PROMPTS:
@@ -923,6 +929,143 @@ def yemot_pod():
 
     except Exception as e:
         log.exception('pod call=%s error: %s', call_id, e)
+        return text_response('id_list_message=f-error')
+
+
+# ---------- Wikipedia (extension 4) ----------
+
+WIKI_RATE = os.environ.get('WIKI_RATE', '+40%')
+WIKI_PROMPTS = {
+    'wiki_ask': 'איזה ערך בויקיפדיה בא לכם לשמוע? אמרו את שם הערך, ולסיום הקישו סולמית.',
+    'wiki_searching': 'רגע אחד, אני מביאה את הערך ומכינה אותו להקראה. בערך ארוך זה יכול לקחת דקה-שתיים.',
+    'wiki_wait': 'עוד קצת, הערך בהכנה.',
+    'wiki_notfound': 'סליחה, לא מצאתי ערך כזה בויקיפדיה. נסו שם אחר.',
+}
+wiki_jobs = {}
+WIKI_SECTION_CHARS = 1400
+WIKI_MAX_SECTIONS = 60
+
+WIKI_HEADERS = {'User-Agent': 'yemot-wiki-ivr/1.0 (https://yemot-ai-voice-1.onrender.com; boherbatov@gmail.com)'}
+
+def wiki_article_text(term):
+    api = 'https://he.wikipedia.org/w/api.php'
+    r = requests.get(api, params={'action': 'query', 'list': 'search', 'srsearch': term,
+                                  'utf8': 1, 'format': 'json', 'srlimit': 1}, headers=WIKI_HEADERS, timeout=20)
+    hits = r.json().get('query', {}).get('search', [])
+    if not hits:
+        return None, None
+    title = hits[0]['title']
+    r = requests.get(api, params={'action': 'query', 'prop': 'extracts', 'explaintext': 1,
+                                  'titles': title, 'format': 'json', 'redirects': 1}, headers=WIKI_HEADERS, timeout=20)
+    pages = r.json().get('query', {}).get('pages', {})
+    extract = next(iter(pages.values())).get('extract', '')
+    return title, (extract or '').strip()
+
+def wiki_sections(text):
+    paras = [p.strip() for p in re.split(r'\n+', text) if p.strip()]
+    out, cur = [], ''
+    for p in paras:
+        if len(cur) + len(p) > WIKI_SECTION_CHARS and cur:
+            out.append(cur); cur = p
+        else:
+            cur = (cur + '\n' + p).strip()
+    if cur:
+        out.append(cur)
+    return out[:WIKI_MAX_SECTIONS]
+
+def fetch_wiki(call_id, term, sub):
+    job = wiki_jobs[call_id]
+    try:
+        # clean previous article folders under /4
+        for f in ym_list_files('ivr2:/4'):
+            if f.get('fileType') == 'EXT' and f.get('name', '').isdigit() and f['name'] != sub:
+                try: ym_delete(f'/4/{f["name"]}')
+                except Exception: pass
+        title, text = wiki_article_text(term)
+        if not text:
+            job.update(status='error', err='not found')
+            return
+        sections = wiki_sections(text)
+        log.info('wiki %r -> %r, %d sections', term, title, len(sections))
+        ym_upload_text('type=playfile\n', f'ivr2:/4/{sub}/ext.ini')
+        results = [None] * len(sections)
+        def one(i, sec):
+            results[i] = tts_wav(sec, rate=WIKI_RATE)
+        ts = []
+        for i, sec in enumerate(sections):
+            t = threading.Thread(target=one, args=(i, sec), daemon=True)
+            t.start(); ts.append(t)
+            while sum(1 for x in ts if x.is_alive()) >= 3:
+                time.sleep(0.2)
+        for t in ts:
+            t.join()
+        for i, wav in enumerate(results):
+            if wav is None:
+                raise RuntimeError(f'tts failed section {i}')
+            ym_upload(wav, f'{i+1:03d}.wav', f'ivr2:/4/{sub}/{i+1:03d}.wav')
+        job.update(status='ready', title=title, sub=sub, nsec=len(sections))
+        log.info('wiki ready call=%s title=%s', call_id, title)
+    except Exception as e:
+        log.warning('wiki fetch failed call=%s: %s', call_id, e)
+        job.update(status='error', err=str(e)[:200])
+
+@app.route('/yemot-wiki', methods=['GET', 'POST'])
+def yemot_wiki():
+    params = request.values
+    if params.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    call_id = params.get('ApiCallId') or str(time.time_ns())
+    if params.get('hangup') == 'yes':
+        with lock:
+            wiki_jobs.pop(call_id, None)
+        return text_response('')
+
+    s_val, turn = None, 0
+    for k, v in params.items():
+        if re.fullmatch(r'S\d+', k):
+            s_val, turn = v, int(k[1:])
+
+    with lock:
+        job = wiki_jobs.setdefault(call_id, {'stage': 'ask', 'status': 'idle', 'started': time.time()})
+
+    if s_val is None:
+        return text_response(f'read=f-wiki_ask=S1,no,record,{IN_DIR},,no')
+
+    try:
+        stage = job['stage']
+
+        if stage == 'ask':
+            rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
+            wav = ym_download(rec_path)
+            text = groq_stt(wav)
+            ym_delete(rec_path)
+            log.info('wiki req call=%s: %s', call_id, (text or '')[:80])
+            if not text:
+                return text_response(f'read=f-didnt_hear=S{turn+1},no,record,{IN_DIR},,no')
+            sub = re.sub(r'\D', '', call_id)[-6:] or '1'
+            job.update(stage='wiki_wait', status='working', started=time.time(), sub=sub)
+            threading.Thread(target=fetch_wiki, args=(call_id, text, sub), daemon=True).start()
+            return text_response(f'read=f-wiki_searching=S{turn+1},no,no')
+
+        if stage == 'wiki_wait':
+            st = job.get('status')
+            if st == 'working':
+                if time.time() - job.get('started', 0) > 300:
+                    job.update(stage='ask', status='idle')
+                    return text_response(f'read=f-wiki_notfound=S{turn+1},no,record,{IN_DIR},,no')
+                return text_response(f'read=f-wiki_wait=S{turn+1},no,no')
+            if st == 'error':
+                job.update(stage='ask', status='idle')
+                return text_response(f'read=f-wiki_notfound=S{turn+1},no,record,{IN_DIR},,no')
+            with lock:
+                wiki_jobs.pop(call_id, None)
+            return text_response(f"go_to_folder=/4/{job['sub']}")
+
+        job['stage'] = 'ask'
+        return text_response(f'read=f-wiki_ask=S{turn+1},no,record,{IN_DIR},,no')
+
+    except Exception as e:
+        log.exception('wiki call=%s error: %s', call_id, e)
         return text_response('id_list_message=f-error')
 
 @app.route('/song-test')
