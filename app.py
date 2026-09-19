@@ -287,11 +287,11 @@ def tts_wav(text, rate=None):
     asyncio.run(gen())
     import miniaudio
     snd = miniaudio.decode_file(mp3_path, output_format=miniaudio.SampleFormat.SIGNED16,
-                                nchannels=1, sample_rate=16000)
+                                nchannels=1, sample_rate=8000)
     os.remove(mp3_path)
     buf = io.BytesIO()
     w = wave.open(buf, 'wb')
-    w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+    w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
     w.writeframes(bytes(snd.samples))
     w.close()
     return buf.getvalue()
@@ -536,7 +536,7 @@ def fetch_song(call_id, query):
         src = files[0]
         out = tmp + '.wav'
         subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-i', src,
-                        '-ar', '16000', '-ac', '1', '-f', 'wav', out],
+                        '-ar', '8000', '-ac', '1', '-f', 'wav', out],
                        check=True, capture_output=True, timeout=120)
         name = 'song' + re.sub(r'\D', '', call_id)[-6:]
         with open(out, 'rb') as f:
@@ -1003,7 +1003,7 @@ def fetch_ned(call_id):
         ff = shutil.which('ffmpeg') or imageio_ffmpeg.get_ffmpeg_exe()
         ferr = open(tmp + '.log', 'wb')
         proc = subprocess.Popen([ff, '-y', '-headers', 'User-Agent: Mozilla/5.0\r\n', '-i', url,
-                                 '-ar', '16000', '-ac', '1', '-f', 'segment', '-segment_time', '600',
+                                 '-ar', '8000', '-ac', '1', '-f', 'segment', '-segment_time', '600',
                                  '-reset_timestamps', '1', tmp + '-%03d.wav'],
                                 stdout=subprocess.DEVNULL, stderr=ferr)
         uploaded = 0
@@ -1119,7 +1119,7 @@ def fetch_tg(call_id, idx):
         ff = shutil.which('ffmpeg') or imageio_ffmpeg.get_ffmpeg_exe()
         ferr = open(tmp + '.log', 'wb')
         proc = subprocess.Popen([ff, '-y', '-i', 'pipe:0',
-                                 '-ar', '16000', '-ac', '1', '-f', 'segment', '-segment_time', '600',
+                                 '-ar', '8000', '-ac', '1', '-f', 'segment', '-segment_time', '600',
                                  '-reset_timestamps', '1', tmp + '-%03d.wav'],
                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ferr)
         async def _dl():
@@ -1495,7 +1495,7 @@ def fetch_pod(call_id, pod_idx, ep_idx):
         urllib.request.urlretrieve(url, mp3)
         out = tmp + '.wav'
         subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-i', mp3,
-                        '-ar', '16000', '-ac', '1', '-f', 'wav', out],
+                        '-ar', '8000', '-ac', '1', '-f', 'wav', out],
                        check=True, capture_output=True, timeout=600)
         name = 'pod' + re.sub(r'\D', '', call_id)[-6:]
         with open(out, 'rb') as f:
@@ -1936,7 +1936,7 @@ def song_test():
         src = files[0]
         out = tmp + '.wav'
         subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-i', src,
-                        '-ar', '16000', '-ac', '1', '-f', 'wav', out],
+                        '-ar', '8000', '-ac', '1', '-f', 'wav', out],
                        check=True, capture_output=True, timeout=120)
         size = os.path.getsize(out)
         for f_ in _glob.glob(tmp + '.*'):
