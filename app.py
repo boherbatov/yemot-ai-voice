@@ -14,6 +14,7 @@ GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 BRIDGE_SECRET = os.environ.get('BRIDGE_SECRET', '')
 GROQ_CHAT_MODEL = os.environ.get('GROQ_CHAT_MODEL', 'openai/gpt-oss-120b')
 GROQ_STT_MODEL = os.environ.get('GROQ_STT_MODEL', 'whisper-large-v3-turbo')
+YT_CLIENT = os.environ.get('YT_PLAYER_CLIENT', 'android_vr')
 EDGE_VOICE = os.environ.get('EDGE_VOICE', 'he-IL-HilaNeural')
 EXT_DIR = os.environ.get('YM_AI_EXT', '/1')          # the api extension folder
 IN_DIR = '/AI/in'                                    # caller recordings
@@ -250,7 +251,7 @@ def fetch_song(call_id, query):
             'format': 'bestaudio/best',
             'outtmpl': tmp + '.%(ext)s',
             'quiet': True, 'no_warnings': True, 'noplaylist': True,
-            'extractor_args': {'youtube': {'player_client': ['android_vr']}},
+            'extractor_args': {'youtube': {'player_client': [YT_CLIENT]}},
             'match_filter': yt_dlp.utils.match_filter_func(['duration < 600']),
         }
         url = query if re.match(r'https?://', query) else f'ytsearch1:{query}'
@@ -353,7 +354,7 @@ def song_test():
         import yt_dlp, imageio_ffmpeg, glob as _glob
         ydl_opts = {'format': 'bestaudio/best', 'outtmpl': tmp + '.%(ext)s',
                     'quiet': True, 'no_warnings': True, 'noplaylist': True,
-                    'extractor_args': {'youtube': {'player_client': ['android_vr']}},
+                    'extractor_args': {'youtube': {'player_client': [request.args.get('client', YT_CLIENT)]}},
                     'match_filter': yt_dlp.utils.match_filter_func(['duration < 600'])}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f'ytsearch1:{q}', download=True)
