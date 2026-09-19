@@ -318,7 +318,7 @@ def setup():
     report = {}
     # root menu greeting lives at /000.wav (played by the root menu extension)
     try:
-        ym_upload(tts_wav('ברוכים הבאים! לשיחה עם אוזן, הקישו 1. לשיר מיוטיוב, הקישו 2.'), '000.wav', '/000.wav')
+        ym_upload(tts_wav('ברוכים הבאים! לשיחה עם אוזן, הקישו 1. לשיר מיוטיוב, הקישו 2. לפודקאסטים, הקישו 3. לויקיפדיה, הקישו 4. לרשימות השירים שלכם, הקישו 5. לתרגום, הקישו 6. למבזק חדשות, הקישו 7.'), '000.wav', '/000.wav')
         report['menu_000.wav'] = 'ok'
     except Exception as e:
         report['menu_000.wav'] = f'FAIL: {e}'
@@ -342,6 +342,11 @@ def setup():
     for name, text in TR_PROMPTS.items():
         try:
             report[name] = 'OK' if ym_upload(tts_wav(text), name + '.wav', f'/6/{name}.wav') else 'FAIL'
+        except Exception as e:
+            report[name] = f'FAIL: {e}'
+    for name, text in NEWS_PROMPTS.items():
+        try:
+            report[name] = 'OK' if ym_upload(tts_wav(text), name + '.wav', f'/7/{name}.wav') else 'FAIL'
         except Exception as e:
             report[name] = f'FAIL: {e}'
     for name in LIB_PROMPTS:
@@ -755,6 +760,121 @@ def yemot_lib():
 
     except Exception as e:
         log.exception('lib call=%s error: %s', call_id, e)
+        return text_response('id_list_message=f-error')
+
+
+# ---------- News flash (extension 7) ----------
+
+NEWS_PROMPTS = {
+    'news_searching': 'רגע אחד, מביאה את הכותרות הכי חמות.',
+    'news_wait': 'עוד רגע קטן, הכותרות בדרך.',
+    'news_intro': 'מבזק חדשות. הכותרות העדכניות:',
+    'news_menu': 'לשמיעת המבזק שוב עם כותרות מעודכנות, הקישו 1. לחזרה לתפריט הראשי, הקישו 0.',
+    'news_error': 'סליחה, לא הצלחתי להביא את החדשות עכשיו. נסו שוב עוד קצת. להתראות!',
+}
+NEWS_FEEDS = (
+    'https://www.ynet.co.il/Integration/StoryRss2.xml',
+    'https://rcs.mako.co.il/rss/31750a2610f26110VgnVCM1000005201000aRCRD.xml',
+)
+NEWS_RATE = os.environ.get('NEWS_RATE', '+15%')
+
+def news_headlines(limit=10):
+    import xml.etree.ElementTree as ET
+    for feed in NEWS_FEEDS:
+        try:
+            data = urllib.request.urlopen(urllib.request.Request(feed, headers={'User-Agent': 'Mozilla/5.0'}),
+                                          timeout=15).read(2_000_000)
+            root = ET.fromstring(data)
+            titles = []
+            for item in root.iter('item'):
+                t = (item.findtext('title') or '').strip()
+                t = re.sub(r'\s+', ' ', t)
+                if t and len(t) > 8 and t not in titles:
+                    titles.append(t)
+                if len(titles) >= limit:
+                    break
+            if len(titles) >= 3:
+                log.info('news: %d headlines from %s', len(titles), feed)
+                return titles
+        except Exception as e:
+            log.warning('news feed %s failed: %s', feed, e)
+    return []
+
+news_jobs = {}
+
+def fetch_news(call_id):
+    job = news_jobs[call_id]
+    try:
+        titles = news_headlines(10)
+        if not titles:
+            raise ValueError('no headlines')
+        files = []
+        for i, t in enumerate(titles, 1):
+            ym_upload(tts_wav(t, rate=NEWS_RATE), f'news_h{i}.wav', f'/7/news_h{i}.wav')
+            files.append(f'f-news_h{i}')
+        job.update(status='ready', chain='f-news_intro.' + '.'.join(files) + '.f-news_menu')
+        log.info('news ready call=%s: %d headlines', call_id, len(files))
+    except Exception as e:
+        log.warning('news fetch failed call=%s: %s', call_id, e)
+        job.update(status='error', err=str(e)[:200])
+
+@app.route('/yemot-news', methods=['GET', 'POST'])
+def yemot_news():
+    params = request.values
+    if params.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    call_id = params.get('ApiCallId') or str(time.time_ns())
+    if params.get('hangup') == 'yes':
+        with lock:
+            news_jobs.pop(call_id, None)
+        return text_response('')
+
+    s_val, turn = None, 0
+    for k, v in params.items():
+        if re.fullmatch(r'S\d+', k):
+            s_val, turn = v, int(k[1:])
+
+    with lock:
+        job = news_jobs.setdefault(call_id, {'stage': 'start', 'status': 'idle', 'started': time.time()})
+
+    if s_val is None:
+        job.update(stage='start', status='working', started=time.time())
+        threading.Thread(target=fetch_news, args=(call_id,), daemon=True).start()
+        return text_response('read=f-news_searching=S1,no,no')
+
+    try:
+        stage = job.get('stage', 'start')
+
+        if stage == 'start':
+            st = job.get('status')
+            if st == 'working':
+                if time.time() - job.get('started', 0) > 120:
+                    job.update(status='error')
+                else:
+                    return text_response(f'read=f-news_wait=S{turn+1},no,no')
+            if st == 'error' or job.get('status') == 'error':
+                with lock:
+                    news_jobs.pop(call_id, None)
+                return text_response('id_list_message=f-news_error')
+            job['stage'] = 'again'
+            return text_response(f"read={job['chain']}=S{turn+1},,1,1,Digits,yes")
+
+        if stage == 'again':
+            v = (s_val or '').strip()
+            if v == '1':
+                job.update(stage='start', status='working', started=time.time())
+                threading.Thread(target=fetch_news, args=(call_id,), daemon=True).start()
+                return text_response(f'read=f-news_searching=S{turn+1},no,no')
+            with lock:
+                news_jobs.pop(call_id, None)
+            return text_response('go_to_folder=/')
+
+        with lock:
+            news_jobs.pop(call_id, None)
+        return text_response('go_to_folder=/')
+
+    except Exception as e:
+        log.exception('news call=%s error: %s', call_id, e)
         return text_response('id_list_message=f-error')
 
 
