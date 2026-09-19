@@ -3,3 +3,5 @@ gunicorn==22.0.0
 requests==2.32.3
 edge-tts==7.2.8
 miniaudio==1.61
+yt-dlp>=2025.9.0
+imageio-ffmpeg>=0.5.1
