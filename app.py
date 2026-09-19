@@ -1,4 +1,4 @@
-import os, re, io, json, time, wave, asyncio, logging, threading
+import os, re, io, json, time, wave, asyncio, logging, threading, subprocess
 import requests
 from flask import Flask, request, Response
 
@@ -18,6 +18,7 @@ EDGE_VOICE = os.environ.get('EDGE_VOICE', 'he-IL-HilaNeural')
 EXT_DIR = os.environ.get('YM_AI_EXT', '/1')          # the api extension folder
 IN_DIR = '/AI/in'                                    # caller recordings
 HIST_DIR = '/AI/history'                             # per-caller history json (as .txt)
+SONG_DIR = os.environ.get('YM_SONG_EXT', '/2')        # the songs api extension folder
 MAX_DAILY_TURNS = int(os.environ.get('MAX_DAILY_TURNS', '60'))
 
 YM_API = 'https://www.call2all.co.il/ym/api'
@@ -193,7 +194,7 @@ def setup():
     report = {}
     # root menu greeting lives at /000.wav (played by the root menu extension)
     try:
-        ym_upload(tts_wav('ברוכים הבאים! לשיחה עם אוזן, הקישו 1.'), '000.wav', '/000.wav')
+        ym_upload(tts_wav('ברוכים הבאים! לשיחה עם אוזן, הקישו 1. לשיר מיוטיוב, הקישו 2.'), '000.wav', '/000.wav')
         report['menu_000.wav'] = 'ok'
     except Exception as e:
         report['menu_000.wav'] = f'FAIL: {e}'
@@ -204,6 +205,12 @@ def setup():
         'error.wav': 'סליחה, הייתה תקלה טכנית. נסו שוב קצת מאוחר יותר. להתראות!',
         'tired.wav': 'וואו, דיברנו היום המון! נגמרו לי הכוחות להיום. נדבר מחר, בסדר? להתראות!',
     }
+    for name, text in SONG_PROMPTS.items():
+        try:
+            ym_upload(tts_wav(text), name, f'{SONG_DIR}/{name}')
+            report[name] = 'ok'
+        except Exception as e:
+            report[name] = f'FAIL: {e}'
     for name, text in assets.items():
         try:
             ym_upload(tts_wav(text), name, f'{EXT_DIR}/{name}')
@@ -221,6 +228,147 @@ def setup():
     except Exception as e:
         report['groq_stt'] = f'FAIL: {e}'
     return report
+
+# ---------- YouTube songs (extension 2) ----------
+
+SONG_PROMPTS = {
+    'song_ask': 'איזה שיר בא לכם? אמרו את שם השיר, אפשר גם את הזמר. דברו אחרי הצליל, ולסיום הקישו סולמית.',
+    'song_searching': 'רגע אחד, אני מחפשת את השיר. זה יכול לקחת חצי דקה.',
+    'song_wait': 'עוד ממש קצת, השיר כבר בדרך.',
+    'song_notfound': 'סליחה, לא הצלחתי למצוא את השיר הזה. נסו שיר אחר. איזה שיר בא לכם?',
+    'song_more': 'איזה עוד שיר בא לכם? אמרו את שם השיר, או נתקו.',
+    'song_bye': 'כיף היה! נתראה בשיר הבא. להתראות!',
+}
+song_jobs = {}
+
+def fetch_song(call_id, query):
+    job = song_jobs[call_id]
+    tmp = f'/tmp/song-{call_id}'
+    try:
+        import yt_dlp, imageio_ffmpeg, glob as _glob
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': tmp + '.%(ext)s',
+            'quiet': True, 'no_warnings': True, 'noplaylist': True,
+            'match_filter': yt_dlp.utils.match_filter_func(['duration < 600']),
+        }
+        url = query if re.match(r'https?://', query) else f'ytsearch1:{query}'
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            ent = info['entries'][0] if info.get('entries') else info
+            title = ent.get('title') or 'שיר'
+        src = sorted(_glob.glob(tmp + '.*'))[0]
+        out = tmp + '.wav'
+        subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-i', src,
+                        '-ar', '16000', '-ac', '1', '-f', 'wav', out],
+                       check=True, capture_output=True, timeout=120)
+        name = 'song' + re.sub(r'\D', '', call_id)[-6:]
+        with open(out, 'rb') as f:
+            ym_upload(f.read(), name + '.wav', f'{SONG_DIR}/{name}.wav')
+        for f_ in _glob.glob(tmp + '.*'):
+            try: os.remove(f_)
+            except OSError: pass
+        job.update(status='ready', title=title, name=name)
+        log.info('song ready call=%s title=%s', call_id, title[:60])
+    except Exception as e:
+        log.warning('song fetch failed call=%s: %s', call_id, e)
+        job.update(status='error', err=str(e)[:200])
+
+GOODBYE_WORDS = ('להתראות', 'ביי', 'נתק', 'לנתק', 'תודה ביי', 'די', 'סיום')
+
+@app.route('/yemot-song', methods=['GET', 'POST'])
+def yemot_song():
+    params = request.values
+    if params.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    call_id = params.get('ApiCallId') or str(time.time_ns())
+    if params.get('hangup') == 'yes':
+        with lock:
+            song_jobs.pop(call_id, None)
+        return text_response('')
+
+    s_val, turn = None, 0
+    for k, v in params.items():
+        if re.fullmatch(r'S\d+', k):
+            s_val, turn = v, int(k[1:])
+
+    with lock:
+        job = song_jobs.setdefault(call_id, {'stage': 'ask', 'status': 'idle', 'started': time.time()})
+
+    if s_val is None:
+        return text_response(f'read=f-song_ask=S1,no,record,{IN_DIR},,no')
+
+    try:
+        stage = job['stage']
+
+        if stage == 'ask':
+            rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
+            wav = ym_download(rec_path)
+            text = groq_stt(wav)
+            ym_delete(rec_path)
+            log.info('song req call=%s: %s', call_id, (text or '')[:80])
+            if not text:
+                return text_response(f'read=f-didnt_hear=S{turn+1},no,record,{IN_DIR},,no')
+            if any(w in text for w in GOODBYE_WORDS) and len(text) < 25:
+                with lock:
+                    song_jobs.pop(call_id, None)
+                return text_response('id_list_message=f-song_bye')
+            job.update(stage='wait', status='working', query=text)
+            threading.Thread(target=fetch_song, args=(call_id, text), daemon=True).start()
+            return text_response(f'read=f-song_searching=S{turn+1},no,no')
+
+        if stage == 'wait':
+            st = job.get('status')
+            if st == 'working':
+                if time.time() - job.get('started', 0) > 150:
+                    job.update(stage='ask', status='idle')
+                    return text_response(f'read=f-song_notfound=S{turn+1},no,record,{IN_DIR},,no')
+                return text_response(f'read=f-song_wait=S{turn+1},no,no')
+            if st == 'error':
+                job.update(stage='ask', status='idle')
+                return text_response(f'read=f-song_notfound=S{turn+1},no,record,{IN_DIR},,no')
+            job['stage'] = 'play'
+            return text_response(f"read=f-{job['name']}=S{turn+1},no,no")
+
+        if stage == 'play':
+            job.update(stage='ask', status='idle')
+            return text_response(f'read=f-song_more=S{turn+1},no,record,{IN_DIR},,no')
+
+        job['stage'] = 'ask'
+        return text_response(f'read=f-song_ask=S{turn+1},no,record,{IN_DIR},,no')
+
+    except Exception as e:
+        log.exception('song call=%s error: %s', call_id, e)
+        return text_response('id_list_message=f-error')
+
+@app.route('/song-test')
+def song_test():
+    if request.args.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    q = request.args.get('q', 'שלום עליכם')
+    t0 = time.time()
+    tmp = f'/tmp/stest-{time.time_ns()}'
+    try:
+        import yt_dlp, imageio_ffmpeg, glob as _glob
+        ydl_opts = {'format': 'bestaudio/best', 'outtmpl': tmp + '.%(ext)s',
+                    'quiet': True, 'no_warnings': True, 'noplaylist': True,
+                    'match_filter': yt_dlp.utils.match_filter_func(['duration < 600'])}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f'ytsearch1:{q}', download=True)
+            ent = info['entries'][0] if info.get('entries') else info
+        src = sorted(_glob.glob(tmp + '.*'))[0]
+        out = tmp + '.wav'
+        subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-i', src,
+                        '-ar', '16000', '-ac', '1', '-f', 'wav', out],
+                       check=True, capture_output=True, timeout=120)
+        size = os.path.getsize(out)
+        for f_ in _glob.glob(tmp + '.*'):
+            try: os.remove(f_)
+            except OSError: pass
+        return {'ok': True, 'title': ent.get('title'), 'duration': ent.get('duration'),
+                'wav_bytes': size, 'elapsed_s': round(time.time() - t0, 1)}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)[:400], 'elapsed_s': round(time.time() - t0, 1)}
 
 @app.route('/yemot', methods=['GET', 'POST'])
 def yemot():
