@@ -130,6 +130,7 @@ def yt_download(video_id, outtmpl):
         ydl.download([url])
     return title, duration
 EDGE_VOICE = os.environ.get('EDGE_VOICE', 'he-IL-HilaNeural')
+EDGE_RATE = os.environ.get('EDGE_RATE', '+0%')
 EXT_DIR = os.environ.get('YM_AI_EXT', '/1')          # the api extension folder
 IN_DIR = '/AI/in'                                    # caller recordings
 HIST_DIR = '/AI/history'                             # per-caller history json (as .txt)
@@ -248,7 +249,7 @@ def tts_wav(text):
     import edge_tts
     mp3_path = f'/tmp/tts-{time.time_ns()}.mp3'
     async def gen():
-        await edge_tts.Communicate(text, EDGE_VOICE).save(mp3_path)
+        await edge_tts.Communicate(text, EDGE_VOICE, rate=EDGE_RATE).save(mp3_path)
     asyncio.run(gen())
     import miniaudio
     snd = miniaudio.decode_file(mp3_path, output_format=miniaudio.SampleFormat.SIGNED16,
