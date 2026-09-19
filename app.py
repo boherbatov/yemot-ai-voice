@@ -207,7 +207,7 @@ def setup():
             log.error('setup asset %s failed: %s', name, e)
     # groq self-tests
     try:
-        report['groq_chat'] = groq_chat([{'role': 'user', 'content': 'ענה במילה אחת: בסדר'}], max_tokens=10)
+        report['groq_chat'] = groq_chat([{'role': 'user', 'content': 'ענה במילה אחת: בסדר'}], max_tokens=64)
     except Exception as e:
         report['groq_chat'] = f'FAIL: {e}'
     try:
