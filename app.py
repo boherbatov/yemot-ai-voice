@@ -130,7 +130,6 @@ def yt_download(video_id, outtmpl):
         ydl.download([url])
     return title, duration
 EDGE_VOICE = os.environ.get('EDGE_VOICE', 'he-IL-HilaNeural')
-EDGE_RATE = os.environ.get('EDGE_RATE', '+0%')
 EXT_DIR = os.environ.get('YM_AI_EXT', '/1')          # the api extension folder
 IN_DIR = '/AI/in'                                    # caller recordings
 HIST_DIR = '/AI/history'                             # per-caller history json (as .txt)
@@ -177,6 +176,13 @@ def ym_upload(local_bytes, filename, ym_path):
     j = r.json() if r.headers.get('content-type','').startswith('application/json') else {'raw': r.text[:200]}
     if isinstance(j, dict) and j.get('success') is False:
         raise RuntimeError(f"YM upload rejected: {j.get('message')}")
+    return j
+
+def ym_upload_text(text, ym_path):
+    r = ym_get('UploadTextFile', path=ym_p(ym_path), contents=text)
+    j = r.json()
+    if j.get('responseStatus') != 'OK':
+        raise RuntimeError(f"UploadTextFile rejected: {j.get('message')}")
     return j
 
 def ym_delete(ym_path):
@@ -249,7 +255,7 @@ def tts_wav(text):
     import edge_tts
     mp3_path = f'/tmp/tts-{time.time_ns()}.mp3'
     async def gen():
-        await edge_tts.Communicate(text, EDGE_VOICE, rate=EDGE_RATE).save(mp3_path)
+        await edge_tts.Communicate(text, EDGE_VOICE).save(mp3_path)
     asyncio.run(gen())
     import miniaudio
     snd = miniaudio.decode_file(mp3_path, output_format=miniaudio.SampleFormat.SIGNED16,
@@ -354,7 +360,61 @@ SONG_PROMPTS = {
     'song_notfound': 'סליחה, לא הצלחתי למצוא את השיר הזה. נסו שיר אחר. איזה שיר בא לכם?',
     'song_more': 'איזה עוד שיר בא לכם? אמרו את שם השיר, או נתקו.',
     'song_bye': 'כיף היה! נתראה בשיר הבא. להתראות!',
+    'song_after': 'לשמירת השיר ברשימה, הקישו 1. לשיר נוסף, הקישו 2. לסיום, הקישו 3.',
+    'song_pick': 'להוספה לרשימה חדשה, הקישו 0. להוספה לרשימה קיימת, הקישו את מספר הרשימה, ואז סולמית.',
+    'song_pick_bad': 'אין רשימה עם המספר הזה. הקישו 0 לרשימה חדשה, או מספר של רשימה קיימת, ואז סולמית.',
+    'song_saved': 'השיר נשמר ברשימה מספר',
+    'song_saved_listen': 'להאזנה לרשימה עכשיו, הקישו 1. לחיפוש שיר נוסף, הקישו 2.',
 }
+
+LIB_DIR = os.environ.get('YM_LIB_EXT', '/6')            # playlists root extension
+
+def ym_list_files(path):
+    r = ym_get('GetFiles', path=ym_p(path))
+    d = r.json()
+    if d.get('responseStatus') != 'OK':
+        return []
+    return d.get('files') or []
+
+def playlist_next_number():
+    nums = []
+    for f in ym_list_files(f'ivr2:{LIB_DIR}'):
+        if f.get('fileType') == 'EXT' and f.get('name', '').isdigit():
+            nums.append(int(f['name']))
+    return max(nums) + 1 if nums else 1
+
+def playlist_exists(n):
+    for f in ym_list_files(f'ivr2:{LIB_DIR}'):
+        if f.get('fileType') == 'EXT' and f.get('name') == str(n):
+            return True
+    return False
+
+def playlist_save(n, song_name, title):
+    # copy the song wav from the songs ext into playlist n as the next sequence file
+    try:
+        seq_files = [f['name'] for f in ym_list_files(f'ivr2:{LIB_DIR}/{n}')
+                     if re.fullmatch(r'\d{3}\.wav', f.get('name', ''))]
+        seq = max((int(x[:3]) for x in seq_files), default=0) + 1
+        if not seq_files:
+            ym_upload_text('type=playfile\n', f'ivr2:{LIB_DIR}/{n}/ext.ini')
+        wav = ym_download(f'{SONG_DIR}/{song_name}.wav')
+        ym_upload(wav, f'{seq:03d}.wav', f'ivr2:{LIB_DIR}/{n}/{seq:03d}.wav')
+        titles = {}
+        try:
+            old = ym_get('DownloadFile', path=ym_p(f'ivr2:{LIB_DIR}/{n}/titles.ini')).text
+            for line in old.splitlines():
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    titles[k] = v
+        except Exception:
+            pass
+        titles[f'{seq:03d}'] = title[:120]
+        ym_upload_text(''.join(f'{k}={v}\n' for k, v in sorted(titles.items())),
+                       f'ivr2:{LIB_DIR}/{n}/titles.ini')
+        return seq
+    except Exception as e:
+        log.warning('playlist save failed pl=%s: %s', n, e)
+        return None
 song_jobs = {}
 
 def fetch_song(call_id, query):
@@ -478,6 +538,41 @@ def yemot_song():
             return text_response(f"read=f-{job['name']}=S{turn+1},no,no")
 
         if stage == 'play':
+            job['stage'] = 'after'
+            return text_response(f'read=f-song_after=S{turn+1},,1,1,Digits,yes')
+
+        if stage == 'after':
+            if s_val == '1':
+                job['stage'] = 'save_pick'
+                return text_response(f'read=f-song_pick=S{turn+1},,1,2,Digits,yes')
+            if s_val == '3':
+                with lock:
+                    song_jobs.pop(call_id, None)
+                return text_response('id_list_message=f-song_bye')
+            job.update(stage='ask', status='idle')
+            return text_response(f'read=f-song_more=S{turn+1},no,record,{IN_DIR},,no')
+
+        if stage == 'save_pick':
+            pl = None
+            if s_val == '0':
+                pl = playlist_next_number()
+            elif s_val and s_val.isdigit() and playlist_exists(int(s_val)):
+                pl = int(s_val)
+            if pl is None:
+                return text_response(f'read=f-song_pick_bad=S{turn+1},,1,2,Digits,yes')
+            seq = playlist_save(pl, job['name'], job.get('title', ''))
+            if seq is None:
+                job.update(stage='ask', status='idle')
+                return text_response(f'read=f-error.f-song_more=S{turn+1},no,record,{IN_DIR},,no')
+            job.update(stage='saved_listen', playlist=pl)
+            return text_response(f'read=f-song_saved.n-{pl}.f-song_saved_listen=S{turn+1},,1,1,Digits,yes')
+
+        if stage == 'saved_listen':
+            pl = job.get('playlist')
+            if s_val == '1' and pl:
+                with lock:
+                    song_jobs.pop(call_id, None)
+                return text_response(f'go_to_folder={LIB_DIR}/{pl}')
             job.update(stage='ask', status='idle')
             return text_response(f'read=f-song_more=S{turn+1},no,record,{IN_DIR},,no')
 
