@@ -396,10 +396,13 @@ def pot_test():
     except Exception as e:
         out.append('PING ERR: ' + str(e)[:150])
     try:
+        ea = request.args.get('ea', 'fetch_pot=always')
         r = sp.run(['/opt/venv/bin/yt-dlp', '-v', '--skip-download',
-                    '--extractor-args', 'youtube:player_client=web;fetch_pot=always',
+                    '--extractor-args', 'youtube:' + ea,
                     'https://www.youtube.com/watch?v=UE29iz8zi34'],
                    capture_output=True, text=True, timeout=150)
+        ver = sp.run(['/opt/venv/bin/yt-dlp', '--version'], capture_output=True, text=True)
+        out.append('VERSION: ' + ver.stdout.strip())
         keep = [l for l in (r.stdout + r.stderr).splitlines()
                 if any(k in l.lower() for k in ('bgutil', 'pot', 'plugin', 'visitor', 'sign in', 'error', 'warning', 'po token', 'http'))]
         out.append('YTDLP:\n' + '\n'.join(keep[:50]))
