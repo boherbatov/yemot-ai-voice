@@ -250,6 +250,7 @@ def fetch_song(call_id, query):
             'format': 'bestaudio/best',
             'outtmpl': tmp + '.%(ext)s',
             'quiet': True, 'no_warnings': True, 'noplaylist': True,
+            'extractor_args': {'youtube': {'player_client': ['android_vr']}},
             'match_filter': yt_dlp.utils.match_filter_func(['duration < 600']),
         }
         url = query if re.match(r'https?://', query) else f'ytsearch1:{query}'
@@ -352,6 +353,7 @@ def song_test():
         import yt_dlp, imageio_ffmpeg, glob as _glob
         ydl_opts = {'format': 'bestaudio/best', 'outtmpl': tmp + '.%(ext)s',
                     'quiet': True, 'no_warnings': True, 'noplaylist': True,
+                    'extractor_args': {'youtube': {'player_client': ['android_vr']}},
                     'match_filter': yt_dlp.utils.match_filter_func(['duration < 600'])}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f'ytsearch1:{q}', download=True)
