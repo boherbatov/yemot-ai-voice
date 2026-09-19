@@ -463,10 +463,10 @@ def playlist_save(n, song_name, title):
         seq_files = [f['name'] for f in ym_list_files(f'ivr2:{LIB_DIR}/{n}')
                      if re.fullmatch(r'\d{3}\.wav', f.get('name', ''))]
         seq = max((int(x[:3]) for x in seq_files), default=0) + 1
-        if not seq_files:
-            ym_upload_text('type=playfile\n', f'ivr2:{LIB_DIR}/{n}/ext.ini')
         wav = ym_download(f'{SONG_DIR}/{song_name}.wav')
         ym_upload(wav, f'{seq:03d}.wav', f'ivr2:{LIB_DIR}/{n}/{seq:03d}.wav')
+        if not seq_files:
+            ym_upload_text('type=playfile\n', f'ivr2:{LIB_DIR}/{n}/ext.ini')
         titles = {}
         try:
             old = ym_get('DownloadFile', path=ym_p(f'ivr2:{LIB_DIR}/{n}/titles.ini')).text
