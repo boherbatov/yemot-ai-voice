@@ -1,4 +1,4 @@
-import os, re, io, json, time, wave, asyncio, logging, threading, subprocess
+import os, re, io, json, time, wave, asyncio, logging, threading, subprocess, shutil
 import requests
 import urllib.request
 from flask import Flask, request, Response
@@ -924,7 +924,7 @@ def fetch_ned(call_id):
             job['title_wav'] = f'ned_t{call_id[-6:]}'
         except Exception:
             pass
-        ff = imageio_ffmpeg.get_ffmpeg_exe()
+        ff = shutil.which('ffmpeg') or imageio_ffmpeg.get_ffmpeg_exe()
         ferr = open(tmp + '.log', 'wb')
         proc = subprocess.Popen([ff, '-y', '-headers', 'User-Agent: Mozilla/5.0\r\n', '-i', url,
                                  '-ar', '16000', '-ac', '1', '-f', 'segment', '-segment_time', '600',
