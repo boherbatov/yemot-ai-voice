@@ -114,7 +114,7 @@ def groq_stt(wav_bytes):
 def groq_chat(messages, max_tokens=180):
     r = requests.post(f'{GROQ}/chat/completions',
                       headers={'Authorization': f'Bearer {GROQ_API_KEY}', 'Content-Type': 'application/json'},
-                      json={'model': GROQ_CHAT_MODEL, 'messages': messages,
+                      json={'model': GROQ_CHAT_MODEL, 'messages': messages, 'reasoning_effort': 'low',
                             'temperature': 0.7, 'max_tokens': max_tokens},
                       timeout=40)
     r.raise_for_status()
