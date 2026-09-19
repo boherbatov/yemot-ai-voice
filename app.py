@@ -371,7 +371,8 @@ def song_test():
         return {'ok': True, 'title': ent.get('title'), 'duration': ent.get('duration'),
                 'wav_bytes': size, 'elapsed_s': round(time.time() - t0, 1)}
     except Exception as e:
-        return {'ok': False, 'error': str(e)[:400], 'elapsed_s': round(time.time() - t0, 1)}
+        import traceback
+        return {'ok': False, 'error': str(e)[:300], 'trace': traceback.format_exc()[-900:], 'elapsed_s': round(time.time() - t0, 1)}
 
 @app.route('/yemot', methods=['GET', 'POST'])
 def yemot():
