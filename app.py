@@ -252,14 +252,19 @@ def fetch_song(call_id, query):
             'outtmpl': tmp + '.%(ext)s',
             'quiet': True, 'no_warnings': True, 'noplaylist': True,
             'extractor_args': {'youtube': {'player_client': [YT_CLIENT]}},
-            'match_filter': yt_dlp.utils.match_filter_func(['duration < 600']),
         }
         url = query if re.match(r'https?://', query) else f'ytsearch1:{query}'
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(url, download=False)
             ent = info['entries'][0] if info.get('entries') else info
+            if ent.get('duration') and ent['duration'] > 600:
+                raise ValueError('song too long')
+            ydl.download([ent['webpage_url']])
             title = ent.get('title') or 'שיר'
-        src = sorted(_glob.glob(tmp + '.*'))[0]
+        files = sorted(_glob.glob(tmp + '.*'))
+        if not files:
+            raise ValueError('no file downloaded')
+        src = files[0]
         out = tmp + '.wav'
         subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-i', src,
                         '-ar', '16000', '-ac', '1', '-f', 'wav', out],
@@ -354,12 +359,17 @@ def song_test():
         import yt_dlp, imageio_ffmpeg, glob as _glob
         ydl_opts = {'format': 'bestaudio/best', 'outtmpl': tmp + '.%(ext)s',
                     'quiet': True, 'no_warnings': True, 'noplaylist': True,
-                    'extractor_args': {'youtube': {'player_client': [request.args.get('client', YT_CLIENT)]}},
-                    'match_filter': yt_dlp.utils.match_filter_func(['duration < 600'])}
+                    'extractor_args': {'youtube': {'player_client': [request.args.get('client', YT_CLIENT)]}}}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f'ytsearch1:{q}', download=True)
+            info = ydl.extract_info(f'ytsearch1:{q}', download=False)
             ent = info['entries'][0] if info.get('entries') else info
-        src = sorted(_glob.glob(tmp + '.*'))[0]
+            if ent.get('duration') and ent['duration'] > 600:
+                return {'ok': False, 'error': 'song too long', 'title': ent.get('title')}
+            ydl.download([ent['webpage_url']])
+        files = sorted(_glob.glob(tmp + '.*'))
+        if not files:
+            return {'ok': False, 'error': 'no file downloaded', 'title': ent.get('title'), 'duration': ent.get('duration')}
+        src = files[0]
         out = tmp + '.wav'
         subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-i', src,
                         '-ar', '16000', '-ac', '1', '-f', 'wav', out],
