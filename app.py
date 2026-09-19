@@ -913,6 +913,44 @@ def kan_latest_edition(program_id='11544'):
 
 ned_jobs = {}
 
+NED_STATIC = {'ned_menu', 'ned_searching', 'ned_wait', 'ned_notfound', 'ned_after',
+              'tg_listing', 'tg_searching', 'tg_notfound'}
+
+def ned_sweep_stale():
+    try:
+        j = ym_get('GetIVR2Dir', path=ym_p('/8')).json()
+        files = j.get('files') or []
+        active = set()
+        for cid in ned_jobs:
+            active.add(cid[-6:])
+            active.add(re.sub(r'\D', '', cid)[-6:])
+        for f in files:
+            name = f.get('name', '')
+            base = name[:-4] if name.endswith('.wav') else name
+            if base in NED_STATIC or not re.match(r'^(ned|tg)', base):
+                continue
+            if any(sfx and sfx in base for sfx in active):
+                continue
+            ym_delete(f'/8/{name}')
+            log.info('ned sweep: deleted %s', name)
+    except Exception as e:
+        log.warning('ned sweep failed: %s', e)
+
+def ned_delete_call_files(call_id):
+    try:
+        sfxes = {call_id[-6:], re.sub(r'\D', '', call_id)[-6:]}
+        j = ym_get('GetIVR2Dir', path=ym_p('/8')).json()
+        for f in (j.get('files') or []):
+            name = f.get('name', '')
+            base = name[:-4] if name.endswith('.wav') else name
+            if base in NED_STATIC or not re.match(r'^(ned|tg)', base):
+                continue
+            if any(sfx and sfx in base for sfx in sfxes):
+                ym_delete(f'/8/{name}')
+    except Exception as e:
+        log.warning('ned call cleanup failed: %s', e)
+
+
 def fetch_ned(call_id):
     import imageio_ffmpeg, glob as _glob
     job = ned_jobs[call_id]
@@ -1084,6 +1122,7 @@ def yemot_ned():
     if params.get('hangup') == 'yes':
         with lock:
             ned_jobs.pop(call_id, None)
+        threading.Thread(target=ned_delete_call_files, args=(call_id,), daemon=True).start()
         return text_response('')
 
     s_val, turn = None, 0
@@ -1105,6 +1144,9 @@ def yemot_ned():
             chunks = job['chunks']
             nxt = job['playing'] + 1
             if nxt < len(chunks):
+                if nxt > 0:
+                    prev = chunks[nxt - 1]
+                    threading.Thread(target=ym_delete, args=(f'/8/{prev}.wav',), daemon=True).start()
                 job['playing'] = nxt
                 job['stage'] = 'play'
                 head = f"f-{job['title_wav']}." if nxt == 0 and job.get('title_wav') else ''
@@ -1119,10 +1161,12 @@ def yemot_ned():
             v = (s_val or '').strip()
             if v == '1':
                 job.update(stage='wait_start', status='working', started=time.time(), mode='kan')
+                threading.Thread(target=ned_sweep_stale, daemon=True).start()
                 threading.Thread(target=fetch_ned, args=(call_id,), daemon=True).start()
                 return text_response(f'read=f-ned_searching=S{turn+1},no,no')
             if v == '2':
                 job.update(stage='tg_list_wait', status='working', started=time.time(), mode='tg')
+                threading.Thread(target=ned_sweep_stale, daemon=True).start()
                 threading.Thread(target=tg_list, args=(call_id,), daemon=True).start()
                 return text_response(f'read=f-tg_listing=S{turn+1},no,no')
             with lock:
