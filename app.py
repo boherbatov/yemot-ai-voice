@@ -635,12 +635,12 @@ def yemot_song():
 
         if stage == 'play':
             job['stage'] = 'after'
-            return text_response(f'read=f-song_after=S{turn+1},,1,1,Digits,yes')
+            return text_response(f'read=f-song_after=S{turn+1},no,1,1,7,Digits,yes')
 
         if stage == 'after':
             if s_val == '1':
                 job['stage'] = 'save_pick'
-                return text_response(f'read=f-song_pick=S{turn+1},,1,2,Digits,yes')
+                return text_response(f'read=f-song_pick=S{turn+1},no,1,2,7,Digits,yes')
             if s_val == '3':
                 with lock:
                     song_jobs.pop(call_id, None)
@@ -655,7 +655,7 @@ def yemot_song():
             elif s_val and s_val.isdigit() and playlist_exists(int(s_val)):
                 pl = int(s_val)
             if pl is None:
-                return text_response(f'read=f-song_pick_bad=S{turn+1},,1,2,Digits,yes')
+                return text_response(f'read=f-song_pick_bad=S{turn+1},no,1,2,7,Digits,yes')
             seq = playlist_save(pl, job['name'], job.get('title', ''))
             if seq is None:
                 job.update(stage='ask', status='idle')
@@ -663,9 +663,9 @@ def yemot_song():
             job['playlist'] = pl
             if not playlist_named(pl):
                 job['stage'] = 'name_offer'
-                return text_response(f'read=f-song_saved.n-{pl}.f-song_name_offer=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read=f-song_saved.n-{pl}.f-song_name_offer=S{turn+1},no,1,1,7,Digits,yes')
             job['stage'] = 'saved_listen'
-            return text_response(f'read=f-song_saved.n-{pl}.f-song_saved_listen=S{turn+1},,1,1,Digits,yes')
+            return text_response(f'read=f-song_saved.n-{pl}.f-song_saved_listen=S{turn+1},no,1,1,7,Digits,yes')
 
         if stage == 'name_offer':
             pl = job.get('playlist')
@@ -673,7 +673,7 @@ def yemot_song():
                 job['stage'] = 'name_rec'
                 return text_response(f'read=f-name_rec=S{turn+1},no,record,{IN_DIR},,no')
             job['stage'] = 'saved_listen'
-            return text_response(f'read=f-song_saved_listen=S{turn+1},,1,1,Digits,yes')
+            return text_response(f'read=f-song_saved_listen=S{turn+1},no,1,1,7,Digits,yes')
 
         if stage == 'name_rec':
             pl = job.get('playlist')
@@ -686,9 +686,9 @@ def yemot_song():
             except Exception as e:
                 log.warning('song name save failed pl=%s: %s', pl, e)
                 job['stage'] = 'saved_listen'
-                return text_response(f'read=f-song_saved_listen=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read=f-song_saved_listen=S{turn+1},no,1,1,7,Digits,yes')
             job['stage'] = 'saved_listen'
-            return text_response(f'read=f-name_saved.f-song_saved_listen=S{turn+1},,1,1,Digits,yes')
+            return text_response(f'read=f-name_saved.f-song_saved_listen=S{turn+1},no,1,1,7,Digits,yes')
 
         if stage == 'saved_listen':
             pl = job.get('playlist')
@@ -756,29 +756,29 @@ def yemot_lib():
 
         if stage == 'menu':
             if s_val is None:
-                return text_response(f'read={lib_menu_chain(job)}=S1,,1,1,Digits,yes')
+                return text_response(f'read={lib_menu_chain(job)}=S1,no,1,1,7,Digits,yes')
             if s_val == '0':
                 with lock:
                     lib_jobs.pop(call_id, None)
                 return text_response('go_to_folder=/')
             if s_val == '9':
                 job['stage'] = 'name_pick'
-                return text_response(f'read=f-lib_name_pick=S{turn+1},,1,2,Digits,yes')
+                return text_response(f'read=f-lib_name_pick=S{turn+1},no,1,2,7,Digits,yes')
             n = job.get('keys', {}).get(s_val)
             if n:
                 with lock:
                     lib_jobs.pop(call_id, None)
                 return text_response(f'go_to_folder={LIB_DIR}/{n}')
-            return text_response(f'read=f-lib_bad.{lib_menu_chain(job)}=S{turn+1},,1,1,Digits,yes')
+            return text_response(f'read=f-lib_bad.{lib_menu_chain(job)}=S{turn+1},no,1,1,7,Digits,yes')
 
         if stage == 'name_pick':
             if s_val == '0':
                 job['stage'] = 'menu'
-                return text_response(f'read={lib_menu_chain(job)}=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read={lib_menu_chain(job)}=S{turn+1},no,1,1,7,Digits,yes')
             if s_val and s_val.strip().isdigit() and playlist_exists(int(s_val.strip())):
                 job.update(stage='name_rec', name_target=int(s_val.strip()))
                 return text_response(f'read=f-name_rec=S{turn+1},no,record,{IN_DIR},,no')
-            return text_response(f'read=f-lib_name_bad.f-lib_name_pick=S{turn+1},,1,2,Digits,yes')
+            return text_response(f'read=f-lib_name_bad.f-lib_name_pick=S{turn+1},no,1,2,7,Digits,yes')
 
         if stage == 'name_rec':
             n = job.get('name_target')
@@ -791,12 +791,12 @@ def yemot_lib():
             except Exception as e:
                 log.warning('lib name save failed pl=%s: %s', n, e)
                 job['stage'] = 'menu'
-                return text_response(f'read=f-error.{lib_menu_chain(job)}=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read=f-error.{lib_menu_chain(job)}=S{turn+1},no,1,1,7,Digits,yes')
             job['stage'] = 'menu'
-            return text_response(f'read=f-name_saved.{lib_menu_chain(job)}=S{turn+1},,1,1,Digits,yes')
+            return text_response(f'read=f-name_saved.{lib_menu_chain(job)}=S{turn+1},no,1,1,7,Digits,yes')
 
         job['stage'] = 'menu'
-        return text_response(f'read={lib_menu_chain(job)}=S{turn+1},,1,1,Digits,yes')
+        return text_response(f'read={lib_menu_chain(job)}=S{turn+1},no,1,1,7,Digits,yes')
 
     except Exception as e:
         log.exception('lib call=%s error: %s', call_id, e)
@@ -897,7 +897,7 @@ def yemot_news():
                     news_jobs.pop(call_id, None)
                 return text_response('id_list_message=f-news_error')
             job['stage'] = 'again'
-            return text_response(f"read={job['chain']}=S{turn+1},,1,1,Digits,yes")
+            return text_response(f"read={job['chain']}=S{turn+1},no,1,1,7,Digits,yes")
 
         if stage == 'again':
             v = (s_val or '').strip()
@@ -1173,7 +1173,7 @@ def yemot_ned():
         stage = job.get('stage', 'menu')
 
         if s_val is None:
-            return text_response('read=f-ned_menu=S1,,1,1,Digits,yes')
+            return text_response('read=f-ned_menu=S1,no,1,1,7,Digits,yes')
 
         def serve_next():
             chunks = job['chunks']
@@ -1188,7 +1188,7 @@ def yemot_ned():
                 return text_response(f"read={head}f-{chunks[nxt]}=S{turn+1},no,no")
             if job.get('done') or job.get('status') == 'error':
                 job['stage'] = 'after'
-                return text_response(f'read=f-ned_after=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read=f-ned_after=S{turn+1},no,1,1,7,Digits,yes')
             job['stage'] = 'wait_more'
             return text_response(f'read=f-ned_wait=S{turn+1},no,no')
 
@@ -1211,15 +1211,15 @@ def yemot_ned():
         if stage == 'tg_list_wait':
             if job.get('status') == 'error':
                 job['stage'] = 'menu'
-                return text_response(f'read=f-tg_notfound.f-ned_menu=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read=f-tg_notfound.f-ned_menu=S{turn+1},no,1,1,7,Digits,yes')
             if job.get('status') == 'listed':
                 job['stage'] = 'tg_menu'
                 sfx = call_id[-6:]
                 chain = ''.join(f"f-tg_i{sfx}_{i}." for i in range(1, len(job['tg_items']) + 1))
-                return text_response(f'read={chain}f-tg_pick{sfx}=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read={chain}f-tg_pick{sfx}=S{turn+1},no,1,1,7,Digits,yes')
             if time.time() - job.get('started', 0) > 180:
                 job['stage'] = 'menu'
-                return text_response(f'read=f-tg_notfound.f-ned_menu=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read=f-tg_notfound.f-ned_menu=S{turn+1},no,1,1,7,Digits,yes')
             return text_response(f'read=f-tg_listing=S{turn+1},no,no')
 
         if stage == 'tg_menu':
@@ -1237,12 +1237,12 @@ def yemot_ned():
             nf = 'tg_notfound' if job.get('mode') == 'tg' else 'ned_notfound'
             if job.get('status') == 'error':
                 job['stage'] = 'menu'
-                return text_response(f'read=f-{nf}.f-ned_menu=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read=f-{nf}.f-ned_menu=S{turn+1},no,1,1,7,Digits,yes')
             if job['chunks']:
                 return serve_next()
             if time.time() - job.get('started', 0) > 600:
                 job['stage'] = 'menu'
-                return text_response(f'read=f-{nf}.f-ned_menu=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read=f-{nf}.f-ned_menu=S{turn+1},no,1,1,7,Digits,yes')
             return text_response(f'read=f-ned_wait=S{turn+1},no,no')
 
         if stage == 'play':
@@ -1251,7 +1251,7 @@ def yemot_ned():
         if stage == 'wait_more':
             if job.get('status') == 'error':
                 job['stage'] = 'after'
-                return text_response(f'read=f-ned_after=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read=f-ned_after=S{turn+1},no,1,1,7,Digits,yes')
             return serve_next()
 
         if stage == 'after':
@@ -1586,7 +1586,7 @@ def yemot_pod():
         job = pod_jobs.setdefault(call_id, {'stage': 'menu', 'page': 1, 'status': 'idle', 'started': time.time()})
 
     if s_val is None:
-        return text_response('read=f-pod_menu1=S1,,1,2,Digits,yes')
+        return text_response('read=f-pod_menu1=S1,no,1,2,7,Digits,yes')
 
     try:
         stage = job['stage']
@@ -1595,29 +1595,29 @@ def yemot_pod():
             v = (s_val or '').strip()
             if v == '0' or v == '':
                 job['page'] = job.get('page', 1) % 3 + 1
-                return text_response(f"read=f-pod_menu{job['page']}=S{turn+1},,1,2,Digits,yes")
+                return text_response(f"read=f-pod_menu{job['page']}=S{turn+1},no,1,2,7,Digits,yes")
             if v.isdigit() and 1 <= int(v) <= len(PODCASTS):
                 job.update(stage='pod_wait', status='working', idx=int(v) - 1, ep=0, started=time.time())
                 threading.Thread(target=fetch_pod, args=(call_id, job['idx'], 0), daemon=True).start()
                 return text_response(f'read=f-pod_searching=S{turn+1},no,no')
-            return text_response(f"read=f-pod_menu{job.get('page',1)}=S{turn+1},,1,2,Digits,yes")
+            return text_response(f"read=f-pod_menu{job.get('page',1)}=S{turn+1},no,1,2,7,Digits,yes")
 
         if stage == 'pod_wait':
             st = job.get('status')
             if st == 'working':
                 if time.time() - job.get('started', 0) > 300:
                     job.update(stage='menu', status='idle', page=1)
-                    return text_response(f'read=f-pod_notfound.f-pod_menu1=S{turn+1},,1,2,Digits,yes')
+                    return text_response(f'read=f-pod_notfound.f-pod_menu1=S{turn+1},no,1,2,7,Digits,yes')
                 return text_response(f'read=f-pod_wait=S{turn+1},no,no')
             if st == 'error':
                 job.update(stage='menu', status='idle', page=1)
-                return text_response(f'read=f-pod_notfound.f-pod_menu1=S{turn+1},,1,2,Digits,yes')
+                return text_response(f'read=f-pod_notfound.f-pod_menu1=S{turn+1},no,1,2,7,Digits,yes')
             job['stage'] = 'pod_play'
             return text_response(f"read=f-{job['name']}=S{turn+1},no,no")
 
         if stage == 'pod_play':
             job['stage'] = 'pod_after'
-            return text_response(f'read=f-pod_after=S{turn+1},,1,1,Digits,yes')
+            return text_response(f'read=f-pod_after=S{turn+1},no,1,1,7,Digits,yes')
 
         if stage == 'pod_after':
             v = (s_val or '').strip()
@@ -1627,7 +1627,7 @@ def yemot_pod():
                 return text_response('go_to_folder=/')
             if v == '3':
                 job.update(stage='menu', page=1)
-                return text_response(f'read=f-pod_menu1=S{turn+1},,1,2,Digits,yes')
+                return text_response(f'read=f-pod_menu1=S{turn+1},no,1,2,7,Digits,yes')
             if v in ('1', '2'):
                 ep = job.get('ep', 0) + (1 if v == '1' else -1)
                 if ep < 0:
@@ -1636,10 +1636,10 @@ def yemot_pod():
                 threading.Thread(target=fetch_pod, args=(call_id, job['idx'], ep), daemon=True).start()
                 return text_response(f'read=f-pod_searching=S{turn+1},no,no')
             job['stage'] = 'pod_after'
-            return text_response(f'read=f-pod_after=S{turn+1},,1,1,Digits,yes')
+            return text_response(f'read=f-pod_after=S{turn+1},no,1,1,7,Digits,yes')
 
         job['stage'] = 'menu'
-        return text_response(f'read=f-pod_menu1=S{turn+1},,1,2,Digits,yes')
+        return text_response(f'read=f-pod_menu1=S{turn+1},no,1,2,7,Digits,yes')
 
     except Exception as e:
         log.exception('pod call=%s error: %s', call_id, e)
@@ -1854,7 +1854,7 @@ def yemot_translate():
         job = tr_jobs.setdefault(call_id, {'stage': 'src', 'status': 'idle', 'started': time.time()})
 
     if s_val is None:
-        return text_response('read=f-tr_src=S1,,1,1,Digits,yes')
+        return text_response('read=f-tr_src=S1,no,1,1,7,Digits,yes')
 
     try:
         stage = job['stage']
@@ -1862,14 +1862,14 @@ def yemot_translate():
         if stage == 'src':
             if s_val and s_val.isdigit() and 1 <= int(s_val) <= len(LANGS):
                 job.update(stage='dst', src=int(s_val) - 1)
-                return text_response(f'read=f-tr_dst=S{turn+1},,1,1,Digits,yes')
-            return text_response(f'read=f-tr_src=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read=f-tr_dst=S{turn+1},no,1,1,7,Digits,yes')
+            return text_response(f'read=f-tr_src=S{turn+1},no,1,1,7,Digits,yes')
 
         if stage == 'dst':
             if s_val and s_val.isdigit() and 1 <= int(s_val) <= len(LANGS):
                 job.update(stage='tr_ask', dst=int(s_val) - 1)
                 return text_response(f'read=f-tr_ask=S{turn+1},no,record,{IN_DIR},,no')
-            return text_response(f'read=f-tr_dst=S{turn+1},,1,1,Digits,yes')
+            return text_response(f'read=f-tr_dst=S{turn+1},no,1,1,7,Digits,yes')
 
         if stage in ('tr_ask', 'tr_play'):
             rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
@@ -1881,7 +1881,7 @@ def yemot_translate():
                 return text_response(f'read=f-didnt_hear=S{turn+1},no,record,{IN_DIR},,no')
             if 'החלפ' in text and 'שפה' in text:
                 job.update(stage='src', status='idle')
-                return text_response(f'read=f-tr_src=S{turn+1},,1,1,Digits,yes')
+                return text_response(f'read=f-tr_src=S{turn+1},no,1,1,7,Digits,yes')
             job.update(stage='tr_working', status='working', started=time.time())
             threading.Thread(target=fetch_translation, args=(call_id, text, job['src'], job['dst']), daemon=True).start()
             return text_response(f'read=f-tr_working=S{turn+1},no,no')
@@ -1900,7 +1900,7 @@ def yemot_translate():
             return text_response(f"read=f-{job['name']}=S{turn+1},no,no")
 
         job['stage'] = 'src'
-        return text_response(f'read=f-tr_src=S{turn+1},,1,1,Digits,yes')
+        return text_response(f'read=f-tr_src=S{turn+1},no,1,1,7,Digits,yes')
 
     except Exception as e:
         log.exception('tr call=%s error: %s', call_id, e)
