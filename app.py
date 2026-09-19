@@ -1,5 +1,6 @@
 import os, re, io, json, time, wave, asyncio, logging, threading, subprocess
 import requests
+import urllib.request
 from flask import Flask, request, Response
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -327,6 +328,11 @@ def setup():
         'error.wav': 'סליחה, הייתה תקלה טכנית. נסו שוב קצת מאוחר יותר. להתראות!',
         'tired.wav': 'וואו, דיברנו היום המון! נגמרו לי הכוחות להיום. נדבר מחר, בסדר? להתראות!',
     }
+    for name, text in POD_PROMPTS.items():
+        try:
+            report[name] = 'OK' if ym_upload(tts_wav(text), name + '.wav', f'/3/{name}.wav') else 'FAIL'
+        except Exception as e:
+            report[name] = f'FAIL: {e}'
     for name in LIB_PROMPTS:
         try:
             report[name] = 'OK' if ym_upload(tts_wav(SONG_PROMPTS[name]), name + '.wav', f'/5/{name}.wav') else 'FAIL'
@@ -609,6 +615,259 @@ def yemot_lib():
         return text_response(f'go_to_folder={LIB_DIR}/{int(s_val)}')
     return text_response(f'read=f-lib_bad=S{turn+1},,1,2,Digits,yes')
 
+
+# ---------- Podcasts (extension 3) ----------
+
+PODCASTS = [
+ {
+  "title": "אחד ביום",
+  "feed": "https://www.omnycontent.com/d/playlist/2ee97a4e-8795-4260-9648-accf00a38c6a/ac2da21e-2193-4683-bcb5-accf011076ad/409bad89-c4c2-46cb-b69b-accf01152781/podcast.rss"
+ },
+ {
+  "title": "פודקאסט שולחן 4",
+  "feed": "https://anchor.fm/s/1047a9180/podcast/rss"
+ },
+ {
+  "title": "לוינסון על הבוקר",
+  "feed": "https://anchor.fm/s/1173f6c14/podcast/rss"
+ },
+ {
+  "title": "השבוע - פודקאסט הארץ",
+  "feed": "https://www.omnycontent.com/d/playlist/397b9456-4f75-4509-acff-ac0600b4a6a4/fdef9415-eb17-45d7-85fd-ac08009235b2/4c9f1a8f-8a0e-4f10-b01f-ac08009235b7/podcast.rss"
+ },
+ {
+  "title": "למי אכפת",
+  "feed": "https://feeds.megaphone.fm/POLTD2511095846"
+ },
+ {
+  "title": "הפודיום",
+  "feed": "https://feeds.megaphone.fm/POLTD9711993371"
+ },
+ {
+  "title": "בזמן שעבדתם",
+  "feed": "https://www.omnycontent.com/d/playlist/2ee97a4e-8795-4260-9648-accf00a38c6a/a5d4b51f-5b9e-43db-84da-ace100c04108/0ab18f83-1327-4f4e-9d7a-ace100c0411f/podcast.rss"
+ },
+ {
+  "title": "הקרנף עם יואב רבינוביץ",
+  "feed": "https://feeds.megaphone.fm/POLTD2316968013"
+ },
+ {
+  "title": "תרגעו",
+  "feed": "https://feeds.megaphone.fm/POLTD1402661471"
+ },
+ {
+  "title": "הסכתוס",
+  "feed": "https://www.haaretz.co.il/srv/podcast-channel?id=0000018f-7c4b-d430-a38f-fdefbcbe0001&caller=apple"
+ },
+ {
+  "title": "בוקר חדש",
+  "feed": "https://rss.buzzsprout.com/2186489.rss"
+ },
+ {
+  "title": "בגג של יצחקי",
+  "feed": "https://feeds.transistor.fm/7491e803-4380-4b16-af05-0e30d031de2e"
+ },
+ {
+  "title": "קיקטוק",
+  "feed": "https://anchor.fm/s/10ea649d8/podcast/rss"
+ },
+ {
+  "title": "ציון 3",
+  "feed": "http://tziun3.co.il/?feed=podcast"
+ },
+ {
+  "title": "פודקאסט רצח",
+  "feed": "https://anchor.fm/s/96515a90/podcast/rss"
+ },
+ {
+  "title": "הפודקאסט של נדב פרי",
+  "feed": "https://anchor.fm/s/10ea64dc0/podcast/rss"
+ },
+ {
+  "title": "מנועי הכסף",
+  "feed": "https://www.omnycontent.com/d/playlist/178d72a7-a889-4132-8008-a5cc014ed109/c39a4cf6-7e84-43fa-bfa4-b31b00e05cfc/8a5aa674-a749-43c7-86c3-b31b00e06274/podcast.rss"
+ },
+ {
+  "title": "התשובה עם דורון פישלר",
+  "feed": "https://www.spreaker.com/show/4228834/episodes/feed"
+ },
+ {
+  "title": "חוץ לארץ",
+  "feed": "https://www.omnycontent.com/d/playlist/397b9456-4f75-4509-acff-ac0600b4a6a4/6b5c19f7-a385-49c0-bb95-ad4a0071daea/08535d76-8bf4-4bf2-af8d-ad4a007205a3/podcast.rss"
+ },
+ {
+  "title": "לשחרר את הדב",
+  "feed": "https://feeds.megaphone.fm/POLTD4092016598"
+ },
+ {
+  "title": "הברזייה",
+  "feed": "https://www.omnycontent.com/d/playlist/de0f04c1-f777-4661-b029-af6d01426cad/73069524-c0c4-4ec1-b655-af7800691ad1/b5976e80-88f6-48df-9588-af7800691afb/podcast.rss"
+ },
+ {
+  "title": "גיקונומי",
+  "feed": "https://feed.podbean.com/geekonomy/feed.xml"
+ },
+ {
+  "title": "שוט",
+  "feed": "https://feeds.megaphone.fm/POLTD5343938075"
+ },
+ {
+  "title": "מפלגת המחשבות",
+  "feed": "https://rss.buzzsprout.com/1740993.rss"
+ },
+ {
+  "title": "איך לעשות דברים",
+  "feed": "https://www.omnycontent.com/d/playlist/23f697a0-7e6a-4e96-a223-a82c00962b12/3517d295-90e8-402c-8427-b1d7009673de/2d82c4ea-e957-40ac-b9f9-b1d7009a3e97/podcast.rss"
+ },
+ {
+  "title": "החיים החדשים של רומי גונן",
+  "feed": "https://www.omnycontent.com/d/playlist/2ee97a4e-8795-4260-9648-accf00a38c6a/e0e7792b-8eaf-4f49-9f94-b42700b6b6fd/99a84147-703b-4c06-8b0d-b42700b6bb36/podcast.rss"
+ },
+ {
+  "title": "האינטרסנטים",
+  "feed": "https://www.omnycontent.com/d/playlist/397b9456-4f75-4509-acff-ac0600b4a6a4/161f6359-650a-4e72-9090-ac07017cc8e0/f4c15dc2-8e2b-4391-b534-ac07017cc8f8/podcast.rss"
+ },
+ {
+  "title": "מיכה סטוקס על שוק ההון",
+  "feed": "https://app.kajabi.com/podcasts/2147619382/feed"
+ },
+ {
+  "title": "חושבים טוב",
+  "feed": "https://feeds.simplecast.com/w2pVTj5d"
+ },
+ {
+  "title": "השקעות לעצלנים",
+  "feed": "https://anchor.fm/s/ef1f5500/podcast/rss"
+ }
+]
+
+POD_PROMPTS = {
+    'pod_menu1': "להאזנה, הקישו את מספר הפודקאסט וסולמית. 1, אחד ביום . 2, פודקאסט שולחן 4 . 3, לוינסון על הבוקר . 4, השבוע - פודקאסט הארץ . 5, למי אכפת . 6, הפודיום . 7, בזמן שעבדתם . 8, הקרנף עם יואב רבינוביץ . 9, תרגעו . 10, הסכתוס. לרשימה הבאה, הקישו 0 וסולמית.",
+    'pod_menu2': "להאזנה, הקישו את מספר הפודקאסט וסולמית. 11, בוקר חדש . 12, בגג של יצחקי . 13, קיקטוק . 14, ציון 3 . 15, פודקאסט רצח . 16, הפודקאסט של נדב פרי . 17, מנועי הכסף . 18, התשובה עם דורון פישלר . 19, חוץ לארץ . 20, לשחרר את הדב. לרשימה הבאה, הקישו 0 וסולמית.",
+    'pod_menu3': "להאזנה, הקישו את מספר הפודקאסט וסולמית. 21, הברזייה . 22, גיקונומי . 23, שוט . 24, מפלגת המחשבות . 25, איך לעשות דברים . 26, החיים החדשים של רומי גונן . 27, האינטרסנטים . 28, מיכה סטוקס על שוק ההון . 29, חושבים טוב . 30, השקעות לעצלנים. לרשימה הבאה, הקישו 0 וסולמית.",
+    'pod_searching': 'רגע אחד, אני מביאה את הפרק האחרון. אם הפרק ארוך, זה יכול לקחת דקה-שתיים.',
+    'pod_wait': 'עוד קצת, הפרק כבר כמעט כאן.',
+    'pod_notfound': 'סליחה, לא הצלחתי להביא את הפרק. נסו פודקאסט אחר.',
+    'pod_after': 'לפרק קודם, הקישו 1. לפרק הבא, הקישו 2. לתפריט הפודקאסטים, הקישו 3. לתפריט הראשי, הקישו 4.',
+}
+pod_jobs = {}
+
+def feed_enclosures(feed_url):
+    req = urllib.request.Request(feed_url, headers={'User-Agent': 'Mozilla/5.0'})
+    data = urllib.request.urlopen(req, timeout=25).read().decode('utf-8', 'ignore')
+    encs = re.findall(r'<enclosure[^>]*url="([^"]+)"', data)
+    return encs
+
+def fetch_pod(call_id, pod_idx, ep_idx):
+    job = pod_jobs[call_id]
+    tmp = f'/tmp/pod-{call_id}'
+    try:
+        import imageio_ffmpeg
+        pod = PODCASTS[pod_idx]
+        encs = feed_enclosures(pod['feed'])
+        if ep_idx >= len(encs):
+            ep_idx = len(encs) - 1
+        if ep_idx < 0:
+            ep_idx = 0
+        url = encs[ep_idx]
+        log.info('pod %s ep %d: %s', pod['title'], ep_idx, url[:80])
+        mp3 = tmp + '.src'
+        urllib.request.urlretrieve(url, mp3)
+        out = tmp + '.wav'
+        subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-i', mp3,
+                        '-ar', '16000', '-ac', '1', '-f', 'wav', out],
+                       check=True, capture_output=True, timeout=600)
+        name = 'pod' + re.sub(r'\D', '', call_id)[-6:]
+        with open(out, 'rb') as f:
+            ym_upload(f.read(), name + '.wav', f'/3/{name}.wav')
+        for f_ in (tmp + '.src', out):
+            try: os.remove(f_)
+            except OSError: pass
+        job.update(status='ready', name=name, ep=ep_idx)
+        log.info('pod ready call=%s %s ep %d', call_id, pod['title'], ep_idx)
+    except Exception as e:
+        log.warning('pod fetch failed call=%s: %s', call_id, e)
+        job.update(status='error', err=str(e)[:200])
+
+@app.route('/yemot-pod', methods=['GET', 'POST'])
+def yemot_pod():
+    params = request.values
+    if params.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    call_id = params.get('ApiCallId') or str(time.time_ns())
+    if params.get('hangup') == 'yes':
+        with lock:
+            pod_jobs.pop(call_id, None)
+        return text_response('')
+
+    s_val, turn = None, 0
+    for k, v in params.items():
+        if re.fullmatch(r'S\d+', k):
+            s_val, turn = v, int(k[1:])
+
+    with lock:
+        job = pod_jobs.setdefault(call_id, {'stage': 'menu', 'page': 1, 'status': 'idle', 'started': time.time()})
+
+    if s_val is None:
+        return text_response('read=f-pod_menu1=S1,,1,2,Digits,yes')
+
+    try:
+        stage = job['stage']
+
+        if stage == 'menu':
+            v = (s_val or '').strip()
+            if v == '0' or v == '':
+                job['page'] = job.get('page', 1) % 3 + 1
+                return text_response(f"read=f-pod_menu{job['page']}=S{turn+1},,1,2,Digits,yes")
+            if v.isdigit() and 1 <= int(v) <= len(PODCASTS):
+                job.update(stage='pod_wait', status='working', idx=int(v) - 1, ep=0, started=time.time())
+                threading.Thread(target=fetch_pod, args=(call_id, job['idx'], 0), daemon=True).start()
+                return text_response(f'read=f-pod_searching=S{turn+1},no,no')
+            return text_response(f"read=f-pod_menu{job.get('page',1)}=S{turn+1},,1,2,Digits,yes")
+
+        if stage == 'pod_wait':
+            st = job.get('status')
+            if st == 'working':
+                if time.time() - job.get('started', 0) > 300:
+                    job.update(stage='menu', status='idle', page=1)
+                    return text_response(f'read=f-pod_notfound.f-pod_menu1=S{turn+1},,1,2,Digits,yes')
+                return text_response(f'read=f-pod_wait=S{turn+1},no,no')
+            if st == 'error':
+                job.update(stage='menu', status='idle', page=1)
+                return text_response(f'read=f-pod_notfound.f-pod_menu1=S{turn+1},,1,2,Digits,yes')
+            job['stage'] = 'pod_play'
+            return text_response(f"read=f-{job['name']}=S{turn+1},no,no")
+
+        if stage == 'pod_play':
+            job['stage'] = 'pod_after'
+            return text_response(f'read=f-pod_after=S{turn+1},,1,1,Digits,yes')
+
+        if stage == 'pod_after':
+            v = (s_val or '').strip()
+            if v == '4':
+                with lock:
+                    pod_jobs.pop(call_id, None)
+                return text_response('go_to_folder=/')
+            if v == '3':
+                job.update(stage='menu', page=1)
+                return text_response(f'read=f-pod_menu1=S{turn+1},,1,2,Digits,yes')
+            if v in ('1', '2'):
+                ep = job.get('ep', 0) + (1 if v == '1' else -1)
+                if ep < 0:
+                    ep = 0
+                job.update(stage='pod_wait', status='working', started=time.time())
+                threading.Thread(target=fetch_pod, args=(call_id, job['idx'], ep), daemon=True).start()
+                return text_response(f'read=f-pod_searching=S{turn+1},no,no')
+            job['stage'] = 'pod_after'
+            return text_response(f'read=f-pod_after=S{turn+1},,1,1,Digits,yes')
+
+        job['stage'] = 'menu'
+        return text_response(f'read=f-pod_menu1=S{turn+1},,1,2,Digits,yes')
+
+    except Exception as e:
+        log.exception('pod call=%s error: %s', call_id, e)
+        return text_response('id_list_message=f-error')
+
 @app.route('/song-test')
 def song_test():
     if request.args.get('secret') != BRIDGE_SECRET:
@@ -650,36 +909,6 @@ def song_test():
     except Exception as e:
         import traceback
         return {'ok': False, 'error': str(e)[:300], 'trace': traceback.format_exc()[-900:], 'elapsed_s': round(time.time() - t0, 1)}
-
-@app.route('/pot-test')
-def pot_test():
-    if request.args.get('secret') != BRIDGE_SECRET:
-        return 'forbidden', 403
-    import subprocess as sp
-    out = []
-    try:
-        import urllib.request
-        out.append('PING: ' + urllib.request.urlopen('http://127.0.0.1:4416/ping', timeout=10).read().decode()[:200])
-    except Exception as e:
-        out.append('PING ERR: ' + str(e)[:150])
-    try:
-        ea = request.args.get('ea', 'fetch_pot=always')
-        args = ['/opt/venv/bin/yt-dlp', '-v', '--skip-download',
-                '--extractor-args', 'youtube:' + ea]
-        js = request.args.get('js')
-        if js:
-            args += ['--js-runtimes', js]
-        args += ['https://www.youtube.com/watch?v=UE29iz8zi34']
-        r = sp.run(args,
-                   capture_output=True, text=True, timeout=150)
-        ver = sp.run(['/opt/venv/bin/yt-dlp', '--version'], capture_output=True, text=True)
-        out.append('VERSION: ' + ver.stdout.strip())
-        keep = [l for l in (r.stdout + r.stderr).splitlines()
-                if any(k in l.lower() for k in ('bgutil', 'pot', 'plugin', 'visitor', 'sign in', 'error', 'warning', 'po token', 'http'))]
-        out.append('YTDLP:\n' + '\n'.join(keep[:50]))
-    except Exception as e:
-        out.append('YTDLP ERR: ' + str(e)[:200])
-    return '<pre>' + '\n\n'.join(out) + '</pre>'
 
 @app.route('/yemot', methods=['GET', 'POST'])
 def yemot():
