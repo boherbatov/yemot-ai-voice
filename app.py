@@ -789,6 +789,63 @@ def fetch_pod(call_id, pod_idx, ep_idx):
         log.warning('pod fetch failed call=%s: %s', call_id, e)
         job.update(status='error', err=str(e)[:200])
 
+
+def pod_display_name(title):
+    t = (title or '').split('|')[0].strip()
+    t = re.sub(r'[A-Za-z][A-Za-z0-9&\' .]*$', '', t).strip(' -–:')
+    if len(re.findall(r'[\u0590-\u05FF]', t)) < 3:
+        t = (title or '').strip()
+    return t[:60]
+
+def refresh_podcasts():
+    """Weekly: pull Apple Podcasts IL chart, verify feeds, rebuild list + Hila menu prompts."""
+    global PODCASTS
+    try:
+        d = json.loads(urllib.request.urlopen(urllib.request.Request(
+            'https://rss.marketingtools.apple.com/api/v2/il/podcasts/top/50/podcasts.json',
+            headers={'User-Agent': 'Mozilla/5.0'}), timeout=25).read())
+        results = d['feed']['results']
+        ids = ','.join(r['id'] for r in results)
+        lk = json.loads(urllib.request.urlopen(f'https://itunes.apple.com/lookup?id={ids}&entity=podcast', timeout=25).read())
+        feeds = {str(r.get('collectionId')): r.get('feedUrl') for r in lk.get('results', [])}
+        hebrew = lambda s: bool(re.search(r'[\u0590-\u05FF]', s or ''))
+        new = []
+        for r in results:
+            feed = feeds.get(r['id'])
+            if not feed or not hebrew(r.get('name', '')):
+                continue
+            try:
+                data = urllib.request.urlopen(urllib.request.Request(feed, headers={'User-Agent': 'Mozilla/5.0'}), timeout=15).read(4_000_000).decode('utf-8', 'ignore')
+                if not re.search(r'<enclosure[^>]*url="', data):
+                    continue
+            except Exception:
+                continue
+            new.append({'title': pod_display_name(r['name']), 'feed': feed})
+            if len(new) >= 30:
+                break
+        if len(new) < 20:
+            log.warning('podcast refresh: only %d valid feeds, keeping old list', len(new))
+            return
+        PODCASTS = new
+        for pg in range(3):
+            lines = [f'{pg*10+i+1}, {e["title"]}' for i, e in enumerate(new[pg*10:pg*10+10]) if e]
+            if not lines:
+                continue
+            txt = 'להאזנה, הקישו את מספר הפודקאסט וסולמית. ' + ' . '.join(lines) + '. לרשימה הבאה, הקישו 0 וסולמית.'
+            ym_upload(tts_wav(txt), f'pod_menu{pg+1}.wav', f'/3/pod_menu{pg+1}.wav')
+        log.info('podcast refresh: list updated (%d podcasts) + menus regenerated', len(new))
+    except Exception as e:
+        log.warning('podcast refresh failed: %s', e)
+
+def podcast_refresh_loop():
+    time.sleep(3 * 24 * 3600)
+    while True:
+        refresh_podcasts()
+        time.sleep(7 * 24 * 3600)
+
+threading.Thread(target=podcast_refresh_loop, daemon=True).start()
+
+
 @app.route('/yemot-pod', methods=['GET', 'POST'])
 def yemot_pod():
     params = request.values
