@@ -15,6 +15,24 @@ BRIDGE_SECRET = os.environ.get('BRIDGE_SECRET', '')
 GROQ_CHAT_MODEL = os.environ.get('GROQ_CHAT_MODEL', 'openai/gpt-oss-120b')
 GROQ_STT_MODEL = os.environ.get('GROQ_STT_MODEL', 'whisper-large-v3-turbo')
 YT_CLIENT = os.environ.get('YT_PLAYER_CLIENT', 'android_vr')
+YT_REFRESH_TOKEN = os.environ.get('YT_REFRESH_TOKEN', '')
+
+def yt_oauth_opts():
+    """Seed yt-dlp-youtube-oauth2 plugin cache from the env refresh token."""
+    if not YT_REFRESH_TOKEN:
+        return {}
+    try:
+        import yt_dlp as _ytdlp, json as _json
+        cache_dir = '/tmp/ytcache'
+        os.makedirs(f'{cache_dir}/youtube-oauth2', exist_ok=True)
+        data = {'access_token': '', 'expires': 0, 'token_type': 'Bearer',
+                'refresh_token': YT_REFRESH_TOKEN}
+        with open(f'{cache_dir}/youtube-oauth2/token_data.json', 'w') as f:
+            _json.dump({'yt-dlp_version': _ytdlp.version.__version__, 'data': data}, f)
+        return {'cachedir': cache_dir, 'username': 'oauth2', 'password': ''}
+    except Exception as e:
+        log.warning('oauth seed failed: %s', e)
+        return {}
 EDGE_VOICE = os.environ.get('EDGE_VOICE', 'he-IL-HilaNeural')
 EXT_DIR = os.environ.get('YM_AI_EXT', '/1')          # the api extension folder
 IN_DIR = '/AI/in'                                    # caller recordings
@@ -252,6 +270,7 @@ def fetch_song(call_id, query):
             'outtmpl': tmp + '.%(ext)s',
             'quiet': True, 'no_warnings': True, 'noplaylist': True,
             'extractor_args': {'youtube': {'player_client': [YT_CLIENT], 'fetch_pot': ['always']}},
+            **yt_oauth_opts(),
         }
         url = query if re.match(r'https?://', query) else f'ytsearch1:{query}'
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -359,7 +378,8 @@ def song_test():
         import yt_dlp, imageio_ffmpeg, glob as _glob
         ydl_opts = {'format': 'bestaudio/best', 'outtmpl': tmp + '.%(ext)s',
                     'quiet': True, 'no_warnings': True, 'noplaylist': True,
-                    'extractor_args': {'youtube': {'player_client': [request.args.get('client', YT_CLIENT)], 'fetch_pot': ['always']}}}
+                    'extractor_args': {'youtube': {'player_client': [request.args.get('client', YT_CLIENT)], 'fetch_pot': ['always']}},
+                    **yt_oauth_opts()}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f'ytsearch1:{q}', download=False)
             ent = info['entries'][0] if info.get('entries') else info
