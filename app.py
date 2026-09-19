@@ -207,7 +207,7 @@ def setup():
     }
     for name, text in SONG_PROMPTS.items():
         try:
-            ym_upload(tts_wav(text), name, f'{SONG_DIR}/{name}')
+            ym_upload(tts_wav(text), name + '.wav', f'{SONG_DIR}/{name}.wav')
             report[name] = 'ok'
         except Exception as e:
             report[name] = f'FAIL: {e}'
