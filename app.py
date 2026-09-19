@@ -233,11 +233,11 @@ def safe_name(p):
 
 # ---------- Groq ----------
 
-def groq_stt(wav_bytes):
+def groq_stt(wav_bytes, language='he'):
     r = requests.post(f'{GROQ}/audio/transcriptions',
                       headers={'Authorization': f'Bearer {GROQ_API_KEY}'},
                       files={'file': ('audio.wav', wav_bytes, 'audio/wav')},
-                      data={'model': GROQ_STT_MODEL, 'language': 'he', 'response_format': 'json'},
+                      data={'model': GROQ_STT_MODEL, 'response_format': 'json', **({'language': language} if language else {})},
                       timeout=40)
     r.raise_for_status()
     return (r.json().get('text') or '').strip()
@@ -339,6 +339,11 @@ def setup():
             report[name] = 'OK' if ym_upload(tts_wav(text), name + '.wav', f'/4/{name}.wav') else 'FAIL'
         except Exception as e:
             report[name] = f'FAIL: {e}'
+    for name, text in TR_PROMPTS.items():
+        try:
+            report[name] = 'OK' if ym_upload(tts_wav(text), name + '.wav', f'/6/{name}.wav') else 'FAIL'
+        except Exception as e:
+            report[name] = f'FAIL: {e}'
     for name in LIB_PROMPTS:
         try:
             report[name] = 'OK' if ym_upload(tts_wav(SONG_PROMPTS[name]), name + '.wav', f'/5/{name}.wav') else 'FAIL'
@@ -388,7 +393,7 @@ SONG_PROMPTS = {
 
 LIB_PROMPTS = ('lib_pick', 'lib_bad')
 
-LIB_DIR = os.environ.get('YM_LIB_EXT', '/6')            # playlists root extension
+LIB_DIR = os.environ.get('YM_LIB_EXT', '/7')            # playlists root extension
 
 def ym_list_files(path):
     r = ym_get('GetFiles', path=ym_p(path))
@@ -1066,6 +1071,130 @@ def yemot_wiki():
 
     except Exception as e:
         log.exception('wiki call=%s error: %s', call_id, e)
+        return text_response('id_list_message=f-error')
+
+
+# ---------- Translation (extension 6) ----------
+
+LANGS = [
+    ('עברית', 'he-IL-HilaNeural', 'Hebrew'),
+    ('אנגלית', 'en-US-AvaNeural', 'English'),
+    ('ערבית', 'ar-EG-SalmaNeural', 'Arabic'),
+    ('רוסית', 'ru-RU-SvetlanaNeural', 'Russian'),
+    ('צרפתית', 'fr-FR-DeniseNeural', 'French'),
+    ('ספרדית', 'es-ES-ElviraNeural', 'Spanish'),
+    ('גרמנית', 'de-DE-KatjaNeural', 'German'),
+    ('רומנית', 'ro-RO-AlinaNeural', 'Romanian'),
+]
+_lang_menu = ' , '.join(f'ל{name} הקישו {i+1}' for i, (name, _, _) in enumerate(LANGS))
+TR_PROMPTS = {
+    'tr_src': 'בחרו שפת מוצא. ' + _lang_menu + '.',
+    'tr_dst': 'בחרו שפת יעד. ' + _lang_menu + '.',
+    'tr_ask': 'דברו את המשפט לתרגום, ולסיום הקישו סולמית.',
+    'tr_working': 'רגע, מתרגמת.',
+    'tr_again': 'למשפט נוסף, דברו אחרי הצליל ולסיום סולמית. להחלפת שפות, אמרו החלפת שפה.',
+    'tr_error': 'סליחה, התרגום נכשל. נסו שוב.',
+}
+tr_jobs = {}
+
+def fetch_translation(call_id, text, src_i, dst_i):
+    job = tr_jobs[call_id]
+    try:
+        src_name, _, src_en = LANGS[src_i]
+        dst_name, dst_voice, dst_en = LANGS[dst_i]
+        r = requests.post(f'{GROQ}/chat/completions',
+                          headers={'Authorization': f'Bearer {GROQ_API_KEY}', 'Content-Type': 'application/json'},
+                          json={'model': GROQ_CHAT_MODEL,
+                                'messages': [
+                                    {'role': 'system', 'content': f'Translate the user text from {src_en} to {dst_en}. Output ONLY the translation, no quotes, no explanations.'},
+                                    {'role': 'user', 'content': text}],
+                                'temperature': 0.3, 'max_tokens': 400},
+                          timeout=40)
+        r.raise_for_status()
+        out = r.json()['choices'][0]['message']['content'].strip()
+        log.info('translate %s->%s: %r -> %r', src_en, dst_en, text[:50], out[:60])
+        wav = tts_wav(out, rate=EDGE_RATE)
+        name = 'tr' + re.sub(r'\D', '', call_id)[-6:]
+        old = job.get('name')
+        if old and old != name:
+            try: ym_delete(f'/6/{old}.wav')
+            except Exception: pass
+        ym_upload(wav, name + '.wav', f'/6/{name}.wav')
+        job.update(status='ready', name=name)
+    except Exception as e:
+        log.warning('translate failed call=%s: %s', call_id, e)
+        job.update(status='error', err=str(e)[:200])
+
+@app.route('/yemot-translate', methods=['GET', 'POST'])
+def yemot_translate():
+    params = request.values
+    if params.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    call_id = params.get('ApiCallId') or str(time.time_ns())
+    if params.get('hangup') == 'yes':
+        with lock:
+            tr_jobs.pop(call_id, None)
+        return text_response('')
+
+    s_val, turn = None, 0
+    for k, v in params.items():
+        if re.fullmatch(r'S\d+', k):
+            s_val, turn = v, int(k[1:])
+
+    with lock:
+        job = tr_jobs.setdefault(call_id, {'stage': 'src', 'status': 'idle', 'started': time.time()})
+
+    if s_val is None:
+        return text_response('read=f-tr_src=S1,,1,1,Digits,yes')
+
+    try:
+        stage = job['stage']
+
+        if stage == 'src':
+            if s_val and s_val.isdigit() and 1 <= int(s_val) <= len(LANGS):
+                job.update(stage='dst', src=int(s_val) - 1)
+                return text_response(f'read=f-tr_dst=S{turn+1},,1,1,Digits,yes')
+            return text_response(f'read=f-tr_src=S{turn+1},,1,1,Digits,yes')
+
+        if stage == 'dst':
+            if s_val and s_val.isdigit() and 1 <= int(s_val) <= len(LANGS):
+                job.update(stage='tr_ask', dst=int(s_val) - 1)
+                return text_response(f'read=f-tr_ask=S{turn+1},no,record,{IN_DIR},,no')
+            return text_response(f'read=f-tr_dst=S{turn+1},,1,1,Digits,yes')
+
+        if stage in ('tr_ask', 'tr_play'):
+            rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
+            wav = ym_download(rec_path)
+            text = groq_stt(wav, language=None)
+            ym_delete(rec_path)
+            log.info('tr req call=%s: %s', call_id, (text or '')[:80])
+            if not text:
+                return text_response(f'read=f-didnt_hear=S{turn+1},no,record,{IN_DIR},,no')
+            if 'החלפ' in text and 'שפה' in text:
+                job.update(stage='src', status='idle')
+                return text_response(f'read=f-tr_src=S{turn+1},,1,1,Digits,yes')
+            job.update(stage='tr_working', status='working', started=time.time())
+            threading.Thread(target=fetch_translation, args=(call_id, text, job['src'], job['dst']), daemon=True).start()
+            return text_response(f'read=f-tr_working=S{turn+1},no,no')
+
+        if stage == 'tr_working':
+            st = job.get('status')
+            if st == 'working':
+                if time.time() - job.get('started', 0) > 90:
+                    job.update(stage='tr_ask', status='idle')
+                    return text_response(f'read=f-tr_error.f-tr_again=S{turn+1},no,record,{IN_DIR},,no')
+                return text_response(f'read=f-tr_working=S{turn+1},no,no')
+            if st == 'error':
+                job.update(stage='tr_ask', status='idle')
+                return text_response(f'read=f-tr_error.f-tr_again=S{turn+1},no,record,{IN_DIR},,no')
+            job['stage'] = 'tr_play'
+            return text_response(f"read=f-{job['name']}=S{turn+1},no,no")
+
+        job['stage'] = 'src'
+        return text_response(f'read=f-tr_src=S{turn+1},,1,1,Digits,yes')
+
+    except Exception as e:
+        log.exception('tr call=%s error: %s', call_id, e)
         return text_response('id_list_message=f-error')
 
 @app.route('/song-test')
