@@ -393,7 +393,7 @@ SONG_PROMPTS = {
 
 LIB_PROMPTS = ('lib_pick', 'lib_bad')
 
-LIB_DIR = os.environ.get('YM_LIB_EXT', '/7')            # playlists root extension
+LIB_DIR = os.environ.get('YM_LIB_EXT', '/16')            # playlists root extension
 
 def ym_list_files(path):
     r = ym_get('GetFiles', path=ym_p(path))
