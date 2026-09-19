@@ -251,7 +251,7 @@ def fetch_song(call_id, query):
             'format': 'bestaudio/best',
             'outtmpl': tmp + '.%(ext)s',
             'quiet': True, 'no_warnings': True, 'noplaylist': True,
-            'extractor_args': {'youtube': {'player_client': [YT_CLIENT]}},
+            'extractor_args': {'youtube': {'player_client': [YT_CLIENT], 'fetch_pot': ['always']}},
         }
         url = query if re.match(r'https?://', query) else f'ytsearch1:{query}'
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -359,7 +359,7 @@ def song_test():
         import yt_dlp, imageio_ffmpeg, glob as _glob
         ydl_opts = {'format': 'bestaudio/best', 'outtmpl': tmp + '.%(ext)s',
                     'quiet': True, 'no_warnings': True, 'noplaylist': True,
-                    'extractor_args': {'youtube': {'player_client': [request.args.get('client', YT_CLIENT)]}}}
+                    'extractor_args': {'youtube': {'player_client': [request.args.get('client', YT_CLIENT)], 'fetch_pot': ['always']}}}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f'ytsearch1:{q}', download=False)
             ent = info['entries'][0] if info.get('entries') else info
@@ -397,7 +397,7 @@ def pot_test():
         out.append('PING ERR: ' + str(e)[:150])
     try:
         r = sp.run(['/opt/venv/bin/yt-dlp', '-v', '--skip-download',
-                    '--extractor-args', 'youtube:player_client=web',
+                    '--extractor-args', 'youtube:player_client=web;fetch_pot=always',
                     'https://www.youtube.com/watch?v=UE29iz8zi34'],
                    capture_output=True, text=True, timeout=150)
         keep = [l for l in (r.stdout + r.stderr).splitlines()
