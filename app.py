@@ -395,6 +395,33 @@ def fetch_song(call_id, query):
 
 GOODBYE_WORDS = ('להתראות', 'ביי', 'נתק', 'לנתק', 'תודה ביי', 'די', 'סיום')
 
+@app.route('/ym-admin')
+def ym_admin():
+    if request.args.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    action = request.args.get('action', 'ReadIniFile')
+    path = request.args.get('path', '')
+    params = {}
+    if action == 'ReadIniFile':
+        params['path'] = ym_p(path)
+    elif action == 'UpdateExtension':
+        params['path'] = ym_p(path)
+        for k, v in request.args.items():
+            if k not in ('secret', 'action', 'path'):
+                params[k] = v
+    elif action == 'GetIIVRSettings':
+        pass
+    else:
+        return {'ok': False, 'error': 'unsupported action'}, 400
+    try:
+        r = ym_get(action, **params)
+        try:
+            return {'ok': True, 'data': r.json()}
+        except Exception:
+            return {'ok': True, 'data': r.text[:4000]}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)[:300]}, 502
+
 @app.route('/yemot-song', methods=['GET', 'POST'])
 def yemot_song():
     params = request.values
