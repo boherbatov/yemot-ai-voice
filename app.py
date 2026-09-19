@@ -327,6 +327,11 @@ def setup():
         'error.wav': 'סליחה, הייתה תקלה טכנית. נסו שוב קצת מאוחר יותר. להתראות!',
         'tired.wav': 'וואו, דיברנו היום המון! נגמרו לי הכוחות להיום. נדבר מחר, בסדר? להתראות!',
     }
+    for name in LIB_PROMPTS:
+        try:
+            report[name] = 'OK' if ym_upload(tts_wav(SONG_PROMPTS[name]), name + '.wav', f'/5/{name}.wav') else 'FAIL'
+        except Exception as e:
+            report[name] = f'FAIL: {e}'
     for name, text in SONG_PROMPTS.items():
         try:
             ym_upload(tts_wav(text), name + '.wav', f'{SONG_DIR}/{name}.wav')
@@ -365,7 +370,11 @@ SONG_PROMPTS = {
     'song_pick_bad': 'אין רשימה עם המספר הזה. הקישו 0 לרשימה חדשה, או מספר של רשימה קיימת, ואז סולמית.',
     'song_saved': 'השיר נשמר ברשימה מספר',
     'song_saved_listen': 'להאזנה לרשימה עכשיו, הקישו 1. לחיפוש שיר נוסף, הקישו 2.',
+    'lib_pick': 'הקישו את מספר הרשימה, ואז סולמית. לחזרה לתפריט הראשי, הקישו 0 וסולמית.',
+    'lib_bad': 'אין רשימה עם המספר הזה. הקישו מספר רשימה, ואז סולמית. לחזרה לתפריט הראשי, הקישו 0 וסולמית.',
 }
+
+LIB_PROMPTS = ('lib_pick', 'lib_bad')
 
 LIB_DIR = os.environ.get('YM_LIB_EXT', '/6')            # playlists root extension
 
@@ -582,6 +591,23 @@ def yemot_song():
     except Exception as e:
         log.exception('song call=%s error: %s', call_id, e)
         return text_response('id_list_message=f-error')
+
+@app.route('/yemot-lib', methods=['GET', 'POST'])
+def yemot_lib():
+    params = request.values
+    if params.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    s_val, turn = None, 0
+    for k, v in params.items():
+        if re.fullmatch(r'S\d+', k):
+            s_val, turn = v, int(k[1:])
+    if s_val is None:
+        return text_response(f'read=f-lib_pick=S1,,1,2,Digits,yes')
+    if s_val == '0' or not s_val.strip():
+        return text_response('go_to_folder=/')
+    if s_val.isdigit() and playlist_exists(int(s_val)):
+        return text_response(f'go_to_folder={LIB_DIR}/{int(s_val)}')
+    return text_response(f'read=f-lib_bad=S{turn+1},,1,2,Digits,yes')
 
 @app.route('/song-test')
 def song_test():
