@@ -45,26 +45,32 @@ def ym_get(action, **params):
     r.raise_for_status()
     return r
 
+def ym_p(p):
+    return p if p.startswith('ivr2:') else 'ivr2:' + p
+
 def ym_download(path):
-    r = ym_get('DownloadFile', path=path)
+    r = ym_get('DownloadFile', path=ym_p(path))
     return r.content
 
 def ym_upload(local_bytes, filename, ym_path):
     r = requests.post(f'{YM_API}/UploadFile',
-                      data={'token': YM_TOKEN, 'path': ym_path},
+                      data={'token': YM_TOKEN, 'path': ym_p(ym_path)},
                       files={'file': (filename, local_bytes)}, timeout=60)
     r.raise_for_status()
-    return r.json() if r.headers.get('content-type','').startswith('application/json') else {'raw': r.text[:200]}
+    j = r.json() if r.headers.get('content-type','').startswith('application/json') else {'raw': r.text[:200]}
+    if isinstance(j, dict) and j.get('success') is False:
+        raise RuntimeError(f"YM upload rejected: {j.get('message')}")
+    return j
 
 def ym_delete(ym_path):
     try:
-        return ym_get('FileAction', action='delete', target=ym_path).json()
+        return ym_get('FileAction', action='delete', target=ym_p(ym_path)).json()
     except Exception as e:
         log.warning('delete failed %s: %s', ym_path, e)
         return None
 
 def ym_newest_file(ym_dir):
-    j = ym_get('GetIVR2Dir', path=ym_dir).json()
+    j = ym_get('GetIVR2Dir', path=ym_p(ym_dir)).json()
     files = j.get('files') or []
     if not files:
         return None
