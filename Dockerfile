@@ -13,7 +13,7 @@ RUN git clone --single-branch --branch 2.0.0 --depth 1 \
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir \
        flask gunicorn "edge-tts==7.2.8" "yt-dlp>=2025.9.0" \
-       imageio-ffmpeg requests bgutil-ytdlp-pot-provider
+       imageio-ffmpeg requests bgutil-ytdlp-pot-provider telethon miniaudio
 
 # deno (yt-dlp 2026 EJS runtime)
 ADD https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip /tmp/deno.zip
