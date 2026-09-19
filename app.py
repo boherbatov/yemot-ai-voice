@@ -8,6 +8,25 @@ log = logging.getLogger('yemot-ai')
 
 app = Flask(__name__)
 
+@app.before_request
+def _fix_ym_glued_query():
+    """Yemot appends its params with '?' even when api_link already has a query
+    string, producing /yemot?secret=XXX?ApiCallId=YYY&... - split the glued
+    secret value back into separate params."""
+    try:
+        sec = request.args.get('secret')
+        if sec and '?' in sec:
+            import urllib.parse
+            from werkzeug.datastructures import MultiDict, CombinedMultiDict
+            base, glued = sec.split('?', 1)
+            items = [('secret', base)] + urllib.parse.parse_qsl(glued) + \
+                    [(k, v) for k, v in request.args.items(multi=True) if k != 'secret']
+            request.args = MultiDict(items)
+            request.__dict__.pop('values', None)
+    except Exception:
+        pass
+
+
 YM_SYSTEM = os.environ.get('YM_SYSTEM', '')
 YM_PASS = os.environ.get('YM_PASS', '')
 YM_TOKEN = f'{YM_SYSTEM}:{YM_PASS}'
