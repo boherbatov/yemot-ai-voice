@@ -1,7 +1,7 @@
 FROM node:20-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git python3 python3-pip python3-venv python3-dev gcc ca-certificates \
+    git python3 python3-pip python3-venv ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # bgutil PO-token provider (HTTP server on 127.0.0.1:4416)
@@ -13,7 +13,7 @@ RUN git clone --single-branch --branch 2.0.0 --depth 1 \
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir \
        flask gunicorn "edge-tts==7.2.8" "yt-dlp>=2025.9.0" \
-       imageio-ffmpeg requests miniaudio==1.61 bgutil-ytdlp-pot-provider
+       imageio-ffmpeg requests bgutil-ytdlp-pot-provider
 
 # deno (yt-dlp 2026 EJS runtime)
 ADD https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip /tmp/deno.zip
