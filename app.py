@@ -925,10 +925,11 @@ def fetch_ned(call_id):
         except Exception:
             pass
         ff = imageio_ffmpeg.get_ffmpeg_exe()
+        ferr = open(tmp + '.log', 'wb')
         proc = subprocess.Popen([ff, '-y', '-headers', 'User-Agent: Mozilla/5.0\r\n', '-i', url,
                                  '-ar', '16000', '-ac', '1', '-f', 'segment', '-segment_time', '600',
                                  '-reset_timestamps', '1', tmp + '-%03d.wav'],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                stdout=subprocess.DEVNULL, stderr=ferr)
         uploaded = 0
         while True:
             existing = sorted(_glob.glob(tmp + '-*.wav'))
@@ -946,7 +947,8 @@ def fetch_ned(call_id):
                 break
             time.sleep(3)
         if not job['chunks']:
-            raise ValueError('no audio chunks')
+            tail = open(tmp + '.log', 'rb').read()[-400:].decode('utf-8', 'ignore')
+            raise ValueError('no audio chunks | ffmpeg: ' + tail[-300:])
         job.update(done=True, status='ready')
         log.info('ned ready call=%s: %d chunks', call_id, len(job['chunks']))
     except Exception as e:
