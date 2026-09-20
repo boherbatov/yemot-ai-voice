@@ -305,6 +305,10 @@ def yemot():
             if not wav.startswith(b'RIFF'):
                 return text_response(f'read=f-didnthear=S{turn+1},no,record,{IN_DIR},,no')
             ym_delete(rec_path)
+            dur = (len(wav) - 44) / 16000.0
+            if dur < 1.2:
+                log.info('rec too short call=%s dur=%.2fs -> didnthear', call_id, dur)
+                return text_response(f'read=f-didnthear=S{turn+1},no,record,{IN_DIR},,no')
             text = groq_stt(wav)
             log.info('req call=%s: %s', call_id, (text or '')[:80])
             if not text:
