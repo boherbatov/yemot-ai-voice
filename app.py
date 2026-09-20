@@ -608,7 +608,7 @@ def yemot_song():
     mode = params.get('MODE')
     if s_val is None:
         if mode == '1':
-            return text_response('read=f-song_typehow=S1,no,,1,20,HebrewKeyboard,no')
+            return text_response('read=f-song_typehow=S1,no,,1,20,HebrewKeyboard,no,,,,,,,,no')
         if mode == '2':
             return text_response(f'read=f-song_ask=S1,no,record,{IN_DIR},,no')
         return text_response('read=f-song_mode=MODE,no,1,1,10,Digits,yes')
@@ -628,7 +628,7 @@ def yemot_song():
             log.info('song req call=%s typed=%s: %s', call_id, typed, (text or '')[:80])
             if not text:
                 if typed:
-                    return text_response('read=f-song_typehow=S1,no,,1,20,HebrewKeyboard,no')
+                    return text_response('read=f-song_typehow=S1,no,,1,20,HebrewKeyboard,no,,,,,,,,no')
                 return text_response(f'read=f-didnt_hear=S{turn+1},no,record,{IN_DIR},,no')
             if any(w in text for w in GOODBYE_WORDS) and len(text) < 25:
                 with lock:
@@ -1837,7 +1837,7 @@ def yemot_wiki():
     mode = params.get('MODE')
     if s_val is None:
         if mode == '1':
-            return text_response('read=f-wiki_typehow=S1,no,,1,20,HebrewKeyboard,no')
+            return text_response('read=f-wiki_typehow=S1,no,,1,20,HebrewKeyboard,no,,,,,,,,no')
         if mode == '2':
             return text_response(f'read=f-wiki_ask=S1,no,record,{IN_DIR},,no')
         return text_response('read=f-wiki_mode=MODE,no,1,1,10,Digits,yes')
@@ -1857,7 +1857,7 @@ def yemot_wiki():
             log.info('wiki req call=%s typed=%s: %s', call_id, typed, (text or '')[:80])
             if not text:
                 if typed:
-                    return text_response('read=f-wiki_typehow=S1,no,,1,20,HebrewKeyboard,no')
+                    return text_response('read=f-wiki_typehow=S1,no,,1,20,HebrewKeyboard,no,,,,,,,,no')
                 return text_response(f'read=f-didnt_hear=S{turn+1},no,record,{IN_DIR},,no')
             sub = re.sub(r'\D', '', call_id)[-6:] or '1'
             job.update(stage='wiki_wait', status='working', started=time.time(), sub=sub)
