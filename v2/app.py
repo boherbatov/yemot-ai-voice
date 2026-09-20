@@ -133,7 +133,7 @@ def _yt_tv_context():
     return {'client': {'clientName': 'TVHTML5', 'clientVersion': TV_CLIENT_VER,
                        'hl': 'en', 'visitorData': _YT['vd']}}
 
-def yt_search_video_id(query):
+def yt_search_candidates(query):
     import json as J, urllib.request as U
     _yt_cfg()
     body = J.dumps({'context': _yt_tv_context(), 'query': query}).encode()
@@ -155,9 +155,13 @@ def yt_search_video_id(query):
             for v in o:
                 walk(v)
     walk(r)
-    if not found:
+    seen, out = set(), []
+    for v in found:
+        if v not in seen:
+            seen.add(v); out.append(v)
+    if not out:
         raise ValueError('no video results')
-    return found[0]
+    return out
 
 def yt_player(video_id):
     import json as J, urllib.request as U
@@ -214,7 +218,22 @@ def fetch_song(call_id):
             raise ValueError('YT_REFRESH_TOKEN not set')
         query = job['query']
         m = re.search(r'(?:v=|youtu\.be/|/shorts/)([\w-]{11})', query)
-        video_id = m.group(1) if m else yt_search_video_id(query)
+        if m:
+            candidates = [m.group(1)]
+        else:
+            candidates = yt_search_candidates(query)
+        video_id, title = None, None
+        for cand in candidates[:6]:
+            try:
+                t, dur, st = yt_player(cand)
+                log.info('cand %s: %s %ss %s', cand, (t or '')[:40], dur, st)
+                if st == 'OK' and (not dur or int(dur) <= 600):
+                    video_id, title = cand, t
+                    break
+            except Exception as e:
+                log.info('cand %s player failed: %s', cand, e)
+        if not video_id:
+            raise ValueError('no playable short result')
         log.info('song search q=%r -> video %s', query[:60], video_id)
         title, _dur = yt_download(video_id, tmp + '.%(ext)s')
         files = sorted(_glob.glob(tmp + '.*'))
