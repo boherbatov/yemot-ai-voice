@@ -256,7 +256,8 @@ def fetch_song(call_id):
         for f_ in _glob.glob(tmp + '.*'):
             try: os.remove(f_)
             except OSError: pass
-        job.update(status='ready', title=title, name=name)
+        job.update(status='ready', title=title, name=name,
+                   song_path=f'{EXT_DIR}/{name}.wav')
         log.info('song ready call=%s title=%s', call_id, title[:60])
     except Exception as e:
         log.warning('song fetch failed call=%s: %s', call_id, e)
@@ -274,8 +275,10 @@ def yemot():
     call_id = params.get('ApiCallId') or str(time.time_ns())
     if params.get('hangup') == 'yes':
         with lock:
-            jobs.pop(call_id, None)
+            job = jobs.pop(call_id, None)
         log.info('hangup call=%s', call_id)
+        if job and job.get('song_path'):
+            threading.Thread(target=ym_delete, args=(job['song_path'],), daemon=True).start()
         return text_response('')
 
     s_val, turn = None, 0
