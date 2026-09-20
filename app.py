@@ -640,7 +640,7 @@ def yemot_song():
         if stage == 'after':
             if s_val == '1':
                 job['stage'] = 'save_pick'
-                return text_response(f'read=f-song_pick=S{turn+1},no,1,2,7,Digits,yes')
+                return text_response(f'read=f-song_pick=S{turn+1},no,2,1,7,Digits,yes')
             if s_val == '3':
                 with lock:
                     song_jobs.pop(call_id, None)
@@ -655,7 +655,7 @@ def yemot_song():
             elif s_val and s_val.isdigit() and playlist_exists(int(s_val)):
                 pl = int(s_val)
             if pl is None:
-                return text_response(f'read=f-song_pick_bad=S{turn+1},no,1,2,7,Digits,yes')
+                return text_response(f'read=f-song_pick_bad=S{turn+1},no,2,1,7,Digits,yes')
             seq = playlist_save(pl, job['name'], job.get('title', ''))
             if seq is None:
                 job.update(stage='ask', status='idle')
@@ -763,7 +763,7 @@ def yemot_lib():
                 return text_response('go_to_folder=/')
             if s_val == '9':
                 job['stage'] = 'name_pick'
-                return text_response(f'read=f-lib_name_pick=S{turn+1},no,1,2,7,Digits,yes')
+                return text_response(f'read=f-lib_name_pick=S{turn+1},no,2,1,7,Digits,yes')
             n = job.get('keys', {}).get(s_val)
             if n:
                 with lock:
@@ -778,7 +778,7 @@ def yemot_lib():
             if s_val and s_val.strip().isdigit() and playlist_exists(int(s_val.strip())):
                 job.update(stage='name_rec', name_target=int(s_val.strip()))
                 return text_response(f'read=f-name_rec=S{turn+1},no,record,{IN_DIR},,no')
-            return text_response(f'read=f-lib_name_bad.f-lib_name_pick=S{turn+1},no,1,2,7,Digits,yes')
+            return text_response(f'read=f-lib_name_bad.f-lib_name_pick=S{turn+1},no,2,1,7,Digits,yes')
 
         if stage == 'name_rec':
             n = job.get('name_target')
@@ -1586,7 +1586,7 @@ def yemot_pod():
         job = pod_jobs.setdefault(call_id, {'stage': 'menu', 'page': 1, 'status': 'idle', 'started': time.time()})
 
     if s_val is None:
-        return text_response('read=f-pod_menu1=S1,no,1,2,7,Digits,yes')
+        return text_response('read=f-pod_menu1=S1,no,2,1,7,Digits,yes')
 
     try:
         stage = job['stage']
@@ -1595,23 +1595,23 @@ def yemot_pod():
             v = (s_val or '').strip()
             if v == '0' or v == '':
                 job['page'] = job.get('page', 1) % 3 + 1
-                return text_response(f"read=f-pod_menu{job['page']}=S{turn+1},no,1,2,7,Digits,yes")
+                return text_response(f"read=f-pod_menu{job['page']}=S{turn+1},no,2,1,7,Digits,yes")
             if v.isdigit() and 1 <= int(v) <= len(PODCASTS):
                 job.update(stage='pod_wait', status='working', idx=int(v) - 1, ep=0, started=time.time())
                 threading.Thread(target=fetch_pod, args=(call_id, job['idx'], 0), daemon=True).start()
                 return text_response(f'read=f-pod_searching=S{turn+1},no,no')
-            return text_response(f"read=f-pod_menu{job.get('page',1)}=S{turn+1},no,1,2,7,Digits,yes")
+            return text_response(f"read=f-pod_menu{job.get('page',1)}=S{turn+1},no,2,1,7,Digits,yes")
 
         if stage == 'pod_wait':
             st = job.get('status')
             if st == 'working':
                 if time.time() - job.get('started', 0) > 300:
                     job.update(stage='menu', status='idle', page=1)
-                    return text_response(f'read=f-pod_notfound.f-pod_menu1=S{turn+1},no,1,2,7,Digits,yes')
+                    return text_response(f'read=f-pod_notfound.f-pod_menu1=S{turn+1},no,2,1,7,Digits,yes')
                 return text_response(f'read=f-pod_wait=S{turn+1},no,no')
             if st == 'error':
                 job.update(stage='menu', status='idle', page=1)
-                return text_response(f'read=f-pod_notfound.f-pod_menu1=S{turn+1},no,1,2,7,Digits,yes')
+                return text_response(f'read=f-pod_notfound.f-pod_menu1=S{turn+1},no,2,1,7,Digits,yes')
             job['stage'] = 'pod_play'
             return text_response(f"read=f-{job['name']}=S{turn+1},no,no")
 
@@ -1627,7 +1627,7 @@ def yemot_pod():
                 return text_response('go_to_folder=/')
             if v == '3':
                 job.update(stage='menu', page=1)
-                return text_response(f'read=f-pod_menu1=S{turn+1},no,1,2,7,Digits,yes')
+                return text_response(f'read=f-pod_menu1=S{turn+1},no,2,1,7,Digits,yes')
             if v in ('1', '2'):
                 ep = job.get('ep', 0) + (1 if v == '1' else -1)
                 if ep < 0:
@@ -1639,7 +1639,7 @@ def yemot_pod():
             return text_response(f'read=f-pod_after=S{turn+1},no,1,1,7,Digits,yes')
 
         job['stage'] = 'menu'
-        return text_response(f'read=f-pod_menu1=S{turn+1},no,1,2,7,Digits,yes')
+        return text_response(f'read=f-pod_menu1=S{turn+1},no,2,1,7,Digits,yes')
 
     except Exception as e:
         log.exception('pod call=%s error: %s', call_id, e)
