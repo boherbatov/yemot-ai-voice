@@ -260,6 +260,11 @@ def safe_name(p):
 # ---------- Groq ----------
 
 def groq_stt(wav_bytes, language='he'):
+    if wav_bytes[:4] == b'RIFF' and len(wav_bytes) >= 44:
+        dur = (len(wav_bytes) - 44) / 16000.0
+        if dur < 1.2:
+            log.info('stt skip: recording too short (%.2fs)', dur)
+            return ''
     r = requests.post(f'{GROQ}/audio/transcriptions',
                       headers={'Authorization': f'Bearer {GROQ_API_KEY}'},
                       files={'file': ('audio.wav', wav_bytes, 'audio/wav')},
