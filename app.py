@@ -427,6 +427,8 @@ def setup():
 
 SONG_PROMPTS = {
     'song_ask': 'איזה שיר בא לכם? אמרו את שם השיר, אפשר גם את הזמר. דברו אחרי הצליל, ולסיום הקישו סולמית.',
+    'song_mode': 'איזה שיר בא לכם? לחיפוש בהקלדה על המקשים, הקישו 1. לחיפוש בדיבור, הקישו 2.',
+    'song_typehow': 'הקלידו את שם השיר או הזמר. כל אות ואז סולמית. לרווח הקישו 0 וסולמית. לסיום הקישו כוכבית, סולמית, ואז 1. להקלדה באנגלית, הקישו כוכבית, סולמית, 6, ואז 2.',
     'song_searching': 'רגע אחד, אני מחפשת את השיר. זה יכול לקחת חצי דקה.',
     'song_wait': 'עוד ממש קצת, השיר כבר בדרך.',
     'song_notfound': 'סליחה, לא הצלחתי למצוא את השיר הזה. נסו שיר אחר. איזה שיר בא לכם?',
@@ -603,19 +605,30 @@ def yemot_song():
     with lock:
         job = song_jobs.setdefault(call_id, {'stage': 'ask', 'status': 'idle', 'started': time.time()})
 
+    mode = params.get('MODE')
     if s_val is None:
-        return text_response(f'read=f-song_ask=S1,no,record,{IN_DIR},,no')
+        if mode == '1':
+            return text_response('read=f-song_typehow=S1,no,,1,20,HebrewKeyboard,no')
+        if mode == '2':
+            return text_response(f'read=f-song_ask=S1,no,record,{IN_DIR},,no')
+        return text_response('read=f-song_mode=MODE,no,1,1,10,Digits,yes')
 
     try:
         stage = job['stage']
 
         if stage == 'ask':
-            rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
-            wav = ym_download(rec_path)
-            text = groq_stt(wav)
-            ym_delete(rec_path)
-            log.info('song req call=%s: %s', call_id, (text or '')[:80])
+            typed = s_val and '.wav' not in s_val and '/' not in s_val
+            if typed:
+                text = s_val.strip()
+            else:
+                rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
+                wav = ym_download(rec_path)
+                text = groq_stt(wav)
+                ym_delete(rec_path)
+            log.info('song req call=%s typed=%s: %s', call_id, typed, (text or '')[:80])
             if not text:
+                if typed:
+                    return text_response('read=f-song_typehow=S1,no,,1,20,HebrewKeyboard,no')
                 return text_response(f'read=f-didnt_hear=S{turn+1},no,record,{IN_DIR},,no')
             if any(w in text for w in GOODBYE_WORDS) and len(text) < 25:
                 with lock:
@@ -630,11 +643,11 @@ def yemot_song():
             if st == 'working':
                 if time.time() - job.get('started', 0) > 150:
                     job.update(stage='ask', status='idle')
-                    return text_response(f'read=f-song_notfound=S{turn+1},no,record,{IN_DIR},,no')
+                    return text_response(f'read=f-song_notfound.f-song_mode=MODE,no,1,1,10,Digits,yes')
                 return text_response(f'read=f-song_wait=S{turn+1},no,no')
             if st == 'error':
                 job.update(stage='ask', status='idle')
-                return text_response(f'read=f-song_notfound=S{turn+1},no,record,{IN_DIR},,no')
+                return text_response(f'read=f-song_notfound.f-song_mode=MODE,no,1,1,10,Digits,yes')
             job['stage'] = 'play'
             return text_response(f"read=f-{job['name']}=S{turn+1},no,no")
 
@@ -651,7 +664,7 @@ def yemot_song():
                     song_jobs.pop(call_id, None)
                 return text_response('id_list_message=f-song_bye')
             job.update(stage='ask', status='idle')
-            return text_response(f'read=f-song_more=S{turn+1},no,record,{IN_DIR},,no')
+            return text_response(f'read=f-song_more.f-song_mode=MODE,no,1,1,10,Digits,yes')
 
         if stage == 'save_pick':
             pl = None
@@ -664,7 +677,7 @@ def yemot_song():
             seq = playlist_save(pl, job['name'], job.get('title', ''))
             if seq is None:
                 job.update(stage='ask', status='idle')
-                return text_response(f'read=f-error.f-song_more=S{turn+1},no,record,{IN_DIR},,no')
+                return text_response(f'read=f-error.f-song_more.f-song_mode=MODE,no,1,1,10,Digits,yes')
             job['playlist'] = pl
             if not playlist_named(pl):
                 job['stage'] = 'name_offer'
@@ -702,7 +715,7 @@ def yemot_song():
                     song_jobs.pop(call_id, None)
                 return text_response(f'go_to_folder={LIB_DIR}/{pl}')
             job.update(stage='ask', status='idle')
-            return text_response(f'read=f-song_more=S{turn+1},no,record,{IN_DIR},,no')
+            return text_response(f'read=f-song_more.f-song_mode=MODE,no,1,1,10,Digits,yes')
 
         job['stage'] = 'ask'
         return text_response(f'read=f-song_ask=S{turn+1},no,record,{IN_DIR},,no')
@@ -1383,6 +1396,23 @@ CHULIN_PROMPTS = {
     'chulin_error': 'אוי, הייתה תקלה טכנית. נסו שוב קצת מאוחר יותר. להתראות!',
 }
 
+@app.route('/setup-typing')
+def setup_typing():
+    if request.args.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    report = {}
+    for name in ('song_mode', 'song_typehow'):
+        try:
+            report[name] = 'OK' if ym_upload(tts_wav(SONG_PROMPTS[name]), name + '.wav', f'{SONG_DIR}/{name}.wav') else 'FAIL'
+        except Exception as e:
+            report[name] = f'FAIL: {e}'
+    for name in ('wiki_mode', 'wiki_typehow'):
+        try:
+            report[name] = 'OK' if ym_upload(tts_wav(WIKI_PROMPTS[name]), name + '.wav', f'/4/{name}.wav') else 'FAIL'
+        except Exception as e:
+            report[name] = f'FAIL: {e}'
+    return report
+
 @app.route('/setup-chulin')
 def setup_chulin():
     if request.args.get('secret') != BRIDGE_SECRET:
@@ -1711,6 +1741,8 @@ def yemot_pod():
 WIKI_RATE = os.environ.get('WIKI_RATE', '+40%')
 WIKI_PROMPTS = {
     'wiki_ask': 'איזה ערך בויקיפדיה בא לכם לשמוע? אמרו את שם הערך, ולסיום הקישו סולמית.',
+    'wiki_mode': 'איזה ערך בויקיפדיה בא לכם? לחיפוש בהקלדה על המקשים, הקישו 1. לחיפוש בדיבור, הקישו 2.',
+    'wiki_typehow': 'הקלידו את שם הערך. כל אות ואז סולמית. לרווח הקישו 0 וסולמית. לסיום הקישו כוכבית, סולמית, ואז 1.',
     'wiki_searching': 'רגע אחד, אני מביאה את הערך ומכינה אותו להקראה. בערך ארוך זה יכול לקחת דקה-שתיים.',
     'wiki_wait': 'עוד קצת, הערך בהכנה.',
     'wiki_notfound': 'סליחה, לא מצאתי ערך כזה בויקיפדיה. נסו שם אחר.',
@@ -1802,19 +1834,30 @@ def yemot_wiki():
     with lock:
         job = wiki_jobs.setdefault(call_id, {'stage': 'ask', 'status': 'idle', 'started': time.time()})
 
+    mode = params.get('MODE')
     if s_val is None:
-        return text_response(f'read=f-wiki_ask=S1,no,record,{IN_DIR},,no')
+        if mode == '1':
+            return text_response('read=f-wiki_typehow=S1,no,,1,20,HebrewKeyboard,no')
+        if mode == '2':
+            return text_response(f'read=f-wiki_ask=S1,no,record,{IN_DIR},,no')
+        return text_response('read=f-wiki_mode=MODE,no,1,1,10,Digits,yes')
 
     try:
         stage = job['stage']
 
         if stage == 'ask':
-            rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
-            wav = ym_download(rec_path)
-            text = groq_stt(wav)
-            ym_delete(rec_path)
-            log.info('wiki req call=%s: %s', call_id, (text or '')[:80])
+            typed = s_val and '.wav' not in s_val and '/' not in s_val
+            if typed:
+                text = s_val.strip()
+            else:
+                rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
+                wav = ym_download(rec_path)
+                text = groq_stt(wav)
+                ym_delete(rec_path)
+            log.info('wiki req call=%s typed=%s: %s', call_id, typed, (text or '')[:80])
             if not text:
+                if typed:
+                    return text_response('read=f-wiki_typehow=S1,no,,1,20,HebrewKeyboard,no')
                 return text_response(f'read=f-didnt_hear=S{turn+1},no,record,{IN_DIR},,no')
             sub = re.sub(r'\D', '', call_id)[-6:] or '1'
             job.update(stage='wiki_wait', status='working', started=time.time(), sub=sub)
@@ -1826,11 +1869,11 @@ def yemot_wiki():
             if st == 'working':
                 if time.time() - job.get('started', 0) > 300:
                     job.update(stage='ask', status='idle')
-                    return text_response(f'read=f-wiki_notfound=S{turn+1},no,record,{IN_DIR},,no')
+                    return text_response(f'read=f-wiki_notfound.f-wiki_mode=MODE,no,1,1,10,Digits,yes')
                 return text_response(f'read=f-wiki_wait=S{turn+1},no,no')
             if st == 'error':
                 job.update(stage='ask', status='idle')
-                return text_response(f'read=f-wiki_notfound=S{turn+1},no,record,{IN_DIR},,no')
+                return text_response(f'read=f-wiki_notfound.f-wiki_mode=MODE,no,1,1,10,Digits,yes')
             with lock:
                 wiki_jobs.pop(call_id, None)
             return text_response(f"go_to_folder=/4/{job['sub']}")
