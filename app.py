@@ -1778,7 +1778,7 @@ def yemot_pod():
                 return text_response(multitap_read('f-pod_typehow', f'S{turn+1}'))
             job['stage'] = 'menu'
             job['custom'] = None
-            return text_response('read=f-pod_menu1=S{turn+1},no,2,1,7,No,yes,,,,,,,,no'.format(turn=turn))
+            return text_response(f'read=f-pod_menu1=S{turn+1},no,2,1,7,No,yes,,,,,,,,no')
 
         if stage == 'pod_typed':
             term = multitap_decode(s_val or '', 'he') if re.fullmatch(r'[0-9*]+', s_val or '') else ''
