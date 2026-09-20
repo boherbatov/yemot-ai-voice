@@ -189,9 +189,14 @@ def gemini_chat(messages, max_tokens=180):
         else: contents.append({'role': 'model' if role == 'assistant' else 'user', 'parts': [{'text': text}]})
     payload = {'contents': contents, 'generationConfig': {'maxOutputTokens': max_tokens, 'temperature': 0.7}}
     if systems: payload['systemInstruction'] = {'parts': [{'text': '\n\n'.join(systems)}]}
-    r = requests.post(f'{GEMINI}/models/{GEMINI_MODEL}:generateContent', params={'key': GEMINI_API_KEY}, json=payload, timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f'gemini chat {r.status_code}: {r.text[:300]}')
+    r = None
+    for attempt in range(3):
+        r = requests.post(f'{GEMINI}/models/{GEMINI_MODEL}:generateContent', params={'key': GEMINI_API_KEY}, json=payload, timeout=30)
+        if r.status_code == 200:
+            break
+        if r.status_code not in (429, 503) or attempt == 2:
+            raise RuntimeError(f'gemini chat {r.status_code}: {r.text[:300]}')
+        time.sleep(2 * (attempt + 1))
     try:
         return ''.join(p.get('text', '') for p in r.json()['candidates'][0]['content']['parts']).strip()
     except Exception as e:
