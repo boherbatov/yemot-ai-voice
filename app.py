@@ -423,12 +423,52 @@ def setup():
         report['groq_stt'] = f'FAIL: {e}'
     return report
 
+# ---------- Multi-tap keypad decoding (forum model: no hash between letters, * separates same-key) ----------
+MT_HE = {'3':'א','33':'ב','333':'ג','2':'ד','22':'ה','222':'ו','6':'ז','66':'ח','666':'ט',
+         '5':'י','55':'כ','555':'ך','5555':'ל','4':'מ','44':'ם','444':'נ','4444':'ן',
+         '9':'ס','99':'ע','999':'פ','9999':'ף','8':'צ','88':'ץ','888':'ק',
+         '7':'ר','77':'ש','777':'ת','0':' '}
+MT_EN = {'2':'a','22':'b','222':'c','3':'d','33':'e','333':'f','4':'g','44':'h','444':'i',
+         '5':'j','55':'k','555':'l','6':'m','66':'n','666':'o','7':'p','77':'q','777':'r','7777':'s',
+         '8':'t','88':'u','888':'v','9':'w','99':'x','999':'y','9999':'z','0':' '}
+
+def multitap_decode(s, lang='he'):
+    """35555222 -> אלו ; 3*33*3 -> אבא ; 5 repeats of a key = the digit itself."""
+    table = MT_EN if lang == 'en' else MT_HE
+    out, cur, n = [], None, 0
+    def flush():
+        nonlocal cur, n
+        if cur is None:
+            return
+        g = cur * n
+        if n >= 5 and n % 5 == 0:
+            out.append(cur * (n // 5))
+        else:
+            out.append(table.get(g, ''))
+        cur, n = None, 0
+    for ch in s:
+        if ch == '*':
+            flush()
+        elif ch.isdigit():
+            if ch == cur:
+                n += 1
+            else:
+                flush()
+                cur, n = ch, 1
+    flush()
+    return ''.join(out).strip()
+
+def multitap_read(prompt_chain, var):
+    # raw digits+* collection: no echo, no confirm, * and 0 allowed, # ends input
+    fields = [var, 'no', '120', '1', '20', 'No', 'no', 'no', '', '', '', '', '', '', 'no']
+    return f'read={prompt_chain}=' + ','.join(fields)
+
 # ---------- YouTube songs (extension 2) ----------
 
 SONG_PROMPTS = {
     'song_ask': 'איזה שיר בא לכם? אמרו את שם השיר, אפשר גם את הזמר. דברו אחרי הצליל, ולסיום הקישו סולמית.',
-    'song_mode': 'איזה שיר בא לכם? לחיפוש בהקלדה על המקשים, הקישו 1. לחיפוש בדיבור, הקישו 2.',
-    'song_typehow': 'הקלידו את שם השיר או הזמר. כל אות ואז סולמית. לרווח הקישו 0 וסולמית. לסיום הקישו כוכבית, סולמית, ואז 1. להקלדה באנגלית, הקישו כוכבית, סולמית, 6, ואז 2.',
+    'song_mode': 'איזה שיר בא לכם? לחיפוש בהקלדה בעברית, הקישו 1. לחיפוש בדיבור, הקישו 2. לחיפוש בהקלדה באנגלית, הקישו 3.',
+    'song_typehow': 'הקלידו את שם השיר או הזמר, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לסיום הקישו סולמית.',
     'song_searching': 'רגע אחד, אני מחפשת את השיר. זה יכול לקחת חצי דקה.',
     'song_wait': 'עוד ממש קצת, השיר כבר בדרך.',
     'song_notfound': 'סליחה, לא הצלחתי למצוא את השיר הזה. נסו שיר אחר. איזה שיר בא לכם?',
@@ -607,8 +647,9 @@ def yemot_song():
 
     mode = params.get('MODE')
     if s_val is None:
-        if mode == '1':
-            return text_response('read=f-song_typehow=S1,no,,1,20,HebrewKeyboard,no,,,,,,,,no')
+        if mode in ('1', '3'):
+            job['tlang'] = 'en' if mode == '3' else 'he'
+            return text_response(multitap_read('f-song_typehow', 'S1'))
         if mode == '2':
             return text_response(f'read=f-song_ask=S1,no,record,{IN_DIR},,no')
         return text_response('read=f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
@@ -617,9 +658,10 @@ def yemot_song():
         stage = job['stage']
 
         if stage == 'ask':
-            typed = s_val and '.wav' not in s_val and '/' not in s_val
+            typed = bool(re.fullmatch(r'[0-9*]+', s_val or ''))
             if typed:
-                text = s_val.strip()
+                text = multitap_decode(s_val, job.get('tlang', 'he'))
+                log.info('song typed call=%s raw=%s -> %s', call_id, s_val[:60], text[:60])
             else:
                 rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
                 wav = ym_download(rec_path)
@@ -628,7 +670,7 @@ def yemot_song():
             log.info('song req call=%s typed=%s: %s', call_id, typed, (text or '')[:80])
             if not text:
                 if typed:
-                    return text_response('read=f-song_typehow=S1,no,,1,20,HebrewKeyboard,no,,,,,,,,no')
+                    return text_response(multitap_read('f-song_typehow', f'S{turn+1}'))
                 return text_response(f'read=f-didnt_hear=S{turn+1},no,record,{IN_DIR},,no')
             if any(w in text for w in GOODBYE_WORDS) and len(text) < 25:
                 with lock:
@@ -1741,8 +1783,8 @@ def yemot_pod():
 WIKI_RATE = os.environ.get('WIKI_RATE', '+40%')
 WIKI_PROMPTS = {
     'wiki_ask': 'איזה ערך בויקיפדיה בא לכם לשמוע? אמרו את שם הערך, ולסיום הקישו סולמית.',
-    'wiki_mode': 'איזה ערך בויקיפדיה בא לכם? לחיפוש בהקלדה על המקשים, הקישו 1. לחיפוש בדיבור, הקישו 2.',
-    'wiki_typehow': 'הקלידו את שם הערך. כל אות ואז סולמית. לרווח הקישו 0 וסולמית. לסיום הקישו כוכבית, סולמית, ואז 1.',
+    'wiki_mode': 'איזה ערך בויקיפדיה בא לכם? לחיפוש בהקלדה, הקישו 1. לחיפוש בדיבור, הקישו 2.',
+    'wiki_typehow': 'הקלידו את שם הערך, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לסיום הקישו סולמית.',
     'wiki_searching': 'רגע אחד, אני מביאה את הערך ומכינה אותו להקראה. בערך ארוך זה יכול לקחת דקה-שתיים.',
     'wiki_wait': 'עוד קצת, הערך בהכנה.',
     'wiki_notfound': 'סליחה, לא מצאתי ערך כזה בויקיפדיה. נסו שם אחר.',
@@ -1837,7 +1879,8 @@ def yemot_wiki():
     mode = params.get('MODE')
     if s_val is None:
         if mode == '1':
-            return text_response('read=f-wiki_typehow=S1,no,,1,20,HebrewKeyboard,no,,,,,,,,no')
+            job['tlang'] = 'he'
+            return text_response(multitap_read('f-wiki_typehow', 'S1'))
         if mode == '2':
             return text_response(f'read=f-wiki_ask=S1,no,record,{IN_DIR},,no')
         return text_response('read=f-wiki_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
@@ -1846,9 +1889,10 @@ def yemot_wiki():
         stage = job['stage']
 
         if stage == 'ask':
-            typed = s_val and '.wav' not in s_val and '/' not in s_val
+            typed = bool(re.fullmatch(r'[0-9*]+', s_val or ''))
             if typed:
-                text = s_val.strip()
+                text = multitap_decode(s_val, job.get('tlang', 'he'))
+                log.info('wiki typed call=%s raw=%s -> %s', call_id, s_val[:60], text[:60])
             else:
                 rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
                 wav = ym_download(rec_path)
@@ -1857,7 +1901,7 @@ def yemot_wiki():
             log.info('wiki req call=%s typed=%s: %s', call_id, typed, (text or '')[:80])
             if not text:
                 if typed:
-                    return text_response('read=f-wiki_typehow=S1,no,,1,20,HebrewKeyboard,no,,,,,,,,no')
+                    return text_response(multitap_read('f-wiki_typehow', f'S{turn+1}'))
                 return text_response(f'read=f-didnt_hear=S{turn+1},no,record,{IN_DIR},,no')
             sub = re.sub(r'\D', '', call_id)[-6:] or '1'
             job.update(stage='wiki_wait', status='working', started=time.time(), sub=sub)
