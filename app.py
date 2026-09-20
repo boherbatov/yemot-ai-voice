@@ -34,6 +34,9 @@ GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 BRIDGE_SECRET = os.environ.get('BRIDGE_SECRET', '')
 GROQ_CHAT_MODEL = os.environ.get('GROQ_CHAT_MODEL', 'openai/gpt-oss-120b')
 GROQ_STT_MODEL = os.environ.get('GROQ_STT_MODEL', 'whisper-large-v3-turbo')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
+PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', 'https://yemot-ai-voice.onrender.com').rstrip('/')
 YT_CLIENT = os.environ.get('YT_PLAYER_CLIENT', 'android_vr')
 YT_REFRESH_TOKEN = os.environ.get('YT_REFRESH_TOKEN', '')
 PS4_UA = 'Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15'
@@ -159,6 +162,7 @@ MAX_DAILY_TURNS = int(os.environ.get('MAX_DAILY_TURNS', '60'))
 
 YM_API = 'https://www.call2all.co.il/ym/api'
 GROQ = 'https://api.groq.com/openai/v1'
+GEMINI = 'https://generativelanguage.googleapis.com/v1beta'
 
 SYSTEM_PROMPT = (
     'את עוזרת קולית חמה וחברותית בשם "אוזן", שמדברת עם מתקשרים בקו טלפוני. '
@@ -173,6 +177,25 @@ SYSTEM_PROMPT = (
 sessions = {}
 stats = {'calls': 0, 'turns': 0, 'started': time.time(), 'errors': 0}
 lock = threading.Lock()
+
+
+def gemini_chat(messages, max_tokens=180):
+    if not GEMINI_API_KEY:
+        raise RuntimeError('GEMINI_API_KEY is not configured')
+    systems, contents = [], []
+    for msg in messages:
+        role, text = msg.get('role'), str(msg.get('content') or '')
+        if role == 'system': systems.append(text)
+        else: contents.append({'role': 'model' if role == 'assistant' else 'user', 'parts': [{'text': text}]})
+    payload = {'contents': contents, 'generationConfig': {'maxOutputTokens': max_tokens, 'temperature': 0.7}}
+    if systems: payload['systemInstruction'] = {'parts': [{'text': '\n\n'.join(systems)}]}
+    r = requests.post(f'{GEMINI}/models/{GEMINI_MODEL}:generateContent', params={'key': GEMINI_API_KEY}, json=payload, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f'gemini chat {r.status_code}: {r.text[:300]}')
+    try:
+        return ''.join(p.get('text', '') for p in r.json()['candidates'][0]['content']['parts']).strip()
+    except Exception as e:
+        raise RuntimeError(f'gemini response missing text: {r.text[:300]}') from e
 
 # ---------- Yemot API ----------
 
@@ -347,7 +370,7 @@ def today():
 @app.route('/healthz')
 def healthz():
     return {'ok': True, 'uptime_s': int(time.time()-stats['started']),
-            'env': {'ym': bool(YM_SYSTEM and YM_PASS), 'groq': bool(GROQ_API_KEY), 'secret': bool(BRIDGE_SECRET)}}
+            'env': {'ym': bool(YM_SYSTEM and YM_PASS), 'groq': bool(GROQ_API_KEY), 'gemini': bool(GEMINI_API_KEY), 'secret': bool(BRIDGE_SECRET)}}
 
 @app.route('/status')
 def status():
@@ -1362,10 +1385,13 @@ def yemot_chulin():
     params = request.values
     if params.get('secret') != BRIDGE_SECRET:
         return 'forbidden', 403
+    provider = 'gemini' if params.get('provider') == 'gemini' else 'groq'
+    base_dir = '/9/2' if provider == 'gemini' else '/9/1'
     call_id = params.get('ApiCallId') or str(time.time_ns())
+    job_id = f'{provider}:{call_id}'
     if params.get('hangup') == 'yes':
         with lock:
-            chulin_jobs.pop(call_id, None)
+            chulin_jobs.pop(job_id, None)
         return text_response('')
 
     s_val, turn = None, 0
@@ -1374,13 +1400,14 @@ def yemot_chulin():
             s_val, turn = v, int(k[1:])
 
     with lock:
-        job = chulin_jobs.setdefault(call_id, {'stage': 'ask', 'empty': 0, 'hist': []})
+        job = chulin_jobs.setdefault(job_id, {'stage': 'ask', 'empty': 0, 'hist': []})
 
     try:
         if s_val is None:
-            return text_response('read=f-chulin_intro=S1,no,record,/9/in,,no')
+            intro = 'chulin_gemini_intro' if provider == 'gemini' else 'chulin_intro'
+            return text_response(f'read=f-{intro}=S1,no,record,{base_dir}/in,,no')
 
-        rec_path = s_val if s_val.startswith('/') else f'/9/in/{s_val}'
+        rec_path = s_val if s_val.startswith('/') else f'{base_dir}/in/{s_val}'
         wav = ym_download(rec_path if rec_path.startswith('ivr2:') else 'ivr2:' + rec_path)
         ym_delete(rec_path if rec_path.startswith('ivr2:') else 'ivr2:' + rec_path)
         text = groq_stt(wav)
@@ -1389,9 +1416,9 @@ def yemot_chulin():
             job['empty'] += 1
             if job['empty'] >= 2:
                 with lock:
-                    chulin_jobs.pop(call_id, None)
+                    chulin_jobs.pop(job_id, None)
                 return text_response('id_list_message=f-chulin_end')
-            return text_response(f'read=f-chulin_didnt=S{turn+1},no,record,/9/in,,no')
+            return text_response(f'read=f-chulin_didnt=S{turn+1},no,record,{base_dir}/in,,no')
         job['empty'] = 0
 
         ctx = web_context(text)
@@ -1401,20 +1428,20 @@ def yemot_chulin():
         for who, txt in job['hist'][-6:]:
             msgs.append({'role': 'user' if who == 'u' else 'assistant', 'content': txt})
         msgs.append({'role': 'user', 'content': text})
-        reply = groq_chat(msgs)
+        reply = gemini_chat(msgs) if provider == 'gemini' else groq_chat(msgs)
         is_bye = reply.upper().startswith('BYE')
         reply_text = re.sub(r'^BYE:?\s*', '', reply, flags=re.I).strip() or 'להתראות!'
         log.info('chulin reply call=%s bye=%s: %s', call_id, is_bye, reply_text[:80])
         job['hist'].append(('u', text))
         job['hist'].append(('a', reply_text))
 
-        name = f'ch{call_id[-6:]}{turn}.wav'
-        ym_upload(tts_wav(reply_text), name, f'/9/{name}')
+        name = f'ch{provider[0]}{call_id[-6:]}{turn}.wav'
+        ym_upload(tts_wav(reply_text), name, f'{base_dir}/{name}')
         if is_bye:
             with lock:
-                chulin_jobs.pop(call_id, None)
+                chulin_jobs.pop(job_id, None)
             return text_response(f'id_list_message=f-{name[:-4]}')
-        return text_response(f'read=f-{name[:-4]}=S{turn+1},no,record,/9/in,,no')
+        return text_response(f'read=f-{name[:-4]}=S{turn+1},no,record,{base_dir}/in,,no')
 
     except Exception as e:
         log.exception('chulin call=%s error: %s', call_id, e)
@@ -1457,6 +1484,8 @@ def web_context(query):
 
 
 CHULIN_PROMPTS = {
+    'chulin_menu': 'לבחירת צ׳אט חולין עם גרוק, הקישו 1. לבחירת אותה השיחה עם ג׳מיני, הקישו 2.',
+    'chulin_gemini_intro': 'הגעתם לפינת חולין בגרסת ג׳מיני! שאלו אותי כל שאלה, גם על דברים שקורים עכשיו בעולם. דברו אחרי הצליל, ולסיום הקישו סולמית.',
     'chulin_intro': 'הגעתם לפינת חולין! אני חולין, הצ׳אטבוט של הקו. שאלו אותי כל שאלה, גם על דברים שקורים עכשיו בעולם. דברו אחרי הצליל, ולסיום הקישו סולמית.',
     'chulin_didnt': 'סליחה, לא שמעתי. אפשר שוב? דברו אחרי הצליל, ולסיום הקישו סולמית.',
     'chulin_end': 'כיף היה! להתראות!',
@@ -1494,12 +1523,33 @@ def setup_typing():
 def setup_chulin():
     if request.args.get('secret') != BRIDGE_SECRET:
         return 'forbidden', 403
+    import urllib.parse
     report = {}
-    for name, text in CHULIN_PROMPTS.items():
+    try:
+        ym_upload_text('type=menu\n', 'ivr2:/9/ext.ini')
+        ym_upload(tts_wav(CHULIN_PROMPTS['chulin_menu']), '000.wav', '/9/000.wav')
+        report['9_menu'] = 'OK'
+    except Exception as e:
+        report['9_menu'] = f'FAIL: {e}'
+    for sub, provider in (('1', 'groq'), ('2', 'gemini')):
         try:
-            report[name] = 'OK' if ym_upload(tts_wav(text), name + '.wav', f'/9/{name}.wav') else 'FAIL'
+            link = f'{PUBLIC_BASE_URL}/yemot-chulin?secret={urllib.parse.quote(BRIDGE_SECRET)}&provider={provider}'
+            ym_upload_text(f'type=api\napi_link={link}\n', f'ivr2:/9/{sub}/ext.ini')
+            report[f'9_{sub}_ext'] = 'OK'
         except Exception as e:
-            report[name] = f'FAIL: {e}'
+            report[f'9_{sub}_ext'] = f'FAIL: {e}'
+        names = ['chulin_intro', 'chulin_didnt', 'chulin_end', 'chulin_error']
+        if provider == 'gemini': names[0] = 'chulin_gemini_intro'
+        for name in names:
+            try:
+                ym_upload(tts_wav(CHULIN_PROMPTS[name]), name + '.wav', f'/9/{sub}/{name}.wav')
+                report[f'{sub}_{name}'] = 'OK'
+            except Exception as e:
+                report[f'{sub}_{name}'] = f'FAIL: {e}'
+    try: report['groq_chat'] = groq_chat([{'role':'user','content':'ענה במילה אחת: בסדר'}], 64)
+    except Exception as e: report['groq_chat'] = f'FAIL: {e}'
+    try: report['gemini_chat'] = gemini_chat([{'role':'user','content':'ענה במילה אחת: בסדר'}], 64)
+    except Exception as e: report['gemini_chat'] = f'FAIL: {e}'
     return report
 
 
@@ -1864,7 +1914,7 @@ wiki_jobs = {}
 WIKI_SECTION_CHARS = 1400
 WIKI_MAX_SECTIONS = 60
 
-WIKI_HEADERS = {'User-Agent': 'yemot-wiki-ivr/1.0 (https://yemot-ai-voice-1.onrender.com; boherbatov@gmail.com)'}
+WIKI_HEADERS = {'User-Agent': 'yemot-wiki-ivr/1.0 (https://yemot-ai-voice.onrender.com; boherbatov@gmail.com)'}
 
 def wiki_article_text(term):
     api = 'https://he.wikipedia.org/w/api.php'
