@@ -136,10 +136,14 @@ def _yt_tv_context():
 def yt_search_candidates(query):
     import json as J, urllib.request as U
     _yt_cfg()
-    body = J.dumps({'context': _yt_tv_context(), 'query': query}).encode()
+    body = J.dumps({'context': {'client': {
+        'clientName': 'WEB', 'clientVersion': '2.20260918.01.00',
+        'hl': 'he', 'visitorData': _YT['vd']}}, 'query': query}).encode()
     r = J.load(U.urlopen(U.Request(
         f'https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key={_YT["key"]}',
-        data=body, headers=_yt_headers()), timeout=30))
+        data=body, headers={'Content-Type': 'application/json',
+                            'User-Agent': 'Mozilla/5.0',
+                            'X-Goog-Visitor-Id': _YT['vd']}), timeout=30))
     found = []
     def walk(o):
         if isinstance(o, dict):
