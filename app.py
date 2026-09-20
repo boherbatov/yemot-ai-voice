@@ -1295,50 +1295,105 @@ def yemot_chulin():
             s_val, turn = v, int(k[1:])
 
     with lock:
-        job = chulin_jobs.setdefault(call_id, {'stage': 'intro', 'empty': 0})
+        job = chulin_jobs.setdefault(call_id, {'stage': 'ask', 'empty': 0, 'hist': []})
 
     try:
         if s_val is None:
-            return text_response(f'read=f-chulin_intro=S1,no,record,/9/in,,no')
+            return text_response('read=f-chulin_intro=S1,no,record,/9/in,,no')
 
-        if job.get('stage') == 'intro':
-            rec_path = None
-            if s_val and s_val.endswith('.wav'):
-                rec_path = s_val if s_val.startswith('/') else f'/9/in/{s_val}'
-            else:
-                try:
-                    rec_path = ym_newest_file('/9/in')
-                except Exception:
-                    rec_path = None
-            if not rec_path:
-                job['empty'] += 1
-                if job['empty'] >= 2:
-                    with lock:
-                        chulin_jobs.pop(call_id, None)
-                    return text_response('read=f-chulin_end=S99,no,no')
-                return text_response(f'read=f-chulin_intro=S{turn+1},no,record,/9/in,,no')
-            name = 'chul' + re.sub(r'\D', '', call_id)[-6:]
-            try:
-                wav = ym_download(rec_path if rec_path.startswith('ivr2:') else 'ivr2:' + rec_path)
-                ym_upload(wav, name + '.wav', f'/9/{name}.wav')
-                ym_delete(rec_path if rec_path.startswith('ivr2:') else 'ivr2:' + rec_path)
-                job['wav'] = name
-            except Exception as e:
-                log.warning('chulin record move failed call=%s: %s', call_id, e)
+        rec_path = s_val if s_val.startswith('/') else f'/9/in/{s_val}'
+        wav = ym_download(rec_path if rec_path.startswith('ivr2:') else 'ivr2:' + rec_path)
+        ym_delete(rec_path if rec_path.startswith('ivr2:') else 'ivr2:' + rec_path)
+        text = groq_stt(wav)
+        log.info('chulin req call=%s: %s', call_id, (text or '')[:80])
+        if not text:
+            job['empty'] += 1
+            if job['empty'] >= 2:
                 with lock:
                     chulin_jobs.pop(call_id, None)
-                return text_response('id_list_message=f-error')
-            job['stage'] = 'done'
-            return text_response(
-                f'read=f-chulin_taunt.f-{name}.f-chulin_taunt2.f-{name}.f-chulin_end=S{turn+1},no,no')
+                return text_response('id_list_message=f-chulin_end')
+            return text_response(f'read=f-chulin_didnt=S{turn+1},no,record,/9/in,,no')
+        job['empty'] = 0
 
-        with lock:
-            chulin_jobs.pop(call_id, None)
-        return text_response('go_to_folder=/')
+        ctx = web_context(text)
+        msgs = [{'role': 'system', 'content': CHULIN_SYSTEM}]
+        if ctx:
+            msgs.append({'role': 'system', 'content': 'מידע עדכני מהאינטרנט שנשלף כרגע, הסתמך עליו:\n' + ctx})
+        for who, txt in job['hist'][-6:]:
+            msgs.append({'role': 'user' if who == 'u' else 'assistant', 'content': txt})
+        msgs.append({'role': 'user', 'content': text})
+        reply = groq_chat(msgs)
+        is_bye = reply.upper().startswith('BYE')
+        reply_text = re.sub(r'^BYE:?\s*', '', reply, flags=re.I).strip() or 'להתראות!'
+        log.info('chulin reply call=%s bye=%s: %s', call_id, is_bye, reply_text[:80])
+        job['hist'].append(('u', text))
+        job['hist'].append(('a', reply_text))
+
+        name = f'ch{call_id[-6:]}{turn}.wav'
+        ym_upload(tts_wav(reply_text), name, f'/9/{name}')
+        if is_bye:
+            with lock:
+                chulin_jobs.pop(call_id, None)
+            return text_response(f'id_list_message=f-{name[:-4]}')
+        return text_response(f'read=f-{name[:-4]}=S{turn+1},no,record,/9/in,,no')
 
     except Exception as e:
         log.exception('chulin call=%s error: %s', call_id, e)
-        return text_response('id_list_message=f-error')
+        return text_response('id_list_message=f-chulin_error')
+
+
+CHULIN_SYSTEM = (
+    'את "חולין", צ׳אטבוט קולי שובב וחכם בקו טלפוני. '
+    'כללים קשיחים: '
+    '1) עני תמיד בעברית בלבד, מדוברת וטבעית, עם חוש הומור קל. '
+    '2) תשובות קצרות: עד שלושה משפטים. לעולם לא רשימות, מספור, אימוג׳י או סימנים מיוחדים - הטקסט מוקרא בקול. '
+    '3) אם מצורף מידע עדכני מהאינטרנט, הסתמכי עליו קודם ואמרי שהמידע עדכני. אם אין, עני מהידע שלך ואמרי בכנות אם את לא בטוחה. '
+    '4) אם המשתמש נפרד (ביי, להתראות, די, תודה זהו) - התחילי את התשובה במילה BYE: ולאחריה משפט פרידה אחד קצר. '
+)
+
+NEWSISH = re.compile(r'חדשות|מה קורה|נשמע|עדכנ|היום|השבוע|אתמול|מזג|מלחמ|בחירות|כותרות|ממשלה|נתניהו')
+
+def web_context(query):
+    parts = []
+    try:
+        api = 'https://he.wikipedia.org/w/api.php'
+        r = requests.get(api, params={'action': 'query', 'list': 'search', 'srsearch': query,
+                                      'utf8': 1, 'format': 'json', 'srlimit': 2, 'srprop': 'snippet'},
+                         headers=WIKI_HEADERS, timeout=12)
+        for hit in r.json().get('query', {}).get('search', []):
+            snip = re.sub(r'<[^>]+>', '', hit.get('snippet', '')).strip()
+            if snip:
+                parts.append(f"ויקיפדיה ({hit['title']}): {snip}")
+    except Exception as e:
+        log.info('chulin wiki ctx failed: %s', e)
+    if NEWSISH.search(query):
+        try:
+            heads = news_headlines(5)
+            if heads:
+                parts.append('כותרות חדשות עדכניות: ' + ' | '.join(heads))
+        except Exception as e:
+            log.info('chulin news ctx failed: %s', e)
+    return '\n'.join(parts)
+
+
+CHULIN_PROMPTS = {
+    'chulin_intro': 'הגעתם לפינת חולין! אני חולין, הצ׳אטבוט של הקו. שאלו אותי כל שאלה, גם על דברים שקורים עכשיו בעולם. דברו אחרי הצליל, ולסיום הקישו סולמית.',
+    'chulin_didnt': 'סליחה, לא שמעתי. אפשר שוב? דברו אחרי הצליל, ולסיום הקישו סולמית.',
+    'chulin_end': 'כיף היה! להתראות!',
+    'chulin_error': 'אוי, הייתה תקלה טכנית. נסו שוב קצת מאוחר יותר. להתראות!',
+}
+
+@app.route('/setup-chulin')
+def setup_chulin():
+    if request.args.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    report = {}
+    for name, text in CHULIN_PROMPTS.items():
+        try:
+            report[name] = 'OK' if ym_upload(tts_wav(text), name + '.wav', f'/9/{name}.wav') else 'FAIL'
+        except Exception as e:
+            report[name] = f'FAIL: {e}'
+    return report
 
 
 # ---------- Podcasts (extension 3) ----------
