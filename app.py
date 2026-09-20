@@ -150,7 +150,7 @@ def yt_download(video_id, outtmpl):
         ydl.download([url])
     return title, duration
 EDGE_VOICE = os.environ.get('EDGE_VOICE', 'he-IL-HilaNeural')
-EDGE_RATE = os.environ.get('EDGE_RATE', '+0%')
+EDGE_RATE = os.environ.get('EDGE_RATE', '-4%')
 EXT_DIR = os.environ.get('YM_AI_EXT', '/1')          # the api extension folder
 IN_DIR = '/AI/in'                                    # caller recordings
 HIST_DIR = '/AI/history'                             # per-caller history json (as .txt)
@@ -286,6 +286,9 @@ def groq_chat(messages, max_tokens=180):
 
 def tts_wav(text, rate=None):
     import edge_tts
+    text = re.sub(r'\s+', ' ', (text or '')).strip()
+    text = re.sub(r' ?[–—] ?', ', ', text)          # dashes read badly in TTS
+    text = re.sub(r'\.(?=[^\s\d.])', '. ', text)   # pause after sentences, keep decimals
     mp3_path = f'/tmp/tts-{time.time_ns()}.mp3'
     async def gen():
         await edge_tts.Communicate(text, EDGE_VOICE, rate=rate or EDGE_RATE).save(mp3_path)
@@ -458,10 +461,17 @@ def multitap_decode(s, lang='he'):
     flush()
     return ''.join(out).strip()
 
-def multitap_read(prompt_chain, var):
+def multitap_read(prompt_chain, var, allow_empty=False):
     # raw digits+* collection: no echo, no confirm, * and 0 allowed, # ends input
-    fields = [var, 'no', '120', '1', '20', 'No', 'no', 'no', '', '', '', '', '', '', 'no']
+    fields = [var, 'no', '120', '1', '20', 'No', 'no', 'no', '', '', '', 'Ok' if allow_empty else '', '', '', 'no']
     return f'read={prompt_chain}=' + ','.join(fields)
+
+SONG_FILLER = set('את שיר השיר שירים של אני רוצה באלי בא לי לשמוע תשמיעי תשמיע נא בבקשה אפשר משהו עם הזמר הזמרת על ידי פליי תנו תני'.split())
+
+def clean_song_query(text):
+    words = (text or '').split()
+    kept = [w for w in words if w not in SONG_FILLER]
+    return ' '.join(kept) if len(kept) >= 1 else (text or '').strip()
 
 # ---------- YouTube songs (extension 2) ----------
 
@@ -469,6 +479,7 @@ SONG_PROMPTS = {
     'song_ask': 'איזה שיר בא לכם? אמרו את שם השיר, אפשר גם את הזמר. דברו אחרי הצליל, ולסיום הקישו סולמית.',
     'song_mode': 'איזה שיר בא לכם? לחיפוש בהקלדה בעברית, הקישו 1. לחיפוש בדיבור, הקישו 2. לחיפוש בהקלדה באנגלית, הקישו 3.',
     'song_typehow': 'הקלידו את שם השיר או הזמר, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לסיום הקישו סולמית.',
+    'song_artist': 'עכשיו הקלידו את שם הזמר, או הקישו רק סולמית לדילוג.',
     'song_searching': 'רגע אחד, אני מחפשת את השיר. זה יכול לקחת חצי דקה.',
     'song_wait': 'עוד ממש קצת, השיר כבר בדרך.',
     'song_notfound': 'סליחה, לא הצלחתי למצוא את השיר הזה. נסו שיר אחר. איזה שיר בא לכם?',
@@ -662,6 +673,9 @@ def yemot_song():
             if typed:
                 text = multitap_decode(s_val, job.get('tlang', 'he'))
                 log.info('song typed call=%s raw=%s -> %s', call_id, s_val[:60], text[:60])
+                if text:
+                    job.update(stage='ask_artist', query=text)
+                    return text_response(multitap_read('f-song_artist', f'S{turn+1}', allow_empty=True))
             else:
                 rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
                 wav = ym_download(rec_path)
@@ -676,8 +690,18 @@ def yemot_song():
                 with lock:
                     song_jobs.pop(call_id, None)
                 return text_response('id_list_message=f-song_bye')
-            job.update(stage='wait', status='working', query=text)
-            threading.Thread(target=fetch_song, args=(call_id, text), daemon=True).start()
+            job.update(stage='wait', status='working', query=clean_song_query(text))
+            threading.Thread(target=fetch_song, args=(call_id, job['query']), daemon=True).start()
+            return text_response(f'read=f-song_searching=S{turn+1},no,no')
+
+        if stage == 'ask_artist':
+            artist = ''
+            if re.fullmatch(r'[0-9*]+', s_val or ''):
+                artist = multitap_decode(s_val, job.get('tlang', 'he'))
+            q = clean_song_query(((job.get('query') or '') + ' ' + artist).strip())
+            log.info('song query call=%s song=%r artist=%r -> %r', call_id, job.get('query'), artist, q)
+            job.update(stage='wait', status='working', query=q)
+            threading.Thread(target=fetch_song, args=(call_id, q), daemon=True).start()
             return text_response(f'read=f-song_searching=S{turn+1},no,no')
 
         if stage == 'wait':
@@ -1406,6 +1430,7 @@ CHULIN_SYSTEM = (
     '4) אם המשתמש נפרד (ביי, להתראות, די, תודה זהו) - התחילי את התשובה במילה BYE: ולאחריה משפט פרידה אחד קצר. '
 )
 
+FACTUALISH = re.compile(r'חדשות|מזג|עדכנ|היום|השבוע|אתמול|מי זה|מי היא|מי הוא|מה זה|מתי|איפה|כמה|למה|איך|ניצח|זכה|מחיר|שער|מלחמ|בחירות|כותרות|ממשלה|נתניהו|טרמפ|מונדיאל|ליגה|תוצא|מזהמ|מה השעה|איזה יום')
 NEWSISH = re.compile(r'חדשות|מה קורה|נשמע|עדכנ|היום|השבוע|אתמול|מזג|מלחמ|בחירות|כותרות|ממשלה|נתניהו')
 
 def web_context(query):
@@ -1451,6 +1476,16 @@ def setup_typing():
     for name in ('wiki_mode', 'wiki_typehow'):
         try:
             report[name] = 'OK' if ym_upload(tts_wav(WIKI_PROMPTS[name]), name + '.wav', f'/4/{name}.wav') else 'FAIL'
+        except Exception as e:
+            report[name] = f'FAIL: {e}'
+    for name in ('song_artist',):
+        try:
+            report[name] = 'OK' if ym_upload(tts_wav(SONG_PROMPTS[name]), name + '.wav', f'{SONG_DIR}/{name}.wav') else 'FAIL'
+        except Exception as e:
+            report[name] = f'FAIL: {e}'
+    for name in ('pod_entry', 'pod_typehow'):
+        try:
+            report[name] = 'OK' if ym_upload(tts_wav(POD_PROMPTS[name]), name + '.wav', f'/3/{name}.wav') else 'FAIL'
         except Exception as e:
             report[name] = f'FAIL: {e}'
     return report
@@ -1597,6 +1632,8 @@ POD_PROMPTS = {
     'pod_menu1': "להאזנה, הקישו את מספר הפודקאסט וסולמית. 1, אחד ביום . 2, פודקאסט שולחן 4 . 3, לוינסון על הבוקר . 4, השבוע - פודקאסט הארץ . 5, למי אכפת . 6, הפודיום . 7, בזמן שעבדתם . 8, הקרנף עם יואב רבינוביץ . 9, תרגעו . 10, הסכתוס. לרשימה הבאה, הקישו 0 וסולמית.",
     'pod_menu2': "להאזנה, הקישו את מספר הפודקאסט וסולמית. 11, בוקר חדש . 12, בגג של יצחקי . 13, קיקטוק . 14, ציון 3 . 15, פודקאסט רצח . 16, הפודקאסט של נדב פרי . 17, מנועי הכסף . 18, התשובה עם דורון פישלר . 19, חוץ לארץ . 20, לשחרר את הדב. לרשימה הבאה, הקישו 0 וסולמית.",
     'pod_menu3': "להאזנה, הקישו את מספר הפודקאסט וסולמית. 21, הברזייה . 22, גיקונומי . 23, שוט . 24, מפלגת המחשבות . 25, איך לעשות דברים . 26, החיים החדשים של רומי גונן . 27, האינטרסנטים . 28, מיכה סטוקס על שוק ההון . 29, חושבים טוב . 30, השקעות לעצלנים. לרשימה הבאה, הקישו 0 וסולמית.",
+    'pod_entry': 'לרשימת הפודקאסטים, הקישו 1. לחיפוש פודקאסט בהקלדה, הקישו 2.',
+    'pod_typehow': 'הקלידו את שם הפודקאסט, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לסיום הקישו סולמית.',
     'pod_searching': 'רגע אחד, אני מביאה את הפרק האחרון. אם הפרק ארוך, זה יכול לקחת דקה-שתיים.',
     'pod_wait': 'עוד קצת, הפרק כבר כמעט כאן.',
     'pod_notfound': 'סליחה, לא הצלחתי להביא את הפרק. נסו פודקאסט אחר.',
@@ -1604,18 +1641,29 @@ POD_PROMPTS = {
 }
 pod_jobs = {}
 
+def itunes_podcast_search(term):
+    try:
+        r = requests.get('https://itunes.apple.com/search',
+                         params={'term': term, 'entity': 'podcast', 'country': 'IL', 'limit': 5}, timeout=15)
+        for res in r.json().get('results', []):
+            if res.get('feedUrl'):
+                return {'title': pod_display_name(res.get('collectionName', '')), 'feed': res['feedUrl']}
+    except Exception as e:
+        log.info('itunes pod search failed: %s', e)
+    return None
+
 def feed_enclosures(feed_url):
     req = urllib.request.Request(feed_url, headers={'User-Agent': 'Mozilla/5.0'})
     data = urllib.request.urlopen(req, timeout=25).read().decode('utf-8', 'ignore')
     encs = re.findall(r'<enclosure[^>]*url="([^"]+)"', data)
     return encs
 
-def fetch_pod(call_id, pod_idx, ep_idx):
+def fetch_pod(call_id, pod_idx, ep_idx, pod=None):
     job = pod_jobs[call_id]
     tmp = f'/tmp/pod-{call_id}'
     try:
         import imageio_ffmpeg
-        pod = PODCASTS[pod_idx]
+        pod = pod or PODCASTS[pod_idx]
         encs = feed_enclosures(pod['feed'])
         if ep_idx >= len(encs):
             ep_idx = len(encs) - 1
@@ -1715,13 +1763,36 @@ def yemot_pod():
             s_val, turn = v, int(k[1:])
 
     with lock:
-        job = pod_jobs.setdefault(call_id, {'stage': 'menu', 'page': 1, 'status': 'idle', 'started': time.time()})
+        job = pod_jobs.setdefault(call_id, {'stage': 'entry', 'page': 1, 'status': 'idle', 'started': time.time()})
 
     if s_val is None:
-        return text_response('read=f-pod_menu1=S1,no,2,1,7,No,yes,,,,,,,,no')
+        return text_response('read=f-pod_entry=S1,no,1,1,7,No,yes,,,,,,,,no')
 
     try:
         stage = job['stage']
+
+        if stage == 'entry':
+            v = (s_val or '').strip()
+            if v == '2':
+                job['stage'] = 'pod_typed'
+                return text_response(multitap_read('f-pod_typehow', f'S{turn+1}'))
+            job['stage'] = 'menu'
+            job['custom'] = None
+            return text_response('read=f-pod_menu1=S{turn+1},no,2,1,7,No,yes,,,,,,,,no'.format(turn=turn))
+
+        if stage == 'pod_typed':
+            term = multitap_decode(s_val or '', 'he') if re.fullmatch(r'[0-9*]+', s_val or '') else ''
+            log.info('pod typed call=%s raw=%s -> %s', call_id, (s_val or '')[:60], term[:60])
+            if not term:
+                return text_response(multitap_read('f-pod_typehow', f'S{turn+1}'))
+            found = itunes_podcast_search(term)
+            if not found:
+                job['stage'] = 'entry'
+                return text_response(f'read=f-pod_notfound.f-pod_entry=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+            log.info('pod search call=%s: %r -> %s', call_id, term, found['title'])
+            job.update(stage='pod_wait', status='working', custom=found, idx=0, ep=0, started=time.time())
+            threading.Thread(target=fetch_pod, args=(call_id, 0, 0, found), daemon=True).start()
+            return text_response(f'read=f-pod_searching=S{turn+1},no,no')
 
         if stage == 'menu':
             v = (s_val or '').strip()
@@ -1729,7 +1800,7 @@ def yemot_pod():
                 job['page'] = job.get('page', 1) % 3 + 1
                 return text_response(f"read=f-pod_menu{job['page']}=S{turn+1},no,2,1,7,No,yes,,,,,,,,no")
             if v.isdigit() and 1 <= int(v) <= len(PODCASTS):
-                job.update(stage='pod_wait', status='working', idx=int(v) - 1, ep=0, started=time.time())
+                job.update(stage='pod_wait', status='working', idx=int(v) - 1, ep=0, started=time.time(), custom=None)
                 threading.Thread(target=fetch_pod, args=(call_id, job['idx'], 0), daemon=True).start()
                 return text_response(f'read=f-pod_searching=S{turn+1},no,no')
             return text_response(f"read=f-pod_menu{job.get('page',1)}=S{turn+1},no,2,1,7,No,yes,,,,,,,,no")
@@ -1765,7 +1836,7 @@ def yemot_pod():
                 if ep < 0:
                     ep = 0
                 job.update(stage='pod_wait', status='working', started=time.time())
-                threading.Thread(target=fetch_pod, args=(call_id, job['idx'], ep), daemon=True).start()
+                threading.Thread(target=fetch_pod, args=(call_id, job['idx'], ep, job.get('custom')), daemon=True).start()
                 return text_response(f'read=f-pod_searching=S{turn+1},no,no')
             job['stage'] = 'pod_after'
             return text_response(f'read=f-pod_after=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
@@ -2163,6 +2234,13 @@ def yemot():
         msgs = [{'role': 'system', 'content': SYSTEM_PROMPT}]
         if h.get('summary'):
             msgs.append({'role': 'system', 'content': 'רקע משיחות קודמות עם המתקשר הזה: ' + h['summary']})
+        if FACTUALISH.search(user_text):
+            try:
+                ctx = web_context(user_text)
+                if ctx:
+                    msgs.append({'role': 'system', 'content': 'מידע עדכני מהאינטרנט שנשלף כרגע, הסתמכי עליו אם רלוונטי:\n' + ctx})
+            except Exception as e:
+                log.info('chat web ctx failed: %s', e)
         for who, txt in h.get('turns', [])[-8:]:
             msgs.append({'role': 'user' if who == 'u' else 'assistant', 'content': txt})
         msgs.append({'role': 'user', 'content': user_text})
