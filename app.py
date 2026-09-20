@@ -150,7 +150,7 @@ def yt_download(video_id, outtmpl):
         ydl.download([url])
     return title, duration
 EDGE_VOICE = os.environ.get('EDGE_VOICE', 'he-IL-HilaNeural')
-EDGE_RATE = os.environ.get('EDGE_RATE', '-4%')
+EDGE_RATE = os.environ.get('EDGE_RATE', '+0%')
 EXT_DIR = os.environ.get('YM_AI_EXT', '/1')          # the api extension folder
 IN_DIR = '/AI/in'                                    # caller recordings
 HIST_DIR = '/AI/history'                             # per-caller history json (as .txt)
