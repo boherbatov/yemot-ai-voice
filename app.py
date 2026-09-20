@@ -1519,10 +1519,7 @@ def setup_typing():
             report[name] = f'FAIL: {e}'
     return report
 
-@app.route('/setup-chulin')
-def setup_chulin():
-    if request.args.get('secret') != BRIDGE_SECRET:
-        return 'forbidden', 403
+def setup_chulin_assets():
     import urllib.parse
     report = {}
     try:
@@ -1551,6 +1548,12 @@ def setup_chulin():
     try: report['gemini_chat'] = gemini_chat([{'role':'user','content':'ענה במילה אחת: בסדר'}], 64)
     except Exception as e: report['gemini_chat'] = f'FAIL: {e}'
     return report
+
+@app.route('/setup-chulin')
+def setup_chulin():
+    if request.args.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    return setup_chulin_assets()
 
 
 # ---------- Podcasts (extension 3) ----------
@@ -2320,6 +2323,19 @@ def yemot():
         stats['errors'] += 1
         log.exception('turn failed: %s', e)
         return text_response('id_list_message=f-error')
+
+def _auto_setup_chulin():
+    # Idempotent startup migration. Keeps ext 9 unchanged until the complete app
+    # and both model keys are live, then installs the menu and both branches.
+    if not (YM_SYSTEM and YM_PASS and BRIDGE_SECRET and GROQ_API_KEY and GEMINI_API_KEY):
+        return
+    time.sleep(5)
+    try:
+        log.info('automatic extension 9 setup: %s', setup_chulin_assets())
+    except Exception as e:
+        log.exception('automatic extension 9 setup failed: %s', e)
+
+threading.Thread(target=_auto_setup_chulin, daemon=True).start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
