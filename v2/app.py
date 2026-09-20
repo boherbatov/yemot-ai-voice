@@ -66,7 +66,10 @@ def ym_upload(local_bytes, filename, ym_path):
 
 def ym_delete(ym_path):
     try:
-        return ym_get('FileAction', action='delete', path=ym_p(ym_path)).json()
+        r = requests.get(f'{YM_API}/FileAction',
+                         params={'token': YM_TOKEN, 'action': 'delete', 'path': ym_p(ym_path)},
+                         timeout=20)
+        return r.json()
     except Exception as e:
         log.warning('delete failed %s: %s', ym_path, e)
         return None
@@ -269,6 +272,12 @@ def yemot():
         if stage == 'ask':
             rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
             wav = ym_download(rec_path)
+            if not wav.startswith(b'RIFF'):
+                log.warning('rec download not wav (%d bytes), retrying', len(wav))
+                time.sleep(2)
+                wav = ym_download(rec_path)
+            if not wav.startswith(b'RIFF'):
+                return text_response(f'read=f-didnthear=S{turn+1},no,record,{IN_DIR},,no')
             ym_delete(rec_path)
             text = groq_stt(wav)
             log.info('req call=%s: %s', call_id, (text or '')[:80])
