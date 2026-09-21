@@ -1386,11 +1386,21 @@ def yemot_ned():
 chulin_jobs = {}
 
 @app.route('/yemot-chulin', methods=['GET', 'POST'])
+@app.route('/yemot-chulin-groq', methods=['GET', 'POST'])
+@app.route('/yemot-chulin-gemini', methods=['GET', 'POST'])
 def yemot_chulin():
     params = request.values
     if params.get('secret') != BRIDGE_SECRET:
         return 'forbidden', 403
-    provider = 'gemini' if params.get('provider') == 'gemini' else 'groq'
+    # Encode the provider in the endpoint path. Yemot appends its call
+    # parameters with '?' even when api_link already has a query string, so a
+    # provider query parameter can become 'gemini?ApiCallId=...' and fail.
+    if request.path.endswith('-gemini'):
+        provider = 'gemini'
+    elif request.path.endswith('-groq'):
+        provider = 'groq'
+    else:
+        provider = 'gemini' if params.get('provider') == 'gemini' else 'groq'
     base_dir = '/9/2' if provider == 'gemini' else '/9/1'
     call_id = params.get('ApiCallId') or str(time.time_ns())
     job_id = f'{provider}:{call_id}'
@@ -1535,8 +1545,11 @@ def setup_chulin_assets():
         report['9_menu'] = f'FAIL: {e}'
     for sub, provider in (('1', 'groq'), ('2', 'gemini')):
         try:
-            link = f'{PUBLIC_BASE_URL}/yemot-chulin?secret={urllib.parse.quote(BRIDGE_SECRET)}&provider={provider}'
-            ym_upload_text(f'type=api\napi_link={link}\n', f'ivr2:/9/{sub}/ext.ini')
+            # Keep only secret in the query string; _fix_ym_glued_query repairs
+            # Yemot's '?ApiCallId=...' suffix. Provider lives in the URL path.
+            link = f'{PUBLIC_BASE_URL}/yemot-chulin-{provider}?secret={urllib.parse.quote(BRIDGE_SECRET)}'
+            config = f'type=api\napi_link={link}\napi_dir=/9/{sub}\napi_url_post=no\n'
+            ym_upload_text(config, f'ivr2:/9/{sub}/ext.ini')
             report[f'9_{sub}_ext'] = 'OK'
         except Exception as e:
             report[f'9_{sub}_ext'] = f'FAIL: {e}'
