@@ -552,7 +552,7 @@ def clean_song_query(text):
 
 SONG_PROMPTS = {
     'song_ask': 'איזה שיר בא לכם? אמרו את שם השיר, אפשר גם את הזמר. דברו אחרי הצליל, ולסיום הקישו סולמית.',
-    'song_mode': 'איזה שיר בא לכם? לחיפוש בהקלדה בעברית, הקישו 1. לחיפוש בדיבור, הקישו 2. לחיפוש בהקלדה באנגלית, הקישו 3. לשירים של זמר מסוים, הקישו 4.',
+    'song_mode': 'איזה שיר בא לכם? לחיפוש בהקלדה בעברית, הקישו 1. לחיפוש בדיבור, הקישו 2. לחיפוש בהקלדה באנגלית, הקישו 3. לשירים של זמר מסוים, הקישו 4. להרשימות השירים שלכם, הקישו 5.',
     'song_typehow': 'הקלידו את שם השיר, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לחיפוש לפי זמר בלבד, הקישו סולמית ישר. לסיום הקישו סולמית.',
     'song_artist': 'עכשיו הקלידו את שם הזמר, או הקישו רק סולמית לדילוג.',
     'song_searching': 'רגע אחד, אני מחפשת את השיר. זה יכול לקחת חצי דקה.',
@@ -597,7 +597,7 @@ LIB_PROMPTS = ('lib_pick', 'lib_bad', 'lib_choose', 'lib_for', 'lib_for_list', '
 # prompts the extension-2 upgrade needs on Yemot; uploaded once by _auto_setup_song2
 SONG2_NEW_PROMPTS = ('song_mode', 'song_typehow', 'song_artist', 'song_after',
                      'song_artist_ask', 'song_auto_next', 'song_queue_done', 'song_radio_on')
-SONG2_PROMPT_VERSION = 'v2'
+SONG2_PROMPT_VERSION = 'v3'
 
 LIB_DIR = os.environ.get('YM_LIB_EXT', '/16')            # playlists root extension
 
@@ -911,6 +911,10 @@ def yemot_song():
         if mode == '4':
             job.update(stage='artist_voice', mode='single')
             return text_response(f'read=f-song_artist_ask=S1,no,record,{IN_DIR},,no')
+        if mode == '5':
+            with lock:
+                song_jobs.pop(call_id, None)
+            return text_response(f'go_to_folder={LIB_DIR}')
         return text_response('read=f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
 
     try:
