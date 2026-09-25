@@ -436,7 +436,7 @@ def setup():
     report = {}
     # root menu greeting lives at /000.wav (played by the root menu extension)
     try:
-        ym_upload(tts_wav('ברוכים הבאים! לשיחה עם אוזן, הקישו 1. לשיר מיוטיוב, הקישו 2. לפודקאסטים, הקישו 3. לויקיפדיה, הקישו 4. לרשימות השירים שלכם, הקישו 5. לתרגום, הקישו 6. למבזק חדשות, הקישו 7. למהדורות החדשות, הקישו 8.'), '000.wav', '/000.wav')
+        ym_upload(tts_wav(ROOT_MENU_TEXT), '000.wav', '/000.wav')
         report['menu_000.wav'] = 'ok'
     except Exception as e:
         report['menu_000.wav'] = f'FAIL: {e}'
@@ -1774,6 +1774,54 @@ def yemot_jump7():
     return text_response('go_to_folder=/7')
 
 
+# ---------- Contact the management (extension 5) ----------
+
+PNIOT_DIR = os.environ.get('YM_PNIOT_EXT', '/5')
+PNIOT_PROMPTS = {
+    'pniot_intro': 'פניות להנהלה. הקליטו את הפנייה שלכם אחרי הצליל, ולסיום הקישו סולמית. הפנייה מגיעה ישירות להנהלת הקו.',
+    'pniot_ok': 'תודה רבה! הפנייה נשלחה להנהלת הקו. להתראות!',
+    'pniot_error': 'סליחה, הייתה תקלה בשליחת הפנייה. נסו שוב קצת מאוחר יותר. להתראות!',
+}
+
+@app.route('/yemot-pniot', methods=['GET', 'POST'])
+def yemot_pniot():
+    params = request.values
+    if params.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    call_id = params.get('ApiCallId') or str(time.time_ns())
+    phone = params.get('ApiPhone', '')
+    if params.get('hangup') == 'yes':
+        return text_response('')
+
+    s_val, turn = None, 0
+    for k, v in params.items():
+        if re.fullmatch(r'S\d+', k):
+            s_val, turn = v, int(k[1:])
+
+    if s_val is None:
+        return text_response(f'read=f-pniot_intro=S1,no,record,{PNIOT_DIR}/in,,no')
+
+    try:
+        rec_path = s_val if s_val.startswith('/') else f'{PNIOT_DIR}/in/{s_val}'
+        full = rec_path if rec_path.startswith('ivr2:') else 'ivr2:' + rec_path
+        wav = ym_download(full)
+        # keep the recording on Yemot as backup (file stays in /5/in)
+        ts = time.strftime('%d/%m/%Y %H:%M', time.localtime())
+        caption = f'פנייה חדשה מהקו\nמספר: {phone or "לא ידוע"}\nזמן: {ts} (שעון ישראל)'
+
+        async def _send():
+            c = tg_client()
+            await c.connect()
+            await c.send_file('me', wav, caption=caption, file_name='פנייה_מהקו.wav')
+            await c.disconnect()
+        asyncio.run(_send())
+        log.info('pniot call=%s phone=%s sent to telegram (%d bytes)', call_id, phone, len(wav))
+        return text_response('id_list_message=f-pniot_ok')
+    except Exception as e:
+        log.exception('pniot call=%s error: %s', call_id, e)
+        return text_response('id_list_message=f-pniot_error')
+
+
 # ---------- Penalty box (extension 9) ----------
 
 chulin_jobs = {}
@@ -2113,7 +2161,8 @@ POD_PROMPTS = {
     'pod_menu1': "להאזנה, הקישו את מספר הפודקאסט וסולמית. 1, אחד ביום . 2, פודקאסט שולחן 4 . 3, לוינסון על הבוקר . 4, השבוע - פודקאסט הארץ . 5, למי אכפת . 6, הפודיום . 7, בזמן שעבדתם . 8, הקרנף עם יואב רבינוביץ . 9, תרגעו . 10, הסכתוס. לרשימה הבאה, הקישו 0 וסולמית.",
     'pod_menu2': "להאזנה, הקישו את מספר הפודקאסט וסולמית. 11, בוקר חדש . 12, בגג של יצחקי . 13, קיקטוק . 14, ציון 3 . 15, פודקאסט רצח . 16, הפודקאסט של נדב פרי . 17, מנועי הכסף . 18, התשובה עם דורון פישלר . 19, חוץ לארץ . 20, לשחרר את הדב. לרשימה הבאה, הקישו 0 וסולמית.",
     'pod_menu3': "להאזנה, הקישו את מספר הפודקאסט וסולמית. 21, הברזייה . 22, גיקונומי . 23, שוט . 24, מפלגת המחשבות . 25, איך לעשות דברים . 26, החיים החדשים של רומי גונן . 27, האינטרסנטים . 28, מיכה סטוקס על שוק ההון . 29, חושבים טוב . 30, השקעות לעצלנים. לרשימה הבאה, הקישו 0 וסולמית.",
-    'pod_entry': 'לרשימת הפודקאסטים, הקישו 1. לחיפוש פודקאסט בהקלדה, הקישו 2.',
+    'pod_entry': 'לרשימת הפודקאסטים, הקישו 1. לחיפוש פודקאסט בהקלדה, הקישו 2. לעיון לפי קטגוריה, הקישו 3.',
+    'pod_cats': 'בחרו קטגוריה. לחדשות ואקטואליה, הקישו 1. לקומדיה ובידור, הקישו 2. לטכנולוגיה, הקישו 3. לספורט, הקישו 4. לכסף וכלכלה, הקישו 5. לפשע אמיתי, הקישו 6. לחזרה לתפריט הפודקאסטים, הקישו 0.',
     'pod_typehow': 'הקלידו את שם הפודקאסט, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לסיום הקישו סולמית.',
     'pod_searching': 'רגע אחד, אני מביאה את הפרק האחרון. אם הפרק ארוך, זה יכול לקחת דקה-שתיים.',
     'pod_wait': 'עוד קצת, הפרק כבר כמעט כאן.',
@@ -2121,6 +2170,20 @@ POD_PROMPTS = {
     'pod_after': 'לפרק קודם, הקישו 1. לפרק הבא, הקישו 2. לתפריט הפודקאסטים, הקישו 3. לתפריט הראשי, הקישו 4.',
 }
 pod_jobs = {}
+
+def itunes_podcast_search_multi(term, limit=5):
+    out = []
+    try:
+        r = requests.get('https://itunes.apple.com/search',
+                         params={'term': term, 'entity': 'podcast', 'country': 'IL', 'limit': 12}, timeout=15)
+        for res in r.json().get('results', []):
+            if res.get('feedUrl'):
+                out.append({'title': pod_display_name(res.get('collectionName', '')), 'feed': res['feedUrl']})
+            if len(out) >= limit:
+                break
+    except Exception as e:
+        log.info('itunes pod multi failed: %s', e)
+    return out
 
 def itunes_podcast_search(term):
     try:
@@ -2227,6 +2290,15 @@ def podcast_refresh_loop():
 threading.Thread(target=podcast_refresh_loop, daemon=True).start()
 
 
+POD_CATEGORIES = [
+    ('חדשות אקטואליה פודקאסט', 'חדשות ואקטואליה'),
+    ('קומדיה בידור פודקאסט', 'קומדיה ובידור'),
+    ('טכנולוגיה פודקאסט', 'טכנולוגיה'),
+    ('ספורט פודקאסט', 'ספורט'),
+    ('כסף כלכלה פודקאסט', 'כסף וכלכלה'),
+    ('פשע אמיתי פודקאסט', 'פשע אמיתי'),
+]
+
 @app.route('/yemot-pod', methods=['GET', 'POST'])
 def yemot_pod():
     params = request.values
@@ -2257,9 +2329,52 @@ def yemot_pod():
             if v == '2':
                 job['stage'] = 'pod_typed'
                 return text_response(multitap_read('f-pod_typehow', f'S{turn+1}'))
+            if v == '3':
+                job['stage'] = 'cats'
+                return text_response(f'read=f-pod_cats=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             job['stage'] = 'menu'
             job['custom'] = None
             return text_response(f'read=f-pod_menu1=S{turn+1},no,2,1,7,No,yes,,,,,,,,no')
+
+        if stage == 'cats':
+            v = (s_val or '').strip()
+            if v.isdigit() and 1 <= int(v) <= len(POD_CATEGORIES):
+                term, cat_name = POD_CATEGORIES[int(v) - 1]
+                log.info('pod cat call=%s: %s (%s)', call_id, cat_name, term)
+                found = itunes_podcast_search_multi(term, 5)
+                if not found:
+                    job['stage'] = 'entry'
+                    return text_response(f'read=f-pod_notfound.f-pod_entry=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+                job.update(stage='cat_pick', cat_results=found)
+                sfx = call_id[-6:]
+                names = []
+                for i, it in enumerate(found, 1):
+                    try:
+                        ym_upload(tts_wav(f'מקש {i}. {it["title"]}'),
+                                  f'pc_i{sfx}_{i}.wav', f'/3/pc_i{sfx}_{i}.wav')
+                        names.append(f'f-pc_i{sfx}_{i}')
+                    except Exception as e:
+                        log.warning('pod cat prompt %d failed: %s', i, e)
+                try:
+                    ym_upload(tts_wav('בחרו פודקאסט. לחזרה לקטגוריות, הקישו 0.'),
+                              f'pc_pick{sfx}.wav', f'/3/pc_pick{sfx}.wav')
+                except Exception:
+                    pass
+                chain = '.'.join(names) + f'.f-pc_pick{sfx}'
+                return text_response(f'read={chain}=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+            job['stage'] = 'entry'
+            return text_response(f'read=f-pod_entry=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+
+        if stage == 'cat_pick':
+            v = (s_val or '').strip()
+            found = job.get('cat_results') or []
+            if v.isdigit() and 1 <= int(v) <= len(found):
+                sel = found[int(v) - 1]
+                job.update(stage='pod_wait', status='working', custom=sel, idx=0, ep=0, started=time.time())
+                threading.Thread(target=fetch_pod, args=(call_id, 0, 0, sel), daemon=True).start()
+                return text_response(play_chain('f-pod_searching', f'S{turn+1}'))
+            job['stage'] = 'cats'
+            return text_response(f'read=f-pod_cats=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
 
         if stage == 'pod_typed':
             term = multitap_decode(s_val or '', 'he') if re.fullmatch(r'[0-9*]+', s_val or '') else ''
@@ -2896,6 +3011,83 @@ def _auto_setup_newscenter():
             ym_upload_text(NC_PROMPT_VERSION + '\n', f'ivr2:{NED_DIR}/prompts_nc_{NC_PROMPT_VERSION}.txt')
         except Exception as e:
             log.warning('nc marker failed: %s', e)
+
+PNIOT_PROMPT_VERSION = 'v1'
+
+def _auto_setup_pniot():
+    # Idempotent startup migration: install extension 5 (פניות להנהלה) once per version.
+    if not (YM_SYSTEM and YM_PASS and BRIDGE_SECRET):
+        return
+    time.sleep(55)
+    try:
+        names = {f.get('name') for f in ym_list_files(f'ivr2:{PNIOT_DIR}')}
+        if f'prompts_pniot_{PNIOT_PROMPT_VERSION}.txt' in names:
+            log.info('pniot already at %s', PNIOT_PROMPT_VERSION)
+            return
+    except Exception as e:
+        log.warning('pniot prompt check failed, uploading anyway: %s', e)
+    import urllib.parse
+    ok = True
+    for name, text in PNIOT_PROMPTS.items():
+        try:
+            ym_upload(tts_wav(text), name + '.wav', f'{PNIOT_DIR}/{name}.wav')
+            log.info('pniot prompt %s uploaded', name)
+        except Exception as e:
+            ok = False
+            log.warning('pniot prompt %s failed: %s', name, e)
+    try:
+        link = f'{PUBLIC_BASE_URL}/yemot-pniot?secret={urllib.parse.quote(BRIDGE_SECRET)}'
+        ym_upload_text(f'type=api\napi_link={link}\napi_dir={PNIOT_DIR}\napi_url_post=no\n',
+                       f'ivr2:{PNIOT_DIR}/ext.ini')
+        log.info('pniot: %s ext.ini -> yemot-pniot', PNIOT_DIR)
+    except Exception as e:
+        ok = False
+        log.warning('pniot ext.ini failed: %s', e)
+    if ok:
+        try:
+            ym_upload_text(PNIOT_PROMPT_VERSION + '\n', f'ivr2:{PNIOT_DIR}/prompts_pniot_{PNIOT_PROMPT_VERSION}.txt')
+        except Exception as e:
+            log.warning('pniot marker failed: %s', e)
+
+ROOT_MENU_TEXT = 'ברוכים הבאים! למרכז עוזרי הבינה המלאכותית, הקישו 1. לשירים מיוטיוב ולרשימות השירים שלכם, הקישו 2. לפודקאסטים, הקישו 3. לויקיפדיה, הקישו 4. לפניות להנהלה, הקישו 5. לתרגום, הקישו 6. למרכז החדשות, הקישו 7.'
+
+POD_PROMPT_VERSION = 'v2'
+
+def _auto_setup_pod3():
+    # Idempotent startup migration: upload new extension-3 prompts (categories) once per version.
+    if not (YM_SYSTEM and YM_PASS):
+        return
+    time.sleep(70)
+    try:
+        names = {f.get('name') for f in ym_list_files('ivr2:/3')}
+        if f'prompts_pod_{POD_PROMPT_VERSION}.txt' in names:
+            log.info('pod prompts already at %s', POD_PROMPT_VERSION)
+            return
+    except Exception as e:
+        log.warning('pod prompt check failed, uploading anyway: %s', e)
+    ok = True
+    for name in ('pod_entry', 'pod_cats'):
+        try:
+            ym_upload(tts_wav(POD_PROMPTS[name]), name + '.wav', f'/3/{name}.wav')
+            log.info('pod prompt %s uploaded', name)
+        except Exception as e:
+            ok = False
+            log.warning('pod prompt %s failed: %s', name, e)
+    try:
+        ym_upload(tts_wav(ROOT_MENU_TEXT), '000.wav', '/000.wav')
+        log.info('root menu 000.wav updated')
+    except Exception as e:
+        ok = False
+        log.warning('root 000.wav failed: %s', e)
+    if ok:
+        try:
+            ym_upload_text(POD_PROMPT_VERSION + '\n', f'ivr2:/3/prompts_pod_{POD_PROMPT_VERSION}.txt')
+        except Exception as e:
+            log.warning('pod prompt marker failed: %s', e)
+
+threading.Thread(target=_auto_setup_pod3, daemon=True).start()
+
+threading.Thread(target=_auto_setup_pniot, daemon=True).start()
 
 threading.Thread(target=_auto_setup_newscenter, daemon=True).start()
 
