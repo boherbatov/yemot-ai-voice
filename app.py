@@ -469,7 +469,7 @@ def setup():
             report[name] = f'FAIL: {e}'
     for name, text in NED_PROMPTS.items():
         try:
-            report[name] = 'OK' if ym_upload(tts_wav(text), name + '.wav', f'/8/{name}.wav') else 'FAIL'
+            report[name] = 'OK' if ym_upload(tts_wav(text), name + '.wav', f'{NED_DIR}/{name}.wav') else 'FAIL'
         except Exception as e:
             report[name] = f'FAIL: {e}'
     for name in LIB_PROMPTS:
@@ -1281,16 +1281,16 @@ def news_headlines(limit=10):
 news_jobs = {}
 
 def fetch_news(call_id):
-    job = news_jobs[call_id]
+    job = ned_jobs[call_id]
     try:
         titles = news_headlines(10)
         if not titles:
             raise ValueError('no headlines')
         files = []
         for i, t in enumerate(titles, 1):
-            ym_upload(tts_wav(t, rate=NEWS_RATE), f'news_h{i}.wav', f'/7/news_h{i}.wav')
+            ym_upload(tts_wav(t, rate=NEWS_RATE), f'news_h{i}.wav', f'{NED_DIR}/news_h{i}.wav')
             files.append(f'f-news_h{i}')
-        job.update(status='ready', chain='f-news_intro.' + '.'.join(files) + '.f-news_menu')
+        job.update(status='ready', chain='f-news_intro.' + '.'.join(files) + '.f-nc_after_flash')
         log.info('news ready call=%s: %d headlines', call_id, len(files))
     except Exception as e:
         log.warning('news fetch failed call=%s: %s', call_id, e)
@@ -1358,15 +1358,19 @@ def yemot_news():
 
 # ---------- TV news editions (extension 8) ----------
 
+NED_DIR = os.environ.get('YM_NED_EXT', '/7')            # news center folder (merged ext 7+8)
+
 NED_PROMPTS = {
-    'ned_menu': 'מהדורות ותכנים. למהדורת כאן 11, הקישו 1. לתכנים חדשים מערוץ הטלגרם, הקישו 2. לחזרה לתפריט הראשי, הקישו 0.',
+    'nc_menu': 'מרכז החדשות. למבזק הכותרות העדכניות, הקישו 1. למהדורת כאן 11, הקישו 2. לתכנים וחדשות מערוצי הטלגרם, הקישו 3. לחזרה לתפריט הראשי, הקישו 0.',
+    'nc_chmenu': 'בחרו ערוץ. לחזרה לתפריט החדשות, הקישו 0.',
+    'nc_after_flash': 'סוף המבזק. להאזנה נוספת עם כותרות מעודכנות, הקישו 1. לתפריט החדשות, הקישו 2. לתפריט הראשי, הקישו 0.',
     'tg_listing': 'רגע, מביאה את רשימת התכנים העדכנית מהטלגרם.',
     'tg_searching': 'רגע, מביאה את התוכנית. תוכנית ארוכה יכולה לקחת גם שלוש דקות להתחיל.',
     'tg_notfound': 'סליחה, לא הצלחתי להביא את התוכנית. נסו תוכנית אחרת, או חזרו מאוחר יותר.',
     'ned_searching': 'רגע, מביאה את המהדורה העדכנית. מהדורה מלאה, אז זה יכול לקחת דקה או שתיים.',
     'ned_wait': 'עוד קצת, המהדורה מתכוננת.',
     'ned_notfound': 'סליחה, לא הצלחתי להביא את המהדורה עכשיו. נסו שוב מאוחר יותר.',
-    'ned_after': 'המהדורה הסתיימה. תודה שהאזנתם! לתפריט הראשי, הקישו 0.',
+    'ned_after': 'המהדורה הסתיימה. תודה שהאזנתם! לתפריט החדשות, הקישו 1. לתפריט הראשי, הקישו 0.',
 }
 
 def kan_latest_edition(program_id='11544'):
@@ -1386,12 +1390,13 @@ def kan_latest_edition(program_id='11544'):
 
 ned_jobs = {}
 
-NED_STATIC = {'ned_menu', 'ned_searching', 'ned_wait', 'ned_notfound', 'ned_after',
-              'tg_listing', 'tg_searching', 'tg_notfound'}
+NED_STATIC = {'nc_menu', 'nc_chmenu', 'nc_after_flash', 'ned_searching', 'ned_wait',
+              'ned_notfound', 'ned_after', 'tg_listing', 'tg_searching', 'tg_notfound',
+              'news_searching', 'news_wait', 'news_intro', 'news_error'}
 
 def ned_sweep_stale():
     try:
-        j = ym_get('GetIVR2Dir', path=ym_p('/8')).json()
+        j = ym_get('GetIVR2Dir', path=ym_p(NED_DIR)).json()
         files = j.get('files') or []
         active = set()
         for cid in ned_jobs:
@@ -1400,11 +1405,11 @@ def ned_sweep_stale():
         for f in files:
             name = f.get('name', '')
             base = name[:-4] if name.endswith('.wav') else name
-            if base in NED_STATIC or not re.match(r'^(ned|tg)', base):
+            if base in NED_STATIC or not re.match(r'^(ned|tg|nc_ch)', base):
                 continue
             if any(sfx and sfx in base for sfx in active):
                 continue
-            ym_delete(f'/8/{name}')
+            ym_delete(f'{NED_DIR}/{name}')
             log.info('ned sweep: deleted %s', name)
     except Exception as e:
         log.warning('ned sweep failed: %s', e)
@@ -1412,14 +1417,14 @@ def ned_sweep_stale():
 def ned_delete_call_files(call_id):
     try:
         sfxes = {call_id[-6:], re.sub(r'\D', '', call_id)[-6:]}
-        j = ym_get('GetIVR2Dir', path=ym_p('/8')).json()
+        j = ym_get('GetIVR2Dir', path=ym_p(NED_DIR)).json()
         for f in (j.get('files') or []):
             name = f.get('name', '')
             base = name[:-4] if name.endswith('.wav') else name
-            if base in NED_STATIC or not re.match(r'^(ned|tg)', base):
+            if base in NED_STATIC or not re.match(r'^(ned|tg|nc_ch)', base):
                 continue
             if any(sfx and sfx in base for sfx in sfxes):
-                ym_delete(f'/8/{name}')
+                ym_delete(f'{NED_DIR}/{name}')
     except Exception as e:
         log.warning('ned call cleanup failed: %s', e)
 
@@ -1434,7 +1439,7 @@ def fetch_ned(call_id):
         date = title.split('|')[-1].strip() if '|' in title else ''
         try:
             ym_upload(tts_wav(f'מהדורת כאן חדשות, {date}' if date else 'מהדורת כאן חדשות'),
-                      f'ned_t{call_id[-6:]}.wav', f'/8/ned_t{call_id[-6:]}.wav')
+                      f'ned_t{call_id[-6:]}.wav', f'{NED_DIR}/ned_t{call_id[-6:]}.wav')
             job['title_wav'] = f'ned_t{call_id[-6:]}'
         except Exception:
             pass
@@ -1451,7 +1456,7 @@ def fetch_ned(call_id):
             while uploaded < len(complete):
                 name = f'ned{re.sub(chr(92) + "D", "", call_id)[-6:]}_{uploaded+1:02d}'
                 with open(complete[uploaded], 'rb') as f:
-                    ym_upload(f.read(), name + '.wav', f'/8/{name}.wav')
+                    ym_upload(f.read(), name + '.wav', f'{NED_DIR}/{name}.wav')
                 job['chunks'].append(name)
                 log.info('ned call=%s chunk %d up', call_id, uploaded + 1)
                 uploaded += 1
@@ -1479,7 +1484,7 @@ def upload_chunks_loop(proc, tmp, prefix, job, ferr_name):
         while uploaded < len(complete):
             name = f'{prefix}_{uploaded+1:02d}'
             with open(complete[uploaded], 'rb') as f:
-                ym_upload(f.read(), name + '.wav', f'/8/{name}.wav')
+                ym_upload(f.read(), name + '.wav', f'{NED_DIR}/{name}.wav')
             job['chunks'].append(name)
             log.info('chunks call=%s chunk %d up', job.get('cid'), uploaded + 1)
             uploaded += 1
@@ -1495,7 +1500,15 @@ def upload_chunks_loop(proc, tmp, prefix, job, ferr_name):
             tail = ''
         raise ValueError('no audio chunks | ffmpeg: ' + tail[-300:])
 
-TG_CHANNEL = 'Yedioth_Bnei_Brak_Movies'
+TG_CHANNELS = [
+    ('Moshepargod', 'חדשות הפרגוד'),
+    ('ZiratNews', 'זירת החדשות'),
+    ('Political_arena', 'זירה פוליטית'),
+    ('abualiexpress', 'אבו עלי אקספרס'),
+    ('IsraelHayomHeb', 'ישראל היום'),
+    ('now14israel', 'צ׳אט הכתבים של ערוץ 14'),
+    ('Yedioth_Bnei_Brak_Movies', 'ידיעות בני ברק'),
+]
 
 def tg_client():
     from telethon import TelegramClient
@@ -1510,13 +1523,13 @@ def tg_main_title(caption):
         t = t[:90].rsplit(' ', 1)[0].strip(' .|,')
     return t or 'תוכנית ללא שם'
 
-def tg_list(call_id):
+def tg_list(call_id, ch_idx):
     job = ned_jobs[call_id]
     try:
         async def _go():
             c = tg_client()
             await c.connect()
-            ent = await c.get_entity(TG_CHANNEL)
+            ent = await c.get_entity(TG_CHANNELS[ch_idx][0])
             items = []
             async for m in c.iter_messages(ent, limit=40):
                 if m.video:
@@ -1531,9 +1544,9 @@ def tg_list(call_id):
         job['tg_items'] = items
         for i, it in enumerate(items, 1):
             ym_upload(tts_wav(f'מקש {i}. {it["title"]}'),
-                      f'tg_i{call_id[-6:]}_{i}.wav', f'/8/tg_i{call_id[-6:]}_{i}.wav')
+                      f'tg_i{call_id[-6:]}_{i}.wav', f'{NED_DIR}/tg_i{call_id[-6:]}_{i}.wav')
         ym_upload(tts_wav('בחרו תוכנית. לחזרה, הקישו 0.'),
-                  f'tg_pick{call_id[-6:]}.wav', f'/8/tg_pick{call_id[-6:]}.wav')
+                  f'tg_pick{call_id[-6:]}.wav', f'{NED_DIR}/tg_pick{call_id[-6:]}.wav')
         job.update(status='listed')
         log.info('tg listed call=%s: %d items', call_id, len(items))
     except Exception as e:
@@ -1550,7 +1563,7 @@ def fetch_tg(call_id, idx):
         it = items[idx]
         try:
             ym_upload(tts_wav(it['title']),
-                      f'tg_t{call_id[-6:]}.wav', f'/8/tg_t{call_id[-6:]}.wav')
+                      f'tg_t{call_id[-6:]}.wav', f'{NED_DIR}/tg_t{call_id[-6:]}.wav')
             job['title_wav'] = f'tg_t{call_id[-6:]}'
         except Exception:
             pass
@@ -1563,7 +1576,7 @@ def fetch_tg(call_id, idx):
         async def _dl():
             c = tg_client()
             await c.connect()
-            ent = await c.get_entity(TG_CHANNEL)
+            ent = await c.get_entity(TG_CHANNELS[job.get('ch', 0)][0])
             m = await c.get_messages(ent, ids=it['id'])
             log.info('tg dl call=%s msg=%s size=%s', call_id, it['id'], getattr(m.document, 'size', '?'))
             async for chunk in c.iter_download(m.media, chunk_size=512 * 1024):
@@ -1611,7 +1624,7 @@ def yemot_ned():
         stage = job.get('stage', 'menu')
 
         if s_val is None:
-            return text_response('read=f-ned_menu=S1,no,1,1,7,No,yes,,,,,,,,no')
+            return text_response('read=f-nc_menu=S1,no,1,1,7,No,yes,,,,,,,,no')
 
         def serve_next():
             chunks = job['chunks']
@@ -1619,7 +1632,7 @@ def yemot_ned():
             if nxt < len(chunks):
                 if nxt > 0:
                     prev = chunks[nxt - 1]
-                    threading.Thread(target=ym_delete, args=(f'/8/{prev}.wav',), daemon=True).start()
+                    threading.Thread(target=ym_delete, args=(f'{NED_DIR}/{prev}.wav',), daemon=True).start()
                 job['playing'] = nxt
                 job['stage'] = 'play'
                 head = f"f-{job['title_wav']}." if nxt == 0 and job.get('title_wav') else ''
@@ -1633,15 +1646,58 @@ def yemot_ned():
         if stage == 'menu':
             v = (s_val or '').strip()
             if v == '1':
+                job.update(stage='news_start', status='working', started=time.time(), mode='news')
+                threading.Thread(target=fetch_news, args=(call_id,), daemon=True).start()
+                return text_response(play_chain('f-news_searching', f'S{turn+1}'))
+            if v == '2':
                 job.update(stage='wait_start', status='working', started=time.time(), mode='kan')
                 threading.Thread(target=ned_sweep_stale, daemon=True).start()
                 threading.Thread(target=fetch_ned, args=(call_id,), daemon=True).start()
                 return text_response(play_chain('f-ned_searching', f'S{turn+1}'))
-            if v == '2':
-                job.update(stage='tg_list_wait', status='working', started=time.time(), mode='tg')
+            if v == '3':
+                job['stage'] = 'tg_channels'
+                chain = '.'.join(f'f-nc_ch_{i}' for i in range(1, len(TG_CHANNELS) + 1))
+                return text_response(f'read={chain}.f-nc_chmenu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+            with lock:
+                ned_jobs.pop(call_id, None)
+            return text_response('go_to_folder=/')
+
+        if stage == 'tg_channels':
+            v = (s_val or '').strip()
+            if v.isdigit() and 1 <= int(v) <= len(TG_CHANNELS):
+                job.update(stage='tg_list_wait', status='working', started=time.time(),
+                           mode='tg', ch=int(v) - 1)
                 threading.Thread(target=ned_sweep_stale, daemon=True).start()
-                threading.Thread(target=tg_list, args=(call_id,), daemon=True).start()
+                threading.Thread(target=tg_list, args=(call_id, int(v) - 1), daemon=True).start()
                 return text_response(play_chain('f-tg_listing', f'S{turn+1}'))
+            if v == '0':
+                job['stage'] = 'menu'
+                return text_response(f'read=f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+            job['stage'] = 'tg_channels'
+            chain = '.'.join(f'f-nc_ch_{i}' for i in range(1, len(TG_CHANNELS) + 1))
+            return text_response(f'read={chain}.f-nc_chmenu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+
+        if stage == 'news_start':
+            if job.get('status') == 'working':
+                if time.time() - job.get('started', 0) > 120:
+                    job['status'] = 'error'
+                else:
+                    return text_response(play_chain('f-news_wait', f'S{turn+1}'))
+            if job.get('status') == 'error':
+                job['stage'] = 'menu'
+                return text_response(f'read=f-news_error.f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+            job['stage'] = 'news_after'
+            return text_response(f"read={job['chain']}=S{turn+1},no,1,1,7,No,yes,,,,,,,,no")
+
+        if stage == 'news_after':
+            v = (s_val or '').strip()
+            if v == '1':
+                job.update(stage='news_start', status='working', started=time.time(), mode='news')
+                threading.Thread(target=fetch_news, args=(call_id,), daemon=True).start()
+                return text_response(play_chain('f-news_searching', f'S{turn+1}'))
+            if v == '2':
+                job['stage'] = 'menu'
+                return text_response(f'read=f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             with lock:
                 ned_jobs.pop(call_id, None)
             return text_response('go_to_folder=/')
@@ -1649,7 +1705,7 @@ def yemot_ned():
         if stage == 'tg_list_wait':
             if job.get('status') == 'error':
                 job['stage'] = 'menu'
-                return text_response(f'read=f-tg_notfound.f-ned_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+                return text_response(f'read=f-tg_notfound.f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             if job.get('status') == 'listed':
                 job['stage'] = 'tg_menu'
                 sfx = call_id[-6:]
@@ -1657,7 +1713,7 @@ def yemot_ned():
                 return text_response(f'read={chain}f-tg_pick{sfx}=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             if time.time() - job.get('started', 0) > 180:
                 job['stage'] = 'menu'
-                return text_response(f'read=f-tg_notfound.f-ned_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+                return text_response(f'read=f-tg_notfound.f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             return text_response(play_chain('f-tg_listing', f'S{turn+1}'))
 
         if stage == 'tg_menu':
@@ -1675,12 +1731,12 @@ def yemot_ned():
             nf = 'tg_notfound' if job.get('mode') == 'tg' else 'ned_notfound'
             if job.get('status') == 'error':
                 job['stage'] = 'menu'
-                return text_response(f'read=f-{nf}.f-ned_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+                return text_response(f'read=f-{nf}.f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             if job['chunks']:
                 return serve_next()
             if time.time() - job.get('started', 0) > 600:
                 job['stage'] = 'menu'
-                return text_response(f'read=f-{nf}.f-ned_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+                return text_response(f'read=f-{nf}.f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             return text_response(play_chain('f-ned_wait', f'S{turn+1}'))
 
         if stage == 'play':
@@ -1693,6 +1749,9 @@ def yemot_ned():
             return serve_next()
 
         if stage == 'after':
+            if (s_val or '').strip() == '1':
+                job['stage'] = 'menu'
+                return text_response(f'read=f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             with lock:
                 ned_jobs.pop(call_id, None)
             return text_response('go_to_folder=/')
@@ -1705,6 +1764,14 @@ def yemot_ned():
         log.exception('ned call=%s error: %s', call_id, e)
         return text_response('id_list_message=f-error')
 
+
+
+@app.route('/yemot-jump7')
+def yemot_jump7():
+    # Old extension 8 now forwards into the extension-7 news center.
+    if request.args.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    return text_response('go_to_folder=/7')
 
 
 # ---------- Penalty box (extension 9) ----------
@@ -2768,6 +2835,69 @@ def _auto_setup_hub():
             ym_upload_text(HUB_PROMPT_VERSION + '\n', f'ivr2:{EXT_DIR}/prompts_hub_{HUB_PROMPT_VERSION}.txt')
         except Exception as e:
             log.warning('hub prompt marker failed: %s', e)
+
+NC_PROMPT_VERSION = 'v1'
+
+def _auto_setup_newscenter():
+    # Idempotent startup migration: install the extension-7 news center
+    # (headlines flash + Kan 11 edition + Telegram channels) once per version,
+    # and forward old extension 8 into it.
+    if not (YM_SYSTEM and YM_PASS and BRIDGE_SECRET):
+        return
+    time.sleep(40)
+    try:
+        names = {f.get('name') for f in ym_list_files(f'ivr2:{NED_DIR}')}
+        if f'prompts_nc_{NC_PROMPT_VERSION}.txt' in names:
+            log.info('news center already at %s', NC_PROMPT_VERSION)
+            return
+    except Exception as e:
+        log.warning('nc prompt check failed, uploading anyway: %s', e)
+    import urllib.parse
+    ok = True
+    for name, text in NED_PROMPTS.items():
+        try:
+            ym_upload(tts_wav(text), name + '.wav', f'{NED_DIR}/{name}.wav')
+            log.info('nc prompt %s uploaded', name)
+        except Exception as e:
+            ok = False
+            log.warning('nc prompt %s failed: %s', name, e)
+    for name in ('news_searching', 'news_wait', 'news_intro', 'news_error'):
+        try:
+            ym_upload(tts_wav(NEWS_PROMPTS[name]), name + '.wav', f'{NED_DIR}/{name}.wav')
+            log.info('nc prompt %s uploaded', name)
+        except Exception as e:
+            ok = False
+            log.warning('nc prompt %s failed: %s', name, e)
+    for i, (uname, disp) in enumerate(TG_CHANNELS, 1):
+        try:
+            ym_upload(tts_wav(f'מקש {i}. {disp}'), f'nc_ch_{i}.wav', f'{NED_DIR}/nc_ch_{i}.wav')
+            log.info('nc channel prompt %d uploaded', i)
+        except Exception as e:
+            ok = False
+            log.warning('nc channel prompt %d failed: %s', i, e)
+    try:
+        link = f'{PUBLIC_BASE_URL}/yemot-ned?secret={urllib.parse.quote(BRIDGE_SECRET)}'
+        ym_upload_text(f'type=api\napi_link={link}\napi_dir={NED_DIR}\napi_url_post=no\n',
+                       f'ivr2:{NED_DIR}/ext.ini')
+        log.info('nc: %s ext.ini -> yemot-ned', NED_DIR)
+    except Exception as e:
+        ok = False
+        log.warning('nc /7 ext.ini failed: %s', e)
+    try:
+        link = f'{PUBLIC_BASE_URL}/yemot-jump7?secret={urllib.parse.quote(BRIDGE_SECRET)}'
+        ym_upload_text(f'type=api\napi_link={link}\napi_dir=/8\napi_url_post=no\n',
+                       'ivr2:/8/ext.ini')
+        log.info('nc: /8 ext.ini -> jump7')
+    except Exception as e:
+        ok = False
+        log.warning('nc /8 ext.ini failed: %s', e)
+    if ok:
+        try:
+            ym_upload_text(NC_PROMPT_VERSION + '\n', f'ivr2:{NED_DIR}/prompts_nc_{NC_PROMPT_VERSION}.txt')
+        except Exception as e:
+            log.warning('nc marker failed: %s', e)
+
+threading.Thread(target=_auto_setup_newscenter, daemon=True).start()
 
 threading.Thread(target=_auto_setup_hub, daemon=True).start()
 
