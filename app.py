@@ -1785,6 +1785,28 @@ def yemot_chulin():
         return text_response('id_list_message=f-chulin_error')
 
 
+
+HUB_NEWSY_SYSTEM = (
+    'את עוזרת מידע קולית בקו טלפוני, מחוברת למידע עדכני מהאינטרנט. '
+    'כללים קשיחים: '
+    '1) עני תמיד בעברית בלבד, מדוברת וטבעית, עד שלושה משפטים. לעולם לא רשימות, מספור, אימוג׳י או סימנים מיוחדים - הטקסט מוקרא בקול. '
+    '2) לכל שאלה מצורף מידע שנשלף כרגע מהאינטרנט (ויקיפדיה וכותרות חדשות). הסתמכי עליו קודם, ואמרי שהמידע עדכני. אם הוא לא עונה על השאלה, עני מהידע שלך ואמרי בכנות שאת לא בטוחה. '
+    '3) אם המשתמש נפרד (ביי, להתראות, די, תודה זהו) - התחילי את התשובה במילה BYE: ולאחריה משפט פרידה אחד קצר. '
+)
+
+HUB_ASSISTANTS = {
+    '1': {'model': 'groq', 'system': 'ozen', 'web': 'factualish', 'intro': None},
+    '2': {'model': 'gemini', 'system': 'chulin', 'web': 'always', 'intro': 'hub_chulin_intro'},
+    '3': {'model': 'groq', 'system': 'newsy', 'web': 'always', 'intro': 'hub_newsy_intro'},
+}
+
+HUB_PROMPTS = {
+    'hub_menu': 'מרכז עוזרי הבינה המלאכותית. לאוזן, החברה הוירטואלית לשיחה על הכל, הקישו 1. לחולין, הצ׳אטבוט השובב, הקישו 2. לעוזרת המידע העדכני, מחוברת לויקיפדיה ולחדשות האחרונות, הקישו 3. לחזרה לתפריט הראשי, הקישו 0.',
+    'hub_chulin_intro': 'היי, אני חולין! שאלו אותי כל שאלה, גם על דברים שקורים עכשיו בעולם. דברו אחרי הצליל, ולסיום הקישו סולמית.',
+    'hub_newsy_intro': 'היי! אני עוזרת המידע. אני מחוברת לויקיפדיה ולכותרות החדשות האחרונות, אז אפשר לשאול מה קורה בעולם עכשיו, או כל שאלה עובדתית. דברו אחרי הצליל, ולסיום הקישו סולמית.',
+}
+HUB_PROMPT_VERSION = 'v1'
+
 CHULIN_SYSTEM = (
     'את "חולין", צ׳אטבוט קולי שובב וחכם בקו טלפוני. '
     'כללים קשיחים: '
@@ -2584,12 +2606,29 @@ def yemot():
             stats['calls'] += 1
     h = sess['hist']
 
-    # --- new call: greeting + first record ---
+    # --- new call: AI hub menu ---
     if s_val is None:
         if h.get('day') == today() and h.get('day_turns', 0) >= MAX_DAILY_TURNS:
             return text_response('id_list_message=f-tired')
-        g = 'greeting_back' if (h.get('summary') or h.get('turns')) else 'greeting_new'
-        return text_response(f'read=f-{g}=S1,no,record,{IN_DIR},,no')
+        return text_response('read=f-hub_menu=S1,no,1,1,7,No,yes,,,,,,,,no')
+
+    # --- hub menu pick (before an assistant was chosen) ---
+    if sess.get('assistant') is None and not s_val.endswith('.wav'):
+        if s_val == '0':
+            with lock:
+                sessions.pop(call_id, None)
+            return text_response('go_to_folder=/')
+        if s_val in HUB_ASSISTANTS:
+            sess['assistant'] = s_val
+            a = HUB_ASSISTANTS[s_val]
+            if a['intro']:
+                intro = a['intro']
+            else:
+                intro = 'greeting_back' if (h.get('summary') or h.get('turns')) else 'greeting_new'
+            return text_response(f'read=f-{intro}=S{turn+1},no,record,{IN_DIR},,no')
+        return text_response(f'read=f-hub_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+    sess.setdefault('assistant', '1')
+    assist = HUB_ASSISTANTS.get(sess['assistant'], HUB_ASSISTANTS['1'])
 
     t0 = time.time()
     try:
@@ -2619,10 +2658,13 @@ def yemot():
             return text_response('id_list_message=f-tired')
 
         # --- LLM ---
-        msgs = [{'role': 'system', 'content': SYSTEM_PROMPT}]
-        if h.get('summary'):
+        sys_prompt = {'ozen': SYSTEM_PROMPT, 'chulin': CHULIN_SYSTEM,
+                      'newsy': HUB_NEWSY_SYSTEM}[assist['system']]
+        msgs = [{'role': 'system', 'content': sys_prompt}]
+        if h.get('summary') and assist['system'] == 'ozen':
             msgs.append({'role': 'system', 'content': 'רקע משיחות קודמות עם המתקשר הזה: ' + h['summary']})
-        if FACTUALISH.search(user_text):
+        want_web = assist['web'] == 'always' or (assist['web'] == 'factualish' and FACTUALISH.search(user_text))
+        if want_web:
             try:
                 ctx = web_context(user_text)
                 if ctx:
@@ -2632,7 +2674,7 @@ def yemot():
         for who, txt in h.get('turns', [])[-8:]:
             msgs.append({'role': 'user' if who == 'u' else 'assistant', 'content': txt})
         msgs.append({'role': 'user', 'content': user_text})
-        reply = groq_chat(msgs)
+        reply = gemini_chat(msgs) if assist['model'] == 'gemini' else groq_chat(msgs)
         is_bye = reply.upper().startswith('BYE')
         reply_text = re.sub(r'^BYE:?\s*', '', reply, flags=re.I).strip() or 'להתראות!'
         log.info('call=%s turn=%d llm(%.1fs) bye=%s: %s', call_id, turn, time.time()-t0, is_bye, reply_text[:80])
@@ -2696,6 +2738,34 @@ def _auto_setup_song2():
             ym_upload_text(SONG2_PROMPT_VERSION + '\n', f'ivr2:{SONG_DIR}/prompts_{SONG2_PROMPT_VERSION}.txt')
         except Exception as e:
             log.warning('song2 prompt marker failed: %s', e)
+
+def _auto_setup_hub():
+    # Idempotent startup migration: upload the extension-1 AI hub prompts once per version.
+    if not (YM_SYSTEM and YM_PASS):
+        return
+    time.sleep(20)
+    try:
+        names = {f.get('name') for f in ym_list_files(f'ivr2:{EXT_DIR}')}
+        if f'prompts_hub_{HUB_PROMPT_VERSION}.txt' in names:
+            log.info('hub prompts already at %s', HUB_PROMPT_VERSION)
+            return
+    except Exception as e:
+        log.warning('hub prompt check failed, uploading anyway: %s', e)
+    ok = True
+    for name, text in HUB_PROMPTS.items():
+        try:
+            ym_upload(tts_wav(text), name + '.wav', f'{EXT_DIR}/{name}.wav')
+            log.info('hub prompt %s uploaded', name)
+        except Exception as e:
+            ok = False
+            log.warning('hub prompt %s failed: %s', name, e)
+    if ok:
+        try:
+            ym_upload_text(HUB_PROMPT_VERSION + '\n', f'ivr2:{EXT_DIR}/prompts_hub_{HUB_PROMPT_VERSION}.txt')
+        except Exception as e:
+            log.warning('hub prompt marker failed: %s', e)
+
+threading.Thread(target=_auto_setup_hub, daemon=True).start()
 
 threading.Thread(target=_auto_setup_song2, daemon=True).start()
 
