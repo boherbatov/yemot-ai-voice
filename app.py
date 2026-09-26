@@ -326,6 +326,41 @@ def save_history(phone, h):
 def safe_name(p):
     return p.rstrip('/').split('/')[-1]
 
+# ---------- Resume (per-caller last position, stored on Yemot) ----------
+
+RESUME_DIR = '/AI/resume'
+resume_pending = {}   # call_id -> rec picked at the '#' menu, consumed by the target extension
+
+def resume_path(phone):
+    safe = re.sub(r'\D', '', phone or '') or 'anon'
+    return f'{RESUME_DIR}/{safe}.txt'
+
+def load_resume(phone):
+    if not phone:
+        return {}
+    try:
+        return json.loads(ym_download(resume_path(phone)).decode('utf-8'))
+    except Exception:
+        return {}
+
+def save_resume(phone, ext, rec):
+    if not phone:
+        return
+    try:
+        data = load_resume(phone)
+        data[ext] = dict(rec, ts=time.time())
+        p = resume_path(phone)
+        ym_delete(p)
+        ym_upload(json.dumps(data, ensure_ascii=False).encode('utf-8'), safe_name(p), p)
+    except Exception as e:
+        log.warning('resume save failed: %s', e)
+
+def resume_take(call_id, ext):
+    rec = resume_pending.pop(call_id, None)
+    if rec and rec.get('ext') == ext:
+        return rec
+    return None
+
 # ---------- Groq ----------
 
 def groq_stt(wav_bytes, language='he'):
@@ -353,14 +388,14 @@ def groq_chat(messages, max_tokens=180):
 
 # ---------- TTS ----------
 
-def tts_wav(text, rate=None):
+def tts_wav(text, rate=None, voice=None):
     import edge_tts
     text = re.sub(r'\s+', ' ', (text or '')).strip()
     text = re.sub(r' ?[–—] ?', ', ', text)          # dashes read badly in TTS
     text = re.sub(r'\.(?=[^\s\d.])', '. ', text)   # pause after sentences, keep decimals
     mp3_path = f'/tmp/tts-{time.time_ns()}.mp3'
     async def gen():
-        await edge_tts.Communicate(text, EDGE_VOICE, rate=rate or EDGE_RATE).save(mp3_path)
+        await edge_tts.Communicate(text, voice or EDGE_VOICE, rate=rate or EDGE_RATE).save(mp3_path)
     asyncio.run(gen())
     import miniaudio
     snd = miniaudio.decode_file(mp3_path, output_format=miniaudio.SampleFormat.SIGNED16,
@@ -839,6 +874,11 @@ def wait_step(call_id, job, turn):
     job.update(stage='play', name=slot_name(call_id, idx),
                title=job.get(f'{key}_title') or (queue[idx][1] if idx < len(queue) else '') or 'שיר',
                video_id=job.get(f'{key}_video') or (queue[idx][0] if idx < len(queue) else ''))
+    if job.get('phone'):
+        threading.Thread(target=save_resume,
+                         args=(job['phone'], '2', {'ext': '2', 'mode': job.get('mode'),
+                                                   'queue': list(queue), 'qidx': idx}),
+                         daemon=True).start()
     job[f'{key}_status'] = 'playing'
     job['started'] = time.time()
     start_prefetch(call_id, idx + 1)   # the next song downloads while this one plays
@@ -886,9 +926,11 @@ def yemot_song():
     if params.get('secret') != BRIDGE_SECRET:
         return 'forbidden', 403
     call_id = params.get('ApiCallId') or str(time.time_ns())
+    phone = params.get('ApiPhone', '')
     if params.get('hangup') == 'yes':
         with lock:
             song_jobs.pop(call_id, None)
+        resume_pending.pop(call_id, None)
         return text_response('')
 
     s_val, turn = None, 0
@@ -898,6 +940,18 @@ def yemot_song():
 
     with lock:
         job = song_jobs.setdefault(call_id, {'stage': 'ask', 'status': 'idle', 'started': time.time()})
+    if phone:
+        job['phone'] = phone
+
+    rec = resume_take(call_id, '2')
+    if rec:
+        queue = [(v_, t_) for v_, t_ in (rec.get('queue') or [])]
+        if queue:
+            qidx = min(max(int(rec.get('qidx', 0)), 0), len(queue) - 1)
+            job.update(stage='wait', mode=rec.get('mode') or 'single', queue=queue,
+                       qidx=qidx, started=time.time(), status='idle')
+            start_prefetch(call_id, qidx, force=True)
+            return wait_step(call_id, job, 0)
 
     mode = params.get('MODE')
     if s_val is None:
@@ -1365,6 +1419,8 @@ NED_PROMPTS = {
     'nc_chmenu': 'בחרו ערוץ. לחזרה לתפריט החדשות, הקישו 0.',
     'nc_after_flash': 'סוף המבזק. להאזנה נוספת עם כותרות מעודכנות, הקישו 1. לתפריט החדשות, הקישו 2. לתפריט הראשי, הקישו 0.',
     'tg_end': 'סוף העדכונים. לחזרה לרשימת הערוצים, הקישו 0.',
+    'rs_menu': 'לחזרה להאזנה אחרונה: לשירים, הקישו 2. לפודקאסטים, הקישו 3. למרכז החדשות, הקישו 7. לתפריט הראשי, הקישו 0.',
+    'rs_none': 'לא נמצאה האזנה אחרונה בשלוחה זו.',
     'tg_listing': 'רגע, מביאה את רשימת התכנים העדכנית מהטלגרם.',
     'tg_searching': 'רגע, מביאה את התוכנית. תוכנית ארוכה יכולה לקחת גם שלוש דקות להתחיל.',
     'tg_notfound': 'סליחה, לא הצלחתי להביא את התוכנית. נסו תוכנית אחרת, או חזרו מאוחר יותר.',
@@ -1393,7 +1449,7 @@ ned_jobs = {}
 
 NED_STATIC = {'nc_menu', 'nc_chmenu', 'nc_after_flash', 'ned_searching', 'ned_wait',
               'ned_notfound', 'ned_after', 'tg_listing', 'tg_searching', 'tg_notfound',
-              'news_searching', 'news_wait', 'news_intro', 'news_error', 'tg_end'}
+              'news_searching', 'news_wait', 'news_intro', 'news_error', 'tg_end', 'rs_menu', 'rs_none'}
 
 def ned_sweep_stale():
     try:
@@ -1641,9 +1697,11 @@ def yemot_ned():
     if params.get('secret') != BRIDGE_SECRET:
         return 'forbidden', 403
     call_id = params.get('ApiCallId') or str(time.time_ns())
+    phone = params.get('ApiPhone', '')
     if params.get('hangup') == 'yes':
         with lock:
             ned_jobs.pop(call_id, None)
+        resume_pending.pop(call_id, None)
         threading.Thread(target=ned_delete_call_files, args=(call_id,), daemon=True).start()
         return text_response('')
 
@@ -1655,8 +1713,19 @@ def yemot_ned():
     with lock:
         job = ned_jobs.setdefault(call_id, {'stage': 'menu', 'status': 'idle', 'chunks': [],
                                             'done': False, 'playing': -1, 'started': time.time()})
+    if phone:
+        job['phone'] = phone
 
     try:
+        rec = resume_take(call_id, '7')
+        if rec:
+            ch = min(max(int(rec.get('ch', 0)), 0), len(TG_CHANNELS) - 1)
+            job.update(stage='tg_stream_wait', status='working', started=time.time(),
+                       mode='tg', ch=ch)
+            threading.Thread(target=ned_sweep_stale, daemon=True).start()
+            threading.Thread(target=tg_stream, args=(call_id, ch), daemon=True).start()
+            return text_response(play_chain('f-tg_listing', 'S1'))
+
         stage = job.get('stage', 'menu')
 
         if s_val is None:
@@ -1710,6 +1779,10 @@ def yemot_ned():
             if v.isdigit() and 1 <= int(v) <= len(TG_CHANNELS):
                 job.update(stage='tg_stream_wait', status='working', started=time.time(),
                            mode='tg', ch=int(v) - 1)
+                if job.get('phone'):
+                    threading.Thread(target=save_resume,
+                                     args=(job['phone'], '7', {'ext': '7', 'ch': int(v) - 1}),
+                                     daemon=True).start()
                 threading.Thread(target=ned_sweep_stale, daemon=True).start()
                 threading.Thread(target=tg_stream, args=(call_id, int(v) - 1), daemon=True).start()
                 return text_response(play_chain('f-tg_listing', f'S{turn+1}'))
@@ -1806,6 +1879,38 @@ def yemot_ned():
         log.exception('ned call=%s error: %s', call_id, e)
         return text_response('id_list_message=f-error')
 
+
+
+@app.route('/yemot-resume', methods=['GET', 'POST'])
+def yemot_resume():
+    params = request.values
+    if params.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    call_id = params.get('ApiCallId') or str(time.time_ns())
+    phone = params.get('ApiPhone', '')
+    if params.get('hangup') == 'yes':
+        resume_pending.pop(call_id, None)
+        return text_response('')
+
+    s_val, turn = None, 0
+    for k, v in params.items():
+        if re.fullmatch(r'S\d+', k):
+            s_val, turn = v, int(k[1:])
+
+    if s_val is None:
+        return text_response('read=f-rs_menu=S1,no,1,1,7,No,yes,,,,,,,,no')
+
+    v = (s_val or '').strip()
+    if v in ('2', '3', '7'):
+        rec = load_resume(phone).get(v)
+        if rec:
+            resume_pending[call_id] = rec
+            log.info('resume call=%s phone=%s ext=%s', call_id, phone[-4:], v)
+            return text_response(f'go_to_folder=/{v}')
+        return text_response(f'read=f-rs_none.f-rs_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+    if v == '0':
+        return text_response('go_to_folder=/')
+    return text_response(f'read=f-rs_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
 
 
 @app.route('/yemot-jump7')
@@ -2347,9 +2452,11 @@ def yemot_pod():
     if params.get('secret') != BRIDGE_SECRET:
         return 'forbidden', 403
     call_id = params.get('ApiCallId') or str(time.time_ns())
+    phone = params.get('ApiPhone', '')
     if params.get('hangup') == 'yes':
         with lock:
             pod_jobs.pop(call_id, None)
+        resume_pending.pop(call_id, None)
         return text_response('')
 
     s_val, turn = None, 0
@@ -2359,6 +2466,16 @@ def yemot_pod():
 
     with lock:
         job = pod_jobs.setdefault(call_id, {'stage': 'entry', 'page': 1, 'status': 'idle', 'started': time.time()})
+    if phone:
+        job['phone'] = phone
+
+    rec = resume_take(call_id, '3')
+    if rec:
+        job.update(stage='pod_wait', status='working', idx=int(rec.get('idx', 0)),
+                   ep=int(rec.get('ep', 0)), custom=rec.get('custom'), started=time.time())
+        threading.Thread(target=fetch_pod, args=(call_id, job['idx'], job['ep'], job.get('custom')),
+                         daemon=True).start()
+        return text_response(play_chain('f-pod_searching', 'S1'))
 
     if s_val is None:
         return text_response('read=f-pod_entry=S1,no,1,1,7,No,yes,,,,,,,,no')
@@ -2454,6 +2571,12 @@ def yemot_pod():
                 job.update(stage='menu', status='idle', page=1)
                 return text_response(f'read=f-pod_notfound.f-pod_menu1=S{turn+1},no,2,1,7,No,yes,,,,,,,,no')
             job['stage'] = 'pod_play'
+            if job.get('phone'):
+                threading.Thread(target=save_resume,
+                                 args=(job['phone'], '3', {'ext': '3', 'idx': job.get('idx', 0),
+                                                           'ep': job.get('ep', 0),
+                                                           'custom': job.get('custom')}),
+                                 daemon=True).start()
             return text_response(play_chain('f-' + job['name'], f'S{turn+1}'))
 
         if stage == 'pod_play':
@@ -2678,7 +2801,7 @@ def fetch_translation(call_id, text, src_i, dst_i):
         r.raise_for_status()
         out = r.json()['choices'][0]['message']['content'].strip()
         log.info('translate %s->%s: %r -> %r', src_en, dst_en, text[:50], out[:60])
-        wav = tts_wav(out, rate=EDGE_RATE)
+        wav = tts_wav(out, voice=dst_voice)
         name = 'tr' + re.sub(r'\D', '', call_id)[-6:]
         old = job.get('name')
         if old and old != name:
@@ -2993,7 +3116,7 @@ def _auto_setup_hub():
         except Exception as e:
             log.warning('hub prompt marker failed: %s', e)
 
-NC_PROMPT_VERSION = 'v3'
+NC_PROMPT_VERSION = 'v4'
 
 def _auto_setup_newscenter():
     # Idempotent startup migration: install the extension-7 news center
@@ -3046,8 +3169,15 @@ def _auto_setup_newscenter():
                        'ivr2:/8/ext.ini')
         log.info('nc: /8 ext.ini -> jump7')
     except Exception as e:
-        ok = False
         log.warning('nc /8 ext.ini failed: %s', e)
+    try:
+        link = f'{PUBLIC_BASE_URL}/yemot-resume?secret={urllib.parse.quote(BRIDGE_SECRET)}'
+        ym_upload_text(f'type=api\napi_link={link}\napi_dir={NED_DIR}\napi_url_post=no\n',
+                       'ivr2:/#/ext.ini')
+        log.info('nc: /# ext.ini -> yemot-resume')
+    except Exception as e:
+        ok = False
+        log.warning('nc /# ext.ini failed: %s', e)
     if ok:
         try:
             ym_upload_text(NC_PROMPT_VERSION + '\n', f'ivr2:{NED_DIR}/prompts_nc_{NC_PROMPT_VERSION}.txt')
@@ -3091,9 +3221,9 @@ def _auto_setup_pniot():
         except Exception as e:
             log.warning('pniot marker failed: %s', e)
 
-ROOT_MENU_TEXT = 'ברוכים הבאים! למרכז עוזרי הבינה המלאכותית, הקישו 1. לשירים מיוטיוב ולרשימות השירים שלכם, הקישו 2. לפודקאסטים, הקישו 3. לויקיפדיה, הקישו 4. לפניות להנהלה, הקישו 5. לתרגום, הקישו 6. למרכז החדשות, הקישו 7.'
+ROOT_MENU_TEXT = 'ברוכים הבאים! למרכז עוזרי הבינה המלאכותית, הקישו 1. לשירים מיוטיוב ולרשימות השירים שלכם, הקישו 2. לפודקאסטים, הקישו 3. לויקיפדיה, הקישו 4. לפניות להנהלה, הקישו 5. לתרגום, הקישו 6. למרכז החדשות, הקישו 7. לחזרה להאזנה אחרונה, הקישו סולמית.'
 
-POD_PROMPT_VERSION = 'v2'
+POD_PROMPT_VERSION = 'v3'
 
 def _auto_setup_pod3():
     # Idempotent startup migration: upload new extension-3 prompts (categories) once per version.
