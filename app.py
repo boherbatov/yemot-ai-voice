@@ -1364,6 +1364,7 @@ NED_PROMPTS = {
     'nc_menu': 'מרכז החדשות. למבזק הכותרות העדכניות, הקישו 1. למהדורת כאן 11, הקישו 2. לתכנים וחדשות מערוצי הטלגרם, הקישו 3. לחזרה לתפריט הראשי, הקישו 0.',
     'nc_chmenu': 'בחרו ערוץ. לחזרה לתפריט החדשות, הקישו 0.',
     'nc_after_flash': 'סוף המבזק. להאזנה נוספת עם כותרות מעודכנות, הקישו 1. לתפריט החדשות, הקישו 2. לתפריט הראשי, הקישו 0.',
+    'tg_end': 'סוף העדכונים. לחזרה לרשימת הערוצים, הקישו 0.',
     'tg_listing': 'רגע, מביאה את רשימת התכנים העדכנית מהטלגרם.',
     'tg_searching': 'רגע, מביאה את התוכנית. תוכנית ארוכה יכולה לקחת גם שלוש דקות להתחיל.',
     'tg_notfound': 'סליחה, לא הצלחתי להביא את התוכנית. נסו תוכנית אחרת, או חזרו מאוחר יותר.',
@@ -1392,7 +1393,7 @@ ned_jobs = {}
 
 NED_STATIC = {'nc_menu', 'nc_chmenu', 'nc_after_flash', 'ned_searching', 'ned_wait',
               'ned_notfound', 'ned_after', 'tg_listing', 'tg_searching', 'tg_notfound',
-              'news_searching', 'news_wait', 'news_intro', 'news_error'}
+              'news_searching', 'news_wait', 'news_intro', 'news_error', 'tg_end'}
 
 def ned_sweep_stale():
     try:
@@ -1510,6 +1511,16 @@ TG_CHANNELS = [
     ('Yedioth_Bnei_Brak_Movies', 'ידיעות בני ברק'),
 ]
 
+def tg_clean_text(t):
+    t = re.sub(r'https?://\S+|t\.me/\S+|www\.\S+', '', t or '')
+    t = re.sub(r'@\w+', '', t)
+    t = t.split('הצטרפו לערוץ')[0]
+    t = re.sub(r'[\U0001F000-\U0001FAFF\u2600-\u27BF\u2190-\u21FF\u2B00-\u2BFF]', ' ', t)
+    t = re.sub(r'\s+', ' ', t).strip(' .|/-')
+    if len(t) > 250:
+        t = t[:250].rsplit(' ', 1)[0].strip(' .|,')
+    return t
+
 def tg_client():
     from telethon import TelegramClient
     from telethon.sessions import StringSession
@@ -1530,25 +1541,45 @@ def tg_list(call_id, ch_idx):
             c = tg_client()
             await c.connect()
             ent = await c.get_entity(TG_CHANNELS[ch_idx][0])
-            items = []
+            texts, items = [], []
             async for m in c.iter_messages(ent, limit=40):
                 if m.video:
                     items.append({'id': m.id, 'title': tg_main_title(m.message)})
-                if len(items) >= 9:
+                txt = tg_clean_text(m.message)
+                if txt and len(txt) >= 12:
+                    texts.append(txt)
+                if len(texts) >= 8 and len(items) >= 9:
                     break
             await c.disconnect()
-            return items
-        items = asyncio.run(_go())
-        if not items:
-            raise ValueError('no video posts found')
+            return texts[:8], items[:9]
+        texts, items = asyncio.run(_go())
+        if not texts and not items:
+            raise ValueError('no posts found')
+        sfx = call_id[-6:]
+        disp = TG_CHANNELS[ch_idx][1]
         job['tg_items'] = items
-        for i, it in enumerate(items, 1):
-            ym_upload(tts_wav(f'מקש {i}. {it["title"]}'),
-                      f'tg_i{call_id[-6:]}_{i}.wav', f'{NED_DIR}/tg_i{call_id[-6:]}_{i}.wav')
-        ym_upload(tts_wav('בחרו תוכנית. לחזרה, הקישו 0.'),
-                  f'tg_pick{call_id[-6:]}.wav', f'{NED_DIR}/tg_pick{call_id[-6:]}.wav')
+        try:
+            ym_upload(tts_wav(f'עדכונים אחרונים מ{disp}.'),
+                      f'tg_intro{sfx}.wav', f'{NED_DIR}/tg_intro{sfx}.wav')
+        except Exception:
+            pass
+        parts = [f'f-tg_intro{sfx}']
+        for i, txt in enumerate(texts, 1):
+            ym_upload(tts_wav(txt), f'tg_txt{sfx}_{i}.wav', f'{NED_DIR}/tg_txt{sfx}_{i}.wav')
+            parts.append(f'f-tg_txt{sfx}_{i}')
+        if items:
+            for i, it in enumerate(items, 1):
+                ym_upload(tts_wav(f'מקש {i}. {it["title"]}'),
+                          f'tg_i{sfx}_{i}.wav', f'{NED_DIR}/tg_i{sfx}_{i}.wav')
+                parts.append(f'f-tg_i{sfx}_{i}')
+            ym_upload(tts_wav('להאזנת סרטון, הקישו את מספרו. לחזרה לרשימת הערוצים, הקישו 0.'),
+                      f'tg_pick{sfx}.wav', f'{NED_DIR}/tg_pick{sfx}.wav')
+            parts.append(f'f-tg_pick{sfx}')
+        else:
+            parts.append('f-tg_end')
+        job['chain'] = '.'.join(parts)
         job.update(status='listed')
-        log.info('tg listed call=%s: %d items', call_id, len(items))
+        log.info('tg listed call=%s ch=%s: %d texts, %d videos', call_id, disp, len(texts), len(items))
     except Exception as e:
         log.warning('tg list failed call=%s: %s', call_id, e)
         job.update(status='error', err=str(e)[:200])
@@ -1708,9 +1739,7 @@ def yemot_ned():
                 return text_response(f'read=f-tg_notfound.f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             if job.get('status') == 'listed':
                 job['stage'] = 'tg_menu'
-                sfx = call_id[-6:]
-                chain = ''.join(f"f-tg_i{sfx}_{i}." for i in range(1, len(job['tg_items']) + 1))
-                return text_response(f'read={chain}f-tg_pick{sfx}=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+                return text_response(f"read={job['chain']}=S{turn+1},no,1,1,7,No,yes,,,,,,,,no")
             if time.time() - job.get('started', 0) > 180:
                 job['stage'] = 'menu'
                 return text_response(f'read=f-tg_notfound.f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
@@ -1723,9 +1752,9 @@ def yemot_ned():
                 job.update(stage='wait_start', status='working', started=time.time())
                 threading.Thread(target=fetch_tg, args=(call_id, int(v) - 1), daemon=True).start()
                 return text_response(play_chain('f-tg_searching', f'S{turn+1}'))
-            with lock:
-                ned_jobs.pop(call_id, None)
-            return text_response('go_to_folder=/')
+            job['stage'] = 'tg_channels'
+            chain = '.'.join(f'f-nc_ch_{i}' for i in range(1, len(TG_CHANNELS) + 1))
+            return text_response(f'read={chain}.f-nc_chmenu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
 
         if stage == 'wait_start':
             nf = 'tg_notfound' if job.get('mode') == 'tg' else 'ned_notfound'
@@ -2951,7 +2980,7 @@ def _auto_setup_hub():
         except Exception as e:
             log.warning('hub prompt marker failed: %s', e)
 
-NC_PROMPT_VERSION = 'v1'
+NC_PROMPT_VERSION = 'v2'
 
 def _auto_setup_newscenter():
     # Idempotent startup migration: install the extension-7 news center
