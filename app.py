@@ -1509,6 +1509,17 @@ TG_CHANNELS = [
     ('IsraelHayomHeb', 'ישראל היום'),
     ('now14israel', 'צ׳אט הכתבים של ערוץ 14'),
     ('Yedioth_Bnei_Brak_Movies', 'ידיעות בני ברק'),
+    ('N12chat', 'צ׳אט הכתבים N12'),
+    ('reshet13', 'רשת 13'),
+    ('ynetalerts', 'חדשות ynet'),
+    ('wallanews_israel', 'וואלה חדשות'),
+    ('maariv_il', 'מעריב'),
+    ('globesnews', 'גלובס'),
+    ('calcalist', 'כלכליסט'),
+    ('i24NEWS_HE', 'i24NEWS בעברית'),
+    ('sport5israel', 'ספורט 5'),
+    ('ONE_co_il', 'ONE ספורט'),
+    ('behadrey', 'בחדרי חרדים'),
 ]
 
 def tg_clean_text(t):
@@ -1534,100 +1545,94 @@ def tg_main_title(caption):
         t = t[:90].rsplit(' ', 1)[0].strip(' .|,')
     return t or 'תוכנית ללא שם'
 
-def tg_list(call_id, ch_idx):
+def tg_stream_video(call_id, ch_idx, msg_id, i, tmpbase):
+    import imageio_ffmpeg
     job = ned_jobs[call_id]
+    sfx = re.sub(r'\D', '', call_id)[-6:] or call_id[-6:]
+    tmp = f'{tmpbase}-{i}'
+    ff = shutil.which('ffmpeg') or imageio_ffmpeg.get_ffmpeg_exe()
+    ferr = open(tmp + '.log', 'wb')
+    proc = subprocess.Popen([ff, '-y', '-i', 'pipe:0',
+                             '-ar', '8000', '-ac', '1', '-f', 'segment', '-segment_time', '600',
+                             '-reset_timestamps', '1', tmp + '-%03d.wav'],
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ferr)
+    async def _dl():
+        c = tg_client()
+        await c.connect()
+        ent = await c.get_entity(TG_CHANNELS[ch_idx][0])
+        m = await c.get_messages(ent, ids=msg_id)
+        log.info('tg dl call=%s msg=%s size=%s', call_id, msg_id, getattr(m.document, 'size', '?'))
+        async for chunk in c.iter_download(m.media, chunk_size=512 * 1024):
+            if job.get('stop'):
+                break
+            try:
+                proc.stdin.write(chunk)
+            except (BrokenPipeError, OSError):
+                break
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        await c.disconnect()
+    t = threading.Thread(target=lambda: asyncio.run(_dl()), daemon=True)
+    t.start()
+    upload_chunks_loop(proc, tmp, f'tg{sfx}p{i}', job, tmp + '.log')
+
+def tg_stream(call_id, ch_idx):
+    # Stream a channel's latest posts newest-first: each post = TTS of its text
+    # followed inline by its video (if any); files are appended to job['chunks']
+    # progressively so playback starts while later posts are still prepared.
+    job = ned_jobs[call_id]
+    job['cid'] = call_id
+    sfx = re.sub(r'\D', '', call_id)[-6:] or call_id[-6:]
+    tmpbase = f'/tmp/tg-{call_id}'
     try:
-        async def _go():
+        async def _posts():
             c = tg_client()
             await c.connect()
             ent = await c.get_entity(TG_CHANNELS[ch_idx][0])
-            texts, items = [], []
-            async for m in c.iter_messages(ent, limit=40):
-                if m.video:
-                    items.append({'id': m.id, 'title': tg_main_title(m.message)})
+            posts = []
+            async for m in c.iter_messages(ent, limit=60):
                 txt = tg_clean_text(m.message)
-                if txt and len(txt) >= 12:
-                    texts.append(txt)
-                if len(texts) >= 8 and len(items) >= 9:
+                if txt and len(txt) < 12:
+                    txt = ''
+                if not txt and not m.video:
+                    continue
+                posts.append({'id': m.id, 'text': txt, 'video': bool(m.video)})
+                if len(posts) >= 8:
                     break
             await c.disconnect()
-            return texts[:8], items[:9]
-        texts, items = asyncio.run(_go())
-        if not texts and not items:
+            return posts
+        posts = asyncio.run(_posts())
+        if not posts:
             raise ValueError('no posts found')
-        sfx = call_id[-6:]
         disp = TG_CHANNELS[ch_idx][1]
-        job['tg_items'] = items
         try:
             ym_upload(tts_wav(f'עדכונים אחרונים מ{disp}.'),
                       f'tg_intro{sfx}.wav', f'{NED_DIR}/tg_intro{sfx}.wav')
+            job['chunks'].append(f'tg_intro{sfx}')
         except Exception:
             pass
-        parts = [f'f-tg_intro{sfx}']
-        for i, txt in enumerate(texts, 1):
-            ym_upload(tts_wav(txt), f'tg_txt{sfx}_{i}.wav', f'{NED_DIR}/tg_txt{sfx}_{i}.wav')
-            parts.append(f'f-tg_txt{sfx}_{i}')
-        if items:
-            for i, it in enumerate(items, 1):
-                ym_upload(tts_wav(f'מקש {i}. {it["title"]}'),
-                          f'tg_i{sfx}_{i}.wav', f'{NED_DIR}/tg_i{sfx}_{i}.wav')
-                parts.append(f'f-tg_i{sfx}_{i}')
-            ym_upload(tts_wav('להאזנת סרטון, הקישו את מספרו. לחזרה לרשימת הערוצים, הקישו 0.'),
-                      f'tg_pick{sfx}.wav', f'{NED_DIR}/tg_pick{sfx}.wav')
-            parts.append(f'f-tg_pick{sfx}')
-        else:
-            parts.append('f-tg_end')
-        job['chain'] = '.'.join(parts)
         job.update(status='listed')
-        log.info('tg listed call=%s ch=%s: %d texts, %d videos', call_id, disp, len(texts), len(items))
-    except Exception as e:
-        log.warning('tg list failed call=%s: %s', call_id, e)
-        job.update(status='error', err=str(e)[:200])
-
-def fetch_tg(call_id, idx):
-    import imageio_ffmpeg
-    job = ned_jobs[call_id]
-    tmp = f'/tmp/tg-{call_id}'
-    job['cid'] = call_id
-    try:
-        items = job.get('tg_items') or []
-        it = items[idx]
-        try:
-            ym_upload(tts_wav(it['title']),
-                      f'tg_t{call_id[-6:]}.wav', f'{NED_DIR}/tg_t{call_id[-6:]}.wav')
-            job['title_wav'] = f'tg_t{call_id[-6:]}'
-        except Exception:
-            pass
-        ff = shutil.which('ffmpeg') or imageio_ffmpeg.get_ffmpeg_exe()
-        ferr = open(tmp + '.log', 'wb')
-        proc = subprocess.Popen([ff, '-y', '-i', 'pipe:0',
-                                 '-ar', '8000', '-ac', '1', '-f', 'segment', '-segment_time', '600',
-                                 '-reset_timestamps', '1', tmp + '-%03d.wav'],
-                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ferr)
-        async def _dl():
-            c = tg_client()
-            await c.connect()
-            ent = await c.get_entity(TG_CHANNELS[job.get('ch', 0)][0])
-            m = await c.get_messages(ent, ids=it['id'])
-            log.info('tg dl call=%s msg=%s size=%s', call_id, it['id'], getattr(m.document, 'size', '?'))
-            async for chunk in c.iter_download(m.media, chunk_size=512 * 1024):
+        log.info('tg stream call=%s ch=%s: %d posts', call_id, disp, len(posts))
+        for i, p in enumerate(posts, 1):
+            if job.get('stop'):
+                break
+            if p['text']:
                 try:
-                    proc.stdin.write(chunk)
-                except (BrokenPipeError, OSError):
-                    break
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-            await c.disconnect()
-        import threading as _th
-        t = _th.Thread(target=lambda: asyncio.run(_dl()), daemon=True)
-        t.start()
-        upload_chunks_loop(proc, tmp, f'tg{re.sub(chr(92) + "D", "", call_id)[-6:]}', job, tmp + '.log')
+                    ym_upload(tts_wav(p['text']), f'tg{sfx}_t{i}.wav', f'{NED_DIR}/tg{sfx}_t{i}.wav')
+                    job['chunks'].append(f'tg{sfx}_t{i}')
+                except Exception as e:
+                    log.warning('tg tts failed call=%s post=%d: %s', call_id, i, e)
+            if p['video'] and not job.get('stop'):
+                try:
+                    tg_stream_video(call_id, ch_idx, p['id'], i, tmpbase)
+                except Exception as e:
+                    log.warning('tg video failed call=%s post=%d: %s', call_id, i, e)
         job.update(done=True, status='ready')
-        log.info('tg ready call=%s: %d chunks', call_id, len(job['chunks']))
+        log.info('tg stream done call=%s: %d files', call_id, len(job['chunks']))
     except Exception as e:
-        log.warning('tg fetch failed call=%s: %s', call_id, e)
+        log.warning('tg stream failed call=%s: %s', call_id, e)
         job.update(status='error', err=str(e)[:200])
 
 @app.route('/yemot-ned', methods=['GET', 'POST'])
@@ -1658,6 +1663,10 @@ def yemot_ned():
             return text_response('read=f-nc_menu=S1,no,1,1,7,No,yes,,,,,,,,no')
 
         def serve_next():
+            if job.get('mode') == 'tg' and (s_val or '').strip() == '0':
+                job['stop'] = True
+                job['stage'] = 'tg_end_wait'
+                return text_response(f'read=f-tg_end=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             chunks = job['chunks']
             nxt = job['playing'] + 1
             if nxt < len(chunks):
@@ -1669,6 +1678,9 @@ def yemot_ned():
                 head = f"f-{job['title_wav']}." if nxt == 0 and job.get('title_wav') else ''
                 return text_response(play_chain(head + 'f-' + chunks[nxt], f'S{turn+1}'))
             if job.get('done') or job.get('status') == 'error':
+                if job.get('mode') == 'tg':
+                    job['stage'] = 'tg_end_wait'
+                    return text_response(f'read=f-tg_end=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
                 job['stage'] = 'after'
                 return text_response(f'read=f-ned_after=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             job['stage'] = 'wait_more'
@@ -1688,7 +1700,7 @@ def yemot_ned():
             if v == '3':
                 job['stage'] = 'tg_channels'
                 chain = '.'.join(f'f-nc_ch_{i}' for i in range(1, len(TG_CHANNELS) + 1))
-                return text_response(f'read={chain}.f-nc_chmenu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+                return text_response(f'read={chain}.f-nc_chmenu=S{turn+1},no,2,1,7,No,yes,,,,,,,,no')
             with lock:
                 ned_jobs.pop(call_id, None)
             return text_response('go_to_folder=/')
@@ -1696,17 +1708,17 @@ def yemot_ned():
         if stage == 'tg_channels':
             v = (s_val or '').strip()
             if v.isdigit() and 1 <= int(v) <= len(TG_CHANNELS):
-                job.update(stage='tg_list_wait', status='working', started=time.time(),
+                job.update(stage='tg_stream_wait', status='working', started=time.time(),
                            mode='tg', ch=int(v) - 1)
                 threading.Thread(target=ned_sweep_stale, daemon=True).start()
-                threading.Thread(target=tg_list, args=(call_id, int(v) - 1), daemon=True).start()
+                threading.Thread(target=tg_stream, args=(call_id, int(v) - 1), daemon=True).start()
                 return text_response(play_chain('f-tg_listing', f'S{turn+1}'))
             if v == '0':
                 job['stage'] = 'menu'
                 return text_response(f'read=f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             job['stage'] = 'tg_channels'
             chain = '.'.join(f'f-nc_ch_{i}' for i in range(1, len(TG_CHANNELS) + 1))
-            return text_response(f'read={chain}.f-nc_chmenu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+            return text_response(f'read={chain}.f-nc_chmenu=S{turn+1},no,2,1,7,No,yes,,,,,,,,no')
 
         if stage == 'news_start':
             if job.get('status') == 'working':
@@ -1733,28 +1745,26 @@ def yemot_ned():
                 ned_jobs.pop(call_id, None)
             return text_response('go_to_folder=/')
 
-        if stage == 'tg_list_wait':
+        if stage == 'tg_stream_wait':
+            if (s_val or '').strip() == '0':
+                job['stop'] = True
+                job['stage'] = 'tg_channels'
+                chain = '.'.join(f'f-nc_ch_{i}' for i in range(1, len(TG_CHANNELS) + 1))
+                return text_response(f'read={chain}.f-nc_chmenu=S{turn+1},no,2,1,7,No,yes,,,,,,,,no')
             if job.get('status') == 'error':
                 job['stage'] = 'menu'
                 return text_response(f'read=f-tg_notfound.f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
-            if job.get('status') == 'listed':
-                job['stage'] = 'tg_menu'
-                return text_response(f"read={job['chain']}=S{turn+1},no,1,1,7,No,yes,,,,,,,,no")
+            if job['chunks']:
+                return serve_next()
             if time.time() - job.get('started', 0) > 180:
                 job['stage'] = 'menu'
                 return text_response(f'read=f-tg_notfound.f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             return text_response(play_chain('f-tg_listing', f'S{turn+1}'))
 
-        if stage == 'tg_menu':
-            v = (s_val or '').strip()
-            items = job.get('tg_items') or []
-            if v.isdigit() and 1 <= int(v) <= len(items):
-                job.update(stage='wait_start', status='working', started=time.time())
-                threading.Thread(target=fetch_tg, args=(call_id, int(v) - 1), daemon=True).start()
-                return text_response(play_chain('f-tg_searching', f'S{turn+1}'))
+        if stage == 'tg_end_wait':
             job['stage'] = 'tg_channels'
             chain = '.'.join(f'f-nc_ch_{i}' for i in range(1, len(TG_CHANNELS) + 1))
-            return text_response(f'read={chain}.f-nc_chmenu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+            return text_response(f'read={chain}.f-nc_chmenu=S{turn+1},no,2,1,7,No,yes,,,,,,,,no')
 
         if stage == 'wait_start':
             nf = 'tg_notfound' if job.get('mode') == 'tg' else 'ned_notfound'
@@ -1773,6 +1783,9 @@ def yemot_ned():
 
         if stage == 'wait_more':
             if job.get('status') == 'error':
+                if job.get('mode') == 'tg':
+                    job['stage'] = 'tg_end_wait'
+                    return text_response(f'read=f-tg_end=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
                 job['stage'] = 'after'
                 return text_response(f'read=f-ned_after=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             return serve_next()
@@ -2980,7 +2993,7 @@ def _auto_setup_hub():
         except Exception as e:
             log.warning('hub prompt marker failed: %s', e)
 
-NC_PROMPT_VERSION = 'v2'
+NC_PROMPT_VERSION = 'v3'
 
 def _auto_setup_newscenter():
     # Idempotent startup migration: install the extension-7 news center
