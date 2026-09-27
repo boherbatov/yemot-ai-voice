@@ -3116,7 +3116,7 @@ def _auto_setup_hub():
         except Exception as e:
             log.warning('hub prompt marker failed: %s', e)
 
-NC_PROMPT_VERSION = 'v4'
+NC_PROMPT_VERSION = 'v5'
 
 def _auto_setup_newscenter():
     # Idempotent startup migration: install the extension-7 news center
@@ -3184,7 +3184,7 @@ def _auto_setup_newscenter():
         except Exception as e:
             log.warning('nc marker failed: %s', e)
 
-PNIOT_PROMPT_VERSION = 'v1'
+PNIOT_PROMPT_VERSION = 'v2'
 
 def _auto_setup_pniot():
     # Idempotent startup migration: install extension 5 (פניות להנהלה) once per version.
