@@ -920,6 +920,27 @@ def ym_admin():
     except Exception as e:
         return {'ok': False, 'error': str(e)[:300]}, 502
 
+@app.route('/ym-read')
+def ym_read():
+    # Temporary migration helper: read any PBX file as text (DownloadFile action).
+    if request.args.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    try:
+        data = ym_download(request.args.get('path', ''))
+        return data, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)[:300]}, 502
+
+@app.route('/ym-write')
+def ym_write_route():
+    # Temporary migration helper: write text to any PBX file (UploadTextFile action).
+    if request.args.get('secret') != BRIDGE_SECRET:
+        return 'forbidden', 403
+    try:
+        return {'ok': True, 'data': ym_upload_text(request.args.get('text', ''), request.args.get('path', ''))}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)[:300]}, 502
+
 @app.route('/yemot-song', methods=['GET', 'POST'])
 def yemot_song():
     params = request.values
