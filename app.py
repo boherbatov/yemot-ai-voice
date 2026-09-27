@@ -80,15 +80,12 @@ def _yt_tv_context():
                        'hl': 'en', 'visitorData': _YT['vd']}}
 
 def yt_search_results(query, limit=15):
-    """Authenticated TV-surface search; returns up to `limit` (video_id, title) pairs."""
+    """Authenticated TV-surface search, paginated via continuation; up to `limit` (video_id, title) pairs."""
     import json as J, urllib.request as U
     _yt_cfg()
-    body = J.dumps({'context': _yt_tv_context(), 'query': query}).encode()
-    r = J.load(U.urlopen(U.Request(
-        f'https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key={_YT["key"]}',
-        data=body, headers=_yt_headers()), timeout=30))
-    found, seen = [], set()
+    found, seen, token = [], set(), None
     def walk(o):
+        nonlocal token
         if isinstance(o, dict):
             lv = o.get('lockupViewModel')
             if lv and 'VIDEO' in str(lv.get('contentType', '')) and lv.get('contentId'):
@@ -102,12 +99,32 @@ def yt_search_results(query, limit=15):
                 seen.add(vr['videoId'])
                 t = (vr.get('title') or {}).get('runs', [{}])[0].get('text')
                 found.append((vr['videoId'], t))
+            cc = o.get('continuationCommand')
+            if isinstance(cc, dict) and cc.get('token'):
+                token = cc['token']
             for v in o.values():
                 walk(v)
         elif isinstance(o, list):
             for v in o:
                 walk(v)
+    body = J.dumps({'context': _yt_tv_context(), 'query': query}).encode()
+    r = J.load(U.urlopen(U.Request(
+        f'https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key={_YT["key"]}',
+        data=body, headers=_yt_headers()), timeout=30))
     walk(r)
+    for _ in range(3):                       # continuation pages ("all the singer's songs")
+        if not token or len(found) >= limit:
+            break
+        try:
+            body = J.dumps({'context': _yt_tv_context(), 'continuation': token}).encode()
+            r = J.load(U.urlopen(U.Request(
+                f'https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key={_YT["key"]}',
+                data=body, headers=_yt_headers()), timeout=30))
+            token = None
+            walk(r)
+        except Exception as e:
+            log.warning('search continuation failed: %s', e)
+            break
     if not found:
         raise ValueError('no video results')
     return found[:limit]
@@ -116,7 +133,7 @@ def yt_search_video_id(query):
     """Authenticated TV-surface search; returns first video id."""
     return yt_search_results(query, limit=1)[0]
 
-def yt_related(video_id, limit=12):
+def yt_related(video_id, limit=None):
     """Watch-next related videos for radio mode; falls back to [] on any failure."""
     import json as J, urllib.request as U
     found, seen = [], {video_id}
@@ -148,7 +165,7 @@ def yt_related(video_id, limit=12):
         walk(r)
     except Exception as e:
         log.warning('related fetch failed for %s: %s', video_id, e)
-    return found[:limit]
+    return found[:limit] if limit else found
 
 def yt_player(video_id):
     """Direct authenticated TV player call; returns (title, duration, status)."""
@@ -586,14 +603,17 @@ def clean_song_query(text):
 # ---------- YouTube songs (extension 2) ----------
 
 SONG_PROMPTS = {
-    'song_ask': 'איזה שיר בא לכם? אמרו את שם השיר, אפשר גם את הזמר. דברו אחרי הצליל, ולסיום הקישו סולמית.',
-    'song_mode': 'איזה שיר בא לכם? לחיפוש בהקלדה בעברית, הקישו 1. לחיפוש בדיבור, הקישו 2. לחיפוש בהקלדה באנגלית, הקישו 3. לשירים של זמר מסוים, הקישו 4. להרשימות השירים שלכם, הקישו 5.',
-    'song_typehow': 'הקלידו את שם השיר, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לחיפוש לפי זמר בלבד, הקישו סולמית ישר. לסיום הקישו סולמית.',
+    'song_ask': 'איזה שיר בא לכם? אמרו את שם השיר. דברו אחרי הצליל, ולסיום הקישו סולמית.',
+    'song_how': 'באיזו דרך לחפש? להקלדה בעברית, הקישו 1. לחיפוש בדיבור, הקישו 2. להקלדה באנגלית, הקישו 3.',
+    'artist_typehow': 'הקלידו את שם הזמר, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לסיום הקישו סולמית.',
+    'song_artist_voice': 'אם בא לכם, אמרו גם את שם הזמר. דברו אחרי הצליל, ולסיום הקישו סולמית. לחיפוש בלי זמר, הקישו סולמית ישר.',
+    'song_mode': 'מה בא לכם? לחיפוש לפי שיר, הקישו 1. לחיפוש לפי זמר, הקישו 2. להרשימות השירים שלכם, הקישו 3.',
+    'song_typehow': 'הקלידו את שם השיר, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לסיום הקישו סולמית.',
     'song_artist': 'עכשיו הקלידו את שם הזמר, או הקישו רק סולמית לדילוג.',
     'song_searching': 'רגע אחד, אני מחפשת את השיר. זה יכול לקחת חצי דקה.',
     'song_wait': 'עוד ממש קצת, השיר כבר בדרך.',
-    'song_notfound': 'סליחה, לא הצלחתי למצוא את השיר הזה. נסו שיר אחר. איזה שיר בא לכם?',
-    'song_more': 'איזה עוד שיר בא לכם? אמרו את שם השיר, או נתקו.',
+    'song_notfound': 'סליחה, לא מצאתי את זה. נסו שוב.',
+    'song_more': 'מה בא לכם עכשיו?',
     'song_bye': 'כיף היה! נתראה בשיר הבא. להתראות!',
     'song_after': 'לשמירת השיר ברשימה, הקישו 1. לשיר נוסף, הקישו 2. לסיום, הקישו 3. לרדיו עם שירים דומים, הקישו 4.',
     'song_pick': 'להוספה לרשימה חדשה, הקישו 0. להוספה לרשימה קיימת, הקישו את מספר הרשימה, ואז סולמית.',
@@ -630,9 +650,13 @@ LIB_PROMPTS = ('lib_pick', 'lib_bad', 'lib_choose', 'lib_for', 'lib_for_list', '
     tuple(f'lib_press_{i}' for i in range(1, 9))
 
 # prompts the extension-2 upgrade needs on Yemot; uploaded once by _auto_setup_song2
-SONG2_NEW_PROMPTS = ('song_mode', 'song_typehow', 'song_artist', 'song_after',
+SONG2_NEW_PROMPTS = ('song_mode', 'song_how', 'song_typehow', 'song_artist', 'song_artist_voice',
+                     'artist_typehow', 'song_ask', 'song_more', 'song_notfound', 'song_after',
                      'song_artist_ask', 'song_auto_next', 'song_queue_done', 'song_radio_on')
-SONG2_PROMPT_VERSION = 'v3'
+SONG2_PROMPT_VERSION = 'v4'
+
+ARTIST_RESULT_LIMIT = 60   # singer radio: everything the paginated search yields
+ARTIST_PAGE_LIMIT = 25     # results screen announces the first 25 (5 pages of 5)
 
 LIB_DIR = os.environ.get('YM_LIB_EXT', '/16')            # playlists root extension
 
@@ -809,26 +833,31 @@ def fetch_results(call_id, query):
         log.warning('song results failed call=%s: %s', call_id, e)
         job.update(status='error', err=str(e)[:200])
 
-def fetch_artist_queue(call_id, artist):
-    """Artist mode: queue the artist's top songs and prefetch the first."""
+def fetch_artist_results(call_id, artist):
+    """Singer search: paginated results screen; picking a song starts radio of ALL the singer's songs."""
     job = song_jobs.get(call_id)
     if not job:
         return
     try:
-        results = yt_search_results(artist, limit=10)
-        job['queue'] = results
-        job['qidx'] = 0
+        results = yt_search_results(artist, limit=ARTIST_RESULT_LIMIT)
         cid = re.sub(r'\D', '', call_id)[-6:]
-        intro = f'ann{cid}'
-        ym_delete(f'{SONG_DIR}/{intro}.wav')
-        ym_upload(tts_wav(f'מצאתי שירים של {artist}. השיר הראשון בדרך.'), intro + '.wav',
-                  f'{SONG_DIR}/{intro}.wav')
-        job['intro'] = intro
-        start_prefetch(call_id, 0)
-        job.update(status='ready')
-        log.info('artist queue call=%s artist=%r: %d songs', call_id, artist[:60], len(results))
+        pages = []
+        for p in range(0, min(len(results), ARTIST_PAGE_LIMIT), 5):
+            chunk = results[p:p + 5]
+            parts = [f'מצאתי שירים של {artist}.'] if p == 0 else ['התוצאות הבאות.']
+            for i, (_vid, t) in enumerate(chunk, 1):
+                t = re.sub(r'\s+', ' ', (t or '')).strip()[:70]
+                parts.append(f'{i}. {t}.')
+            parts.append('הקישו את מספר השיר. לתוצאות נוספות, הקישו 0.')
+            name = f'res{cid}a{p // 5}'
+            ym_delete(f'{SONG_DIR}/{name}.wav')
+            ym_upload(tts_wav(' '.join(parts)), name + '.wav', f'{SONG_DIR}/{name}.wav')
+            pages.append(name)
+        job.update(status='ready', results=results, pages=pages, page_idx=0)
+        log.info('artist results call=%s artist=%r: %d results, %d pages',
+                 call_id, artist[:60], len(results), len(pages))
     except Exception as e:
-        log.warning('artist queue failed call=%s: %s', call_id, e)
+        log.warning('artist results failed call=%s: %s', call_id, e)
         job.update(status='error', err=str(e)[:200])
 
 def fetch_radio(call_id, video_id, cur_title):
@@ -837,9 +866,9 @@ def fetch_radio(call_id, video_id, cur_title):
     if not job:
         return
     try:
-        queue = yt_related(video_id, limit=12)
+        queue = yt_related(video_id)                 # no cap: every related song YouTube offers
         if not queue and cur_title:
-            queue = [r for r in yt_search_results(cur_title, limit=12) if r[0] != video_id]
+            queue = [r for r in yt_search_results(cur_title, limit=30) if r[0] != video_id]
         if not queue:
             raise ValueError('no related songs')
         job['queue'] = queue
@@ -975,22 +1004,36 @@ def yemot_song():
             return wait_step(call_id, job, 0)
 
     mode = params.get('MODE')
+    how = params.get('HOW')
     if s_val is None:
-        if mode in ('1', '3'):
-            job['tlang'] = 'en' if mode == '3' else 'he'
-            job['mode'] = 'single'
-            return text_response(multitap_read('f-song_typehow', 'S1', allow_empty=True))
-        if mode == '2':
-            job['mode'] = 'single'
-            return text_response(f'read=f-song_ask=S1,no,record,{IN_DIR},,no')
-        if mode == '4':
-            job.update(stage='artist_voice', mode='single')
-            return text_response(f'read=f-song_artist_ask=S1,no,record,{IN_DIR},,no')
-        if mode == '5':
+        if mode in ('1', '2'):
+            job['kind'] = 'song' if mode == '1' else 'artist'
+            return text_response('read=f-song_how=HOW,no,1,1,10,No,yes,,,,,,,,no')
+        if mode == '3':
             with lock:
                 song_jobs.pop(call_id, None)
             return text_response(f'go_to_folder={LIB_DIR}')
-        return text_response('read=f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
+        if mode is not None:
+            return text_response('read=f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
+        if how in ('1', '3'):
+            job['tlang'] = 'en' if how == '3' else 'he'
+            if job.get('kind') == 'artist':
+                job['stage'] = 'artist_typed'
+                return text_response(multitap_read('f-artist_typehow', 'S1', allow_empty=True))
+            job['mode'] = 'single'
+            return text_response(multitap_read('f-song_typehow', 'S1', allow_empty=True))
+        if how == '2':
+            if job.get('kind') == 'artist':
+                job['stage'] = 'artist_voice'
+                return text_response(f'read=f-song_artist_ask=S1,no,record,{IN_DIR},,no')
+            job['mode'] = 'single'
+            return text_response(f'read=f-song_ask=S1,no,record,{IN_DIR},,no')
+        if how is not None:
+            return text_response('read=f-song_how=HOW,no,1,1,10,No,yes,,,,,,,,no')
+        if job.get('stage') == 'ask_artist_voice':
+            s_val = ''   # # pressed with no recording: skip the optional artist step
+        else:
+            return text_response('read=f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
 
     try:
         stage = job['stage']
@@ -1013,9 +1056,28 @@ def yemot_song():
                 with lock:
                     song_jobs.pop(call_id, None)
                 return text_response('id_list_message=f-song_bye')
-            job.update(stage='searching', status='working', query=clean_song_query(text),
+            job.update(stage='ask_artist_voice', query=clean_song_query(text))
+            return text_response(f'read=f-song_artist_voice=S{turn+1},no,record,{IN_DIR},,no')
+
+        if stage == 'ask_artist_voice':
+            artist = ''
+            if s_val:
+                rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
+                try:
+                    wav = ym_download(rec_path)
+                    artist = (groq_stt(wav) or '').strip()
+                    ym_delete(rec_path)
+                except Exception as e:
+                    log.info('artist voice step skipped call=%s: %s', call_id, e)
+            song = (job.get('query') or '').strip()
+            q = clean_song_query((song + ' ' + artist).strip())
+            if not q:
+                job['stage'] = 'ask'
+                return text_response(f'read=f-song_ask=S{turn+1},no,record,{IN_DIR},,no')
+            log.info('song voice query call=%s song=%r artist=%r', call_id, song[:60], artist[:60])
+            job.update(stage='searching', status='working', kind='song', query=q,
                        started=time.time())
-            threading.Thread(target=fetch_results, args=(call_id, job['query']), daemon=True).start()
+            threading.Thread(target=fetch_results, args=(call_id, q), daemon=True).start()
             return text_response(play_chain('f-song_searching', f'S{turn+1}'))
 
         if stage == 'ask_artist':
@@ -1027,13 +1089,25 @@ def yemot_song():
             if not song and not artist:
                 return text_response(multitap_read('f-song_typehow', f'S{turn+1}', allow_empty=True))
             if not song:
-                job.update(stage='await_queue', status='working', mode='artist',
+                job.update(stage='searching', status='working', kind='artist',
                            artist=artist, started=time.time())
-                threading.Thread(target=fetch_artist_queue, args=(call_id, artist), daemon=True).start()
+                threading.Thread(target=fetch_artist_results, args=(call_id, artist), daemon=True).start()
                 return text_response(play_chain('f-song_searching', f'S{turn+1}'))
             q = clean_song_query((song + ' ' + artist).strip())
-            job.update(stage='searching', status='working', query=q, started=time.time())
+            job.update(stage='searching', status='working', kind='song', query=q, started=time.time())
             threading.Thread(target=fetch_results, args=(call_id, q), daemon=True).start()
+            return text_response(play_chain('f-song_searching', f'S{turn+1}'))
+
+        if stage == 'artist_typed':
+            artist = ''
+            if re.fullmatch(r'[0-9*]+', s_val or ''):
+                artist = multitap_decode(s_val, job.get('tlang', 'he'))
+            if not artist:
+                return text_response(multitap_read('f-artist_typehow', f'S{turn+1}', allow_empty=True))
+            log.info('artist typed call=%s: %r', call_id, artist[:60])
+            job.update(stage='searching', status='working', kind='artist',
+                       artist=artist, started=time.time())
+            threading.Thread(target=fetch_artist_results, args=(call_id, artist), daemon=True).start()
             return text_response(play_chain('f-song_searching', f'S{turn+1}'))
 
         if stage == 'artist_voice':
@@ -1048,9 +1122,9 @@ def yemot_song():
                 with lock:
                     song_jobs.pop(call_id, None)
                 return text_response('id_list_message=f-song_bye')
-            job.update(stage='await_queue', status='working', mode='artist',
+            job.update(stage='searching', status='working', kind='artist',
                        artist=artist, started=time.time())
-            threading.Thread(target=fetch_artist_queue, args=(call_id, artist), daemon=True).start()
+            threading.Thread(target=fetch_artist_results, args=(call_id, artist), daemon=True).start()
             return text_response(play_chain('f-song_searching', f'S{turn+1}'))
 
         if stage == 'searching':
@@ -1080,9 +1154,15 @@ def yemot_song():
                 idx = job.get('page_idx', 0) * 5 + int(s_val) - 1
                 if idx < len(results):
                     video_id, title = results[idx]
-                    job.update(stage='wait', status='idle', mode='single',
-                               queue=[(video_id, title)], qidx=0, started=time.time())
-                    start_prefetch(call_id, 0)
+                    if job.get('kind') == 'artist':
+                        # singer radio: play the pick, then the rest of the singer's songs
+                        job.update(stage='wait', status='idle', mode='artist',
+                                   queue=list(results), qidx=idx, started=time.time())
+                        start_prefetch(call_id, idx)
+                    else:
+                        job.update(stage='wait', status='idle', mode='single',
+                                   queue=[(video_id, title)], qidx=0, started=time.time())
+                        start_prefetch(call_id, 0)
                     return text_response(play_chain('f-song_searching', f'S{turn+1}'))
             return text_response(f"read=f-{pages[job.get('page_idx', 0)]}=S{turn+1},no,1,1,10,No,yes,,,,,,,,no")
 
