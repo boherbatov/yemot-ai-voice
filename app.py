@@ -2834,7 +2834,7 @@ def fetch_wiki(call_id, title, sub):
             job.update(status='error', err='not found')
             return
         sections = wiki_sections(text)
-        log.info('wiki %r -> %r, %d sections', term, title, len(sections))
+        log.info('wiki %r: %d sections', title, len(sections))
         ym_upload_text('type=playfile\n', f'ivr2:/4/{sub}/ext.ini')
         results = [None] * len(sections)
         def one(i, sec):
