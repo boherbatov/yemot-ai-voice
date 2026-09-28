@@ -411,13 +411,18 @@ def tts_wav(text, rate=None, voice=None):
     text = re.sub(r' ?[–—] ?', ', ', text)          # dashes read badly in TTS
     text = re.sub(r'\.(?=[^\s\d.])', '. ', text)   # pause after sentences, keep decimals
     mp3_path = f'/tmp/tts-{time.time_ns()}.mp3'
-    async def gen():
-        await edge_tts.Communicate(text, voice or EDGE_VOICE, rate=rate or EDGE_RATE).save(mp3_path)
-    asyncio.run(gen())
-    import miniaudio
-    snd = miniaudio.decode_file(mp3_path, output_format=miniaudio.SampleFormat.SIGNED16,
-                                nchannels=1, sample_rate=8000)
-    os.remove(mp3_path)
+    try:
+        async def gen():
+            await edge_tts.Communicate(text, voice or EDGE_VOICE, rate=rate or EDGE_RATE).save(mp3_path)
+        asyncio.run(gen())
+        import miniaudio
+        snd = miniaudio.decode_file(mp3_path, output_format=miniaudio.SampleFormat.SIGNED16,
+                                    nchannels=1, sample_rate=8000)
+    finally:
+        try:
+            os.remove(mp3_path)
+        except OSError:
+            pass
     buf = io.BytesIO()
     w = wave.open(buf, 'wb')
     w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
@@ -468,6 +473,30 @@ def summarize_if_needed(phone, h):
 
 def today():
     return time.strftime('%Y-%m-%d')
+
+# ---------- /tmp janitor ----------
+# The container disk is small; leaked per-call files (songs, editions, telegram
+# streams, podcasts, tts) filled it once and broke every TTS reply with
+# Errno 28. Sweep anything older than 20 minutes, also right at boot.
+def _tmp_janitor():
+    import glob as _jglob
+    pats = ('/tmp/song-*', '/tmp/ned-*', '/tmp/tg-*', '/tmp/pod-*',
+            '/tmp/stest-*', '/tmp/tts-*', '/tmp/wiki-*')
+    while True:
+        try:
+            now = time.time()
+            for pat in pats:
+                for f_ in _jglob.glob(pat):
+                    try:
+                        if now - os.path.getmtime(f_) > 1200:
+                            os.remove(f_)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        time.sleep(600)
+
+threading.Thread(target=_tmp_janitor, daemon=True).start()
 
 # ---------- Endpoints ----------
 
@@ -1006,15 +1035,9 @@ def yemot_song():
     mode = params.get('MODE')
     how = params.get('HOW')
     if s_val is None:
-        if mode in ('1', '2'):
-            job['kind'] = 'song' if mode == '1' else 'artist'
-            return text_response('read=f-song_how=HOW,no,1,1,10,No,yes,,,,,,,,no')
-        if mode == '3':
-            with lock:
-                song_jobs.pop(call_id, None)
-            return text_response(f'go_to_folder={LIB_DIR}')
-        if mode is not None:
-            return text_response('read=f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
+        # Yemot re-sends every accumulated param on each hop, so MODE stays set
+        # after the caller advances to the HOW step. Check HOW before MODE,
+        # otherwise the search-method choice loops back to the HOW menu forever.
         if how in ('1', '3'):
             job['tlang'] = 'en' if how == '3' else 'he'
             if job.get('kind') == 'artist':
@@ -1030,6 +1053,15 @@ def yemot_song():
             return text_response(f'read=f-song_ask=S1,no,record,{IN_DIR},,no')
         if how is not None:
             return text_response('read=f-song_how=HOW,no,1,1,10,No,yes,,,,,,,,no')
+        if mode in ('1', '2'):
+            job['kind'] = 'song' if mode == '1' else 'artist'
+            return text_response('read=f-song_how=HOW,no,1,1,10,No,yes,,,,,,,,no')
+        if mode == '3':
+            with lock:
+                song_jobs.pop(call_id, None)
+            return text_response(f'go_to_folder={LIB_DIR}')
+        if mode is not None:
+            return text_response('read=f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
         if job.get('stage') == 'ask_artist_voice':
             s_val = ''   # # pressed with no recording: skip the optional artist step
         else:
