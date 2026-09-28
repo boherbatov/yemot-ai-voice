@@ -2579,6 +2579,24 @@ POD_CATEGORIES = [
     ('פשע אמיתי פודקאסט', 'פשע אמיתי'),
 ]
 
+def pod_pick_chain(call_id, found):
+    """Upload per-option TTS prompts for a podcast results screen; return the f- chain."""
+    sfx = re.sub(r'\D', '', call_id)[-6:] or call_id[-6:]
+    names = []
+    for i, it in enumerate(found, 1):
+        try:
+            ym_upload(tts_wav(f'מקש {i}. {it["title"]}'),
+                      f'pc_i{sfx}_{i}.wav', f'/3/pc_i{sfx}_{i}.wav')
+            names.append(f'f-pc_i{sfx}_{i}')
+        except Exception as e:
+            log.warning('pod pick prompt %d failed: %s', i, e)
+    try:
+        ym_upload(tts_wav('בחרו פודקאסט. לחזרה, הקישו 0.'),
+                  f'pc_pick{sfx}.wav', f'/3/pc_pick{sfx}.wav')
+    except Exception:
+        pass
+    return '.'.join(names) + f'.f-pc_pick{sfx}'
+
 @app.route('/yemot-pod', methods=['GET', 'POST'])
 def yemot_pod():
     params = request.values
@@ -2637,23 +2655,8 @@ def yemot_pod():
                 if not found:
                     job['stage'] = 'entry'
                     return text_response(f'read=f-pod_notfound.f-pod_entry=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
-                job.update(stage='cat_pick', cat_results=found)
-                sfx = call_id[-6:]
-                names = []
-                for i, it in enumerate(found, 1):
-                    try:
-                        ym_upload(tts_wav(f'מקש {i}. {it["title"]}'),
-                                  f'pc_i{sfx}_{i}.wav', f'/3/pc_i{sfx}_{i}.wav')
-                        names.append(f'f-pc_i{sfx}_{i}')
-                    except Exception as e:
-                        log.warning('pod cat prompt %d failed: %s', i, e)
-                try:
-                    ym_upload(tts_wav('בחרו פודקאסט. לחזרה לקטגוריות, הקישו 0.'),
-                              f'pc_pick{sfx}.wav', f'/3/pc_pick{sfx}.wav')
-                except Exception:
-                    pass
-                chain = '.'.join(names) + f'.f-pc_pick{sfx}'
-                return text_response(f'read={chain}=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+                job.update(stage='cat_pick', cat_results=found, back_stage='cats')
+                return text_response(f'read={pod_pick_chain(call_id, found)}=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             job['stage'] = 'entry'
             return text_response(f'read=f-pod_entry=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
 
@@ -2665,6 +2668,9 @@ def yemot_pod():
                 job.update(stage='pod_wait', status='working', custom=sel, idx=0, ep=0, started=time.time())
                 threading.Thread(target=fetch_pod, args=(call_id, 0, 0, sel), daemon=True).start()
                 return text_response(play_chain('f-pod_searching', f'S{turn+1}'))
+            if job.get('back_stage') == 'entry':
+                job['stage'] = 'entry'
+                return text_response(f'read=f-pod_entry=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             job['stage'] = 'cats'
             return text_response(f'read=f-pod_cats=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
 
@@ -2673,14 +2679,18 @@ def yemot_pod():
             log.info('pod typed call=%s raw=%s -> %s', call_id, (s_val or '')[:60], term[:60])
             if not term:
                 return text_response(multitap_read('f-pod_typehow', f'S{turn+1}'))
-            found = itunes_podcast_search(term)
+            found = itunes_podcast_search_multi(term, 5)
             if not found:
                 job['stage'] = 'entry'
                 return text_response(f'read=f-pod_notfound.f-pod_entry=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
-            log.info('pod search call=%s: %r -> %s', call_id, term, found['title'])
-            job.update(stage='pod_wait', status='working', custom=found, idx=0, ep=0, started=time.time())
-            threading.Thread(target=fetch_pod, args=(call_id, 0, 0, found), daemon=True).start()
-            return text_response(play_chain('f-pod_searching', f'S{turn+1}'))
+            log.info('pod search call=%s: %r -> %d results', call_id, term, len(found))
+            if len(found) == 1:
+                sel = found[0]
+                job.update(stage='pod_wait', status='working', custom=sel, idx=0, ep=0, started=time.time())
+                threading.Thread(target=fetch_pod, args=(call_id, 0, 0, sel), daemon=True).start()
+                return text_response(play_chain('f-pod_searching', f'S{turn+1}'))
+            job.update(stage='cat_pick', cat_results=found, back_stage='entry')
+            return text_response(f'read={pod_pick_chain(call_id, found)}=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
 
         if stage == 'menu':
             v = (s_val or '').strip()
@@ -2774,6 +2784,20 @@ def wiki_article_text(term):
     extract = next(iter(pages.values())).get('extract', '')
     return title, (extract or '').strip()
 
+def wiki_search_titles(term, limit=5):
+    api = 'https://he.wikipedia.org/w/api.php'
+    r = requests.get(api, params={'action': 'query', 'list': 'search', 'srsearch': term,
+                                  'utf8': 1, 'format': 'json', 'srlimit': limit}, headers=WIKI_HEADERS, timeout=20)
+    return [h['title'] for h in r.json().get('query', {}).get('search', []) if h.get('title')]
+
+def wiki_article_by_title(title):
+    api = 'https://he.wikipedia.org/w/api.php'
+    r = requests.get(api, params={'action': 'query', 'prop': 'extracts', 'explaintext': 1,
+                                  'titles': title, 'format': 'json', 'redirects': 1}, headers=WIKI_HEADERS, timeout=20)
+    pages = r.json().get('query', {}).get('pages', {})
+    extract = next(iter(pages.values()), {}).get('extract', '')
+    return (extract or '').strip()
+
 def wiki_sections(text):
     paras = [p.strip() for p in re.split(r'\n+', text) if p.strip()]
     out, cur = [], ''
@@ -2786,7 +2810,7 @@ def wiki_sections(text):
         out.append(cur)
     return out[:WIKI_MAX_SECTIONS]
 
-def fetch_wiki(call_id, term, sub):
+def fetch_wiki(call_id, title, sub):
     job = wiki_jobs[call_id]
     try:
         # clean previous article folders under /4
@@ -2794,7 +2818,7 @@ def fetch_wiki(call_id, term, sub):
             if f.get('fileType') == 'EXT' and f.get('name', '').isdigit() and f['name'] != sub:
                 try: ym_delete(f'/4/{f["name"]}')
                 except Exception: pass
-        title, text = wiki_article_text(term)
+        text = wiki_article_by_title(title)
         if not text:
             job.update(status='error', err='not found')
             return
@@ -2869,8 +2893,36 @@ def yemot_wiki():
                     return text_response(multitap_read('f-wiki_typehow', f'S{turn+1}'))
                 return text_response(f'read=f-didnt_hear=S{turn+1},no,record,{IN_DIR},,no')
             sub = re.sub(r'\D', '', call_id)[-6:] or '1'
+            try:
+                titles = wiki_search_titles(text)
+            except Exception as e:
+                log.warning('wiki search failed call=%s: %s', call_id, e)
+                titles = []
+            if not titles:
+                job.update(stage='ask', status='idle')
+                return text_response('read=f-wiki_notfound.f-wiki_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
+            if len(titles) > 1:
+                listing = ('נמצאו כמה ערכים. ' + ' . '.join(f'{i+1}, {t}' for i, t in enumerate(titles))
+                           + '. להאזנה, הקישו את מספר הערך.')
+                rname = f'wiki_r{sub}'
+                ym_upload(tts_wav(listing), rname + '.wav', f'ivr2:/4/{rname}.wav')
+                job.update(stage='pick', titles=titles, sub=sub, rname=rname)
+                return text_response(f'read=f-{rname}=S{turn+1},no,1,1,10,No,yes,,,,,,,,no')
             job.update(stage='wiki_wait', status='working', started=time.time(), sub=sub)
-            threading.Thread(target=fetch_wiki, args=(call_id, text, sub), daemon=True).start()
+            threading.Thread(target=fetch_wiki, args=(call_id, titles[0], sub), daemon=True).start()
+            return text_response(play_chain('f-wiki_searching', f'S{turn+1}'))
+
+        if stage == 'pick':
+            titles = job.get('titles') or []
+            rname = job.get('rname') or 'wiki_notfound'
+            n = int(s_val) if (s_val or '').isdigit() else 0
+            if not (1 <= n <= len(titles)):
+                return text_response(f'read=f-{rname}=S{turn+1},no,1,1,10,No,yes,,,,,,,,no')
+            try: ym_delete(f'/4/{rname}.wav')
+            except Exception: pass
+            sub = job.get('sub') or (re.sub(r'\D', '', call_id)[-6:] or '1')
+            job.update(stage='wiki_wait', status='working', started=time.time(), sub=sub)
+            threading.Thread(target=fetch_wiki, args=(call_id, titles[n - 1], sub), daemon=True).start()
             return text_response(play_chain('f-wiki_searching', f'S{turn+1}'))
 
         if stage == 'wiki_wait':
@@ -2984,9 +3036,16 @@ def yemot_translate():
             return text_response(f'read=f-tr_dst=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
 
         if stage in ('tr_ask', 'tr_play'):
+            if s_val in (None, '', 'None'):
+                # playback callback with no new recording: offer the next sentence
+                job['stage'] = 'tr_ask'
+                return text_response(f'read=f-tr_again=S{turn+1},no,record,{IN_DIR},,no')
             rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
             wav = ym_download(rec_path)
-            text = groq_stt(wav, language=None)
+            # pin the language to the chosen source: auto-detect mangles short
+            # phone-quality Hebrew into phonetic English (e.g. "Annie Lodayr")
+            src_lang = LANGS[job.get('src', 0)][1].split('-')[0]
+            text = groq_stt(wav, language=src_lang)
             ym_delete(rec_path)
             log.info('tr req call=%s: %s', call_id, (text or '')[:80])
             if not text:
