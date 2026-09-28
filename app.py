@@ -237,7 +237,7 @@ stats = {'calls': 0, 'turns': 0, 'started': time.time(), 'errors': 0}
 lock = threading.Lock()
 
 
-def gemini_chat(messages, max_tokens=180):
+def gemini_chat(messages, max_tokens=640):
     if not GEMINI_API_KEY:
         raise RuntimeError('GEMINI_API_KEY is not configured')
     systems, contents = [], []
@@ -2301,7 +2301,7 @@ def setup_chulin_assets():
                 report[f'{sub}_{name}'] = f'FAIL: {e}'
     try: report['groq_chat'] = groq_chat([{'role':'user','content':'ענה במילה אחת: בסדר'}], 64)
     except Exception as e: report['groq_chat'] = f'FAIL: {e}'
-    try: report['gemini_chat'] = gemini_chat([{'role':'user','content':'ענה במילה אחת: בסדר'}], 64)
+    try: report['gemini_chat'] = gemini_chat([{'role':'user','content':'ענה במילה אחת: בסדר'}], 256)
     except Exception as e: report['gemini_chat'] = f'FAIL: {e}'
     return report
 
@@ -2597,6 +2597,17 @@ def pod_pick_chain(call_id, found):
         pass
     return '.'.join(names) + f'.f-pc_pick{sfx}'
 
+def itunes_podcast_search_fallback(term, limit=5):
+    """iTunes AND-matches long Hebrew phrases to nothing; retry with shorter prefixes."""
+    words = [w for w in (term or '').split() if w != 'פודקאסט']
+    for n in range(len(words), 0, -1):
+        found = itunes_podcast_search_multi(' '.join(words[:n]), limit)
+        if found:
+            if n < len(words):
+                log.info('pod cat fallback: %r -> %r (%d results)', term, ' '.join(words[:n]), len(found))
+            return found
+    return []
+
 @app.route('/yemot-pod', methods=['GET', 'POST'])
 def yemot_pod():
     params = request.values
@@ -2651,7 +2662,7 @@ def yemot_pod():
             if v.isdigit() and 1 <= int(v) <= len(POD_CATEGORIES):
                 term, cat_name = POD_CATEGORIES[int(v) - 1]
                 log.info('pod cat call=%s: %s (%s)', call_id, cat_name, term)
-                found = itunes_podcast_search_multi(term, 5)
+                found = itunes_podcast_search_fallback(term, 5)
                 if not found:
                     job['stage'] = 'entry'
                     return text_response(f'read=f-pod_notfound.f-pod_entry=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
