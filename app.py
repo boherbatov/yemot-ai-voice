@@ -2939,7 +2939,10 @@ def yemot_wiki():
         if stage == 'wiki_wait':
             st = job.get('status')
             if st == 'working':
-                if time.time() - job.get('started', 0) > 300:
+                # big articles (60 sections of TTS + upload) can take 10+ minutes
+                # on this host; 300s falsely reported "not found" after a
+                # preparation that actually succeeded
+                if time.time() - job.get('started', 0) > 900:
                     job.update(stage='ask', status='idle')
                     return text_response(f'read=f-wiki_notfound.f-wiki_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
                 return text_response(play_chain('f-wiki_wait', f'S{turn+1}'))
