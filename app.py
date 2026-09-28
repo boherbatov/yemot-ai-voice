@@ -1556,6 +1556,7 @@ NED_PROMPTS = {
     'rs_none': 'לא נמצאה האזנה אחרונה בשלוחה זו.',
     'tg_listing': 'רגע, מביאה את רשימת התכנים העדכנית מהטלגרם.',
     'tg_searching': 'רגע, מביאה את התוכנית. תוכנית ארוכה יכולה לקחת גם שלוש דקות להתחיל.',
+    'tg_paused': 'חדשות ותכנים מערוצי הטלגרם זמנית לא זמינים. נסו שוב בעתיד.',
     'tg_notfound': 'סליחה, לא הצלחתי להביא את התוכנית. נסו תוכנית אחרת, או חזרו מאוחר יותר.',
     'ned_searching': 'רגע, מביאה את המהדורה העדכנית. מהדורה מלאה, אז זה יכול לקחת דקה או שתיים.',
     'ned_wait': 'עוד קצת, המהדורה מתכוננת.',
@@ -1711,6 +1712,14 @@ TG_CHANNELS = [
     ('behadrey', 'בחדרי חרדים'),
 ]
 
+# Ariel's personal Telegram account is frozen (appeal pending, deadline
+# 2026-10-27). Any Telethon API use risks worsening the freeze, so every
+# feature that runs through his session is paused: extension 7 key 3
+# (Telegram channel streaming) and extension 5 (pniot delivery to his
+# Saved Messages). Callers hear a short "temporarily unavailable" message.
+# Re-enable by flipping this to False once the account is restored.
+TG_PAUSED = True
+
 def tg_clean_text(t):
     t = re.sub(r'https?://\S+|t\.me/\S+|www\.\S+', '', t or '')
     t = re.sub(r'@\w+', '', t)
@@ -1722,6 +1731,8 @@ def tg_clean_text(t):
     return t
 
 def tg_client():
+    if TG_PAUSED:
+        raise RuntimeError('telegram features paused (frozen account)')
     from telethon import TelegramClient
     from telethon.sessions import StringSession
     return TelegramClient(StringSession(os.environ['TELEGRAM_SESSION']),
@@ -1768,6 +1779,8 @@ def tg_stream_video(call_id, ch_idx, msg_id, i, tmpbase):
     upload_chunks_loop(proc, tmp, f'tg{sfx}p{i}', job, tmp + '.log')
 
 def tg_stream(call_id, ch_idx):
+    if TG_PAUSED:
+        return
     # Stream a channel's latest posts newest-first: each post = TTS of its text
     # followed inline by its video (if any); files are appended to job['chunks']
     # progressively so playback starts while later posts are still prepared.
@@ -1851,6 +1864,9 @@ def yemot_ned():
 
     try:
         rec = resume_take(call_id, '7')
+        if rec and TG_PAUSED:
+            job['stage'] = 'menu'
+            return text_response(f'read=f-tg_paused.f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
         if rec:
             ch = min(max(int(rec.get('ch', 0)), 0), len(TG_CHANNELS) - 1)
             job.update(stage='tg_stream_wait', status='working', started=time.time(),
@@ -1900,6 +1916,9 @@ def yemot_ned():
                 threading.Thread(target=fetch_ned, args=(call_id,), daemon=True).start()
                 return text_response(play_chain('f-ned_searching', f'S{turn+1}'))
             if v == '3':
+                if TG_PAUSED:
+                    job['stage'] = 'menu'
+                    return text_response(f'read=f-tg_paused.f-nc_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
                 job['stage'] = 'tg_channels'
                 chain = '.'.join(f'f-nc_ch_{i}' for i in range(1, len(TG_CHANNELS) + 1))
                 return text_response(f'read={chain}.f-nc_chmenu=S{turn+1},no,2,1,7,No,yes,,,,,,,,no')
@@ -2058,6 +2077,7 @@ def yemot_jump7():
 
 PNIOT_DIR = os.environ.get('YM_PNIOT_EXT', '/5')
 PNIOT_PROMPTS = {
+    'pniot_paused': 'פניות להנהלה זמנית לא זמינות. נסו שוב בעתיד. להתראות!',
     'pniot_intro': 'פניות להנהלה. הקליטו את הפנייה שלכם אחרי הצליל, ולסיום הקישו סולמית. הפנייה מגיעה ישירות להנהלת הקו.',
     'pniot_ok': 'תודה רבה! הפנייה נשלחה להנהלת הקו. להתראות!',
     'pniot_error': 'סליחה, הייתה תקלה בשליחת הפנייה. נסו שוב קצת מאוחר יותר. להתראות!',
@@ -2079,6 +2099,8 @@ def yemot_pniot():
             s_val, turn = v, int(k[1:])
 
     if s_val is None:
+        if TG_PAUSED:
+            return text_response('id_list_message=f-pniot_paused')
         return text_response(f'read=f-pniot_intro=S1,no,record,{PNIOT_DIR}/in,,no')
 
     try:
@@ -3322,7 +3344,7 @@ def _auto_setup_hub():
         except Exception as e:
             log.warning('hub prompt marker failed: %s', e)
 
-NC_PROMPT_VERSION = 'v5'
+NC_PROMPT_VERSION = 'v6'
 
 def _auto_setup_newscenter():
     # Idempotent startup migration: install the extension-7 news center
@@ -3390,7 +3412,7 @@ def _auto_setup_newscenter():
         except Exception as e:
             log.warning('nc marker failed: %s', e)
 
-PNIOT_PROMPT_VERSION = 'v2'
+PNIOT_PROMPT_VERSION = 'v3'
 
 def _auto_setup_pniot():
     # Idempotent startup migration: install extension 5 (פניות להנהלה) once per version.
