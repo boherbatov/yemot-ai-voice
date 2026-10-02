@@ -380,6 +380,27 @@ def hngn_results(query, relevant, limit=5, artist_mode=False):
     relevant(query, text) filters rows (same rule as YouTube results).
     artist_mode keeps only songs whose artist list matches the query."""
     rows = parse_songs(hngn_fetch_search(query))
+    if not rows:
+        # hngn matches the whole phrase against one song title OR one artist, so "song + artist"
+        # returns nothing. Retry with shorter leading parts (the song name comes first); the
+        # relevance filter below still checks every word of the original query.
+        words_ = query.split()
+        tries_ = []
+        for n_ in (len(words_) - 1, (len(words_) + 1) // 2):
+            if 1 <= n_ < len(words_) and n_ not in tries_:
+                tries_.append(n_)
+        t0_ = time.monotonic()
+        for n_ in tries_[:2]:
+            if time.monotonic() - t0_ > 2.5:
+                break
+            try:
+                rows = parse_songs(hngn_fetch_search(' '.join(words_[:n_])))
+            except Exception as e:
+                log_hn.info('hngn shorter query failed: %s', str(e)[:60])
+                break
+            if rows:
+                log_hn.info('hngn found rows with the first %d of %d words', n_, len(words_))
+                break
     out = []
     for vid, title, artists in rows:
         label = f'{title} - {", ".join(artists[:2])}' if artists else title
