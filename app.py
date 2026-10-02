@@ -288,6 +288,141 @@ def yt_search_results(query, limit=15):
         raise ValueError('no video results')
     return found[:limit]
 
+# ---------- hngn.co.il (היכל הנגינה) search source for extension 2 ----------
+# Permission as relayed by the line owner: the site manager allows playing the site's
+# songs on the phone line (streaming only, no catalog copying, no re-hosting).
+# No caching/crawling: 1 HTML request per caller search; each result row already carries
+# the song's YouTube id (thumbnail URL); audio comes through the normal YouTube path.
+import html, urllib.parse, types
+log_hn = logging.getLogger('hngn')
+
+HNGN_BASE = 'https://hngn.co.il'
+HNGN_UA = 'yemot-ai-voice phone line (hngn.co.il, permitted by site manager)'
+HNGN_TIMEOUT = 4          # seconds; hngn failure must never slow the caller
+HNGN_MIN_GAP = 1.0        # seconds between any two requests from this server
+MAX_SECONDS = 600         # same song-length cap as the YouTube path
+
+_lock = threading.Lock()
+_last_request = 0.0
+_blocked_until = 0.0
+_backoff = 600.0
+
+_ROW = re.compile(
+    r'img\.youtube\.com/vi/([A-Za-z0-9_-]{11})/[^"]*"[^>]*/>'
+    r'<div class="SongList-module__\w+__body">'
+    r'<a class="[^"]*" href="/songs/(\d+)/[^"]*">([^<]*)</a>'
+    r'<div class="SongList-module__\w+__artist">(.*?)</div></div>'
+    r'(?:<span class="[^"]*SongList-module__\w+__dur">([^<]*)</span>)?', re.S)
+_ARTIST = re.compile(r'<a href="/artists/\d+/[^"]*">([^<]*)</a>')
+_LYRICS_MARK = 'נמצא במילות השיר'
+
+
+def _secs(text):
+    text = (text or '').strip()
+    if not re.fullmatch(r'\d+(?::\d{1,2}){1,2}', text):
+        return None
+    total = 0
+    for part in text.split(':'):
+        total = total * 60 + int(part)
+    return total
+
+
+def parse_songs(page, include_lyrics_matches=False):
+    """Rows from a hngn search/artist page -> [(youtube_id, title, [artists])]."""
+    if not include_lyrics_matches and _LYRICS_MARK in page:
+        page = page.split(_LYRICS_MARK)[0]
+    out, seen = [], set()
+    for vid, _sid, title, artist_html, dur in _ROW.findall(page):
+        title = html.unescape(title).strip()
+        artists = [html.unescape(a).strip() for a in _ARTIST.findall(artist_html)]
+        secs = _secs(dur)
+        if not title or vid in seen or (secs is not None and secs > MAX_SECONDS):
+            continue
+        seen.add(vid)
+        out.append((vid, title, artists))
+    return out
+
+
+def _is_challenge(resp):
+    if resp.status_code in (403, 429, 503):
+        return True
+    head = resp.text[:2000].lower()
+    return 'just a moment' in head or 'cf-chl' in head or 'challenge-platform' in head
+
+
+def hngn_fetch_search(query):
+    """One polite request. Raises on any problem; callers treat that as 'no hngn'."""
+    global _last_request, _blocked_until, _backoff
+    now = time.monotonic()
+    if now < _blocked_until:
+        raise RuntimeError('hngn paused (backoff)')
+    with _lock:
+        wait = HNGN_MIN_GAP - (time.monotonic() - _last_request)
+        if wait > 0:
+            time.sleep(wait)
+        _last_request = time.monotonic()
+    url = f'{HNGN_BASE}/search?q={urllib.parse.quote(query)}'
+    resp = requests.get(url, headers={'User-Agent': HNGN_UA, 'Accept-Language': 'he'},
+                        timeout=HNGN_TIMEOUT)
+    if _is_challenge(resp):
+        _blocked_until = time.monotonic() + _backoff
+        log_hn.warning('hngn status=%s, pausing hngn for %ds', resp.status_code, _backoff)
+        _backoff = min(_backoff * 2, 3600.0)
+        raise RuntimeError('hngn blocked')
+    resp.raise_for_status()
+    _backoff = 600.0
+    return resp.text
+
+
+def hngn_results(query, relevant, limit=5, artist_mode=False):
+    """[(youtube_id, 'title - artists')] for the phone list.
+    relevant(query, text) filters rows (same rule as YouTube results).
+    artist_mode keeps only songs whose artist list matches the query."""
+    rows = parse_songs(hngn_fetch_search(query))
+    out = []
+    for vid, title, artists in rows:
+        label = f'{title} - {", ".join(artists[:2])}' if artists else title
+        if artist_mode:
+            if not any(relevant(query, a) for a in artists):
+                continue
+        elif not relevant(query, title + ' ' + ' '.join(artists)):
+            continue
+        out.append((vid, label))
+        if len(out) >= limit:
+            break
+    return out
+
+hngn_source = types.SimpleNamespace(
+    hngn_results=hngn_results, HNGN_TIMEOUT=HNGN_TIMEOUT, parse_songs=parse_songs)
+
+def merged_song_search(query, limit=15, artist_mode=False, hn_max=5):
+    """hngn results first (accurate Hebrew titles), then YouTube, deduped by video id.
+    hngn failure is silent (YouTube only); YouTube failure alone does not hide hngn hits."""
+    box = {}
+    def run_hn():
+        try:
+            box['hn'] = hngn_source.hngn_results(query, _yt_title_relevant, limit=hn_max,
+                                                 artist_mode=artist_mode)
+        except Exception as e:
+            log.info('hngn unavailable (%s), YouTube only', str(e)[:80])
+            box['hn'] = []
+    th = threading.Thread(target=run_hn, daemon=True)
+    th.start()
+    yt, yt_err = [], None
+    try:
+        yt = yt_search_results(query, limit=limit)
+    except Exception as e:
+        yt_err = e
+    th.join(timeout=hngn_source.HNGN_TIMEOUT + 2)
+    out, seen = [], set()
+    for vid, title in list(box.get('hn') or []) + list(yt):
+        if vid not in seen:
+            seen.add(vid); out.append((vid, title))
+    if not out:
+        raise yt_err or ValueError('no video results')
+    log.info('merged search: hngn=%d youtube=%d total=%d', len(box.get('hn') or []), len(yt), len(out))
+    return out[:limit]
+
 def yt_search_video_id(query):
     """Authenticated TV-surface search; returns first video id."""
     return yt_search_results(query, limit=1)[0]
@@ -1318,7 +1453,7 @@ def fetch_results(call_id, query):
         return
     try:
         search_started = time.monotonic()
-        results = yt_search_results(query, limit=15)
+        results = merged_song_search(query, limit=15)
         log.info('song search phase elapsed=%.2fs count=%d', time.monotonic()-search_started, len(results))
         menu_started = time.monotonic()
         cid = re.sub(r'\D', '', call_id)[-6:]
@@ -1347,7 +1482,7 @@ def fetch_artist_results(call_id, artist):
     if not job:
         return
     try:
-        results = yt_search_results(artist, limit=ARTIST_RESULT_LIMIT)
+        results = merged_song_search(artist, limit=ARTIST_RESULT_LIMIT, artist_mode=True, hn_max=30)
         cid = re.sub(r'\D', '', call_id)[-6:]
         pages = []
         for p in range(0, min(len(results), ARTIST_PAGE_LIMIT), 5):
