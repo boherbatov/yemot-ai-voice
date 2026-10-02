@@ -1147,7 +1147,8 @@ def _jm_get(path, **params):
     if not JAMENDO_CLIENT_ID:
         raise ValueError('JAMENDO_CLIENT_ID not set')
     params.update(client_id=JAMENDO_CLIENT_ID, format='json')
-    r = requests.get(f'{JAMENDO_API}/{path}/', params=params, timeout=20)
+    from urllib.parse import urlencode, quote
+    r = requests.get(f'{JAMENDO_API}/{path}/?' + urlencode(params, quote_via=quote), timeout=20)
     r.raise_for_status()
     d = r.json()
     if (d.get('headers') or {}).get('status') != 'success':
@@ -1163,8 +1164,15 @@ def _jm_remember(t):
 
 def jamendo_search(query, limit=15):
     """Returns [('jm:<id>', 'name - artist'), ...] and fills the track cache."""
-    res = _jm_get('tracks', search=query, limit=limit, audioformat='mp31',
-                  boost='popularity_month', type='single albumtrack')
+    # Jamendo's API intermittently answers success with 0 results for a query that has hits
+    # (seen ~1 in 3 calls), so an empty answer is retried a few times before giving up.
+    res = []
+    for attempt in range(5):
+        res = _jm_get('tracks', search=query, limit=limit, audioformat='mp31',
+                      boost='popularity_month')
+        if res:
+            break
+        time.sleep(0.6)
     out = []
     for t in res:
         tid = _jm_remember(t)
