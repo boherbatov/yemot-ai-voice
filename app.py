@@ -43,6 +43,113 @@ PS4_UA = 'Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15 (K
 TV_CLIENT_VER = '7.20260916.14.00'
 YT_OAUTH_CLIENT_ID = '861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com'
 YT_OAUTH_CLIENT_SECRET = 'SboVhoG9s0rNafixCSGGKXAT'
+# Private cookie bootstrapping from the service's encrypted environment store.
+# Never emit cookie bytes, encoded data, values, domains or exception details.
+import base64, tempfile, stat
+
+_COOKIE_MAX = 256 * 1024
+_COOKIE_BOOT = {'configured': False, 'ok': False}
+
+
+def _cookie_metadata(raw):
+    if not 0 < len(raw) <= _COOKIE_MAX:
+        raise ValueError('invalid cookie file')
+    text = raw.decode('utf-8-sig', errors='strict')
+    lines = text.splitlines()
+    if not lines or not re.fullmatch(r'# (?:Netscape )?HTTP Cookie File', lines[0].strip()):
+        raise ValueError('invalid cookie file')
+    count, present = 0, set()
+    for line in lines[1:]:
+        if not line.strip() or (line.startswith('#') and not line.startswith('#HttpOnly_')):
+            continue
+        if line.startswith('#HttpOnly_'):
+            line = line[len('#HttpOnly_'):]
+        fields = line.split('\t')
+        if len(fields) != 7:
+            raise ValueError('invalid cookie file')
+        domain, subdomains, path, secure, expiry, name, value = fields
+        host = domain.lstrip('.').lower()
+        if not any(host == root or host.endswith('.' + root) for root in ('youtube.com', 'google.com')):
+            raise ValueError('invalid cookie file')
+        if (subdomains not in ('TRUE', 'FALSE') or secure not in ('TRUE', 'FALSE')
+                or not path.startswith('/') or not re.fullmatch(r'\d+', expiry)
+                or not name or any(ord(c) < 32 or ord(c) == 127 for c in line.replace('\t', ''))):
+            raise ValueError('invalid cookie file')
+        count += 1
+        if (host == 'youtube.com' or host.endswith('.youtube.com')) and value:
+            present.add(name)
+    if not count:
+        raise ValueError('invalid cookie file')
+    return {'cookie_count': count, 'file_size': len(raw),
+            'youtube_sid': 'SID' in present, 'youtube_hsid': 'HSID' in present,
+            'youtube_apisid': 'APISID' in present}
+
+
+def _bootstrap_youtube_cookies():
+    encoded = os.environ.get('YT_COOKIES_B64', '').strip()
+    if not encoded:
+        return
+    _COOKIE_BOOT['configured'] = True
+    tmp_path = None
+    try:
+        if len(encoded) > ((_COOKIE_MAX + 2) // 3) * 4:
+            raise ValueError('invalid cookie file')
+        raw = base64.b64decode(encoded, validate=True)
+        metadata = _cookie_metadata(raw)
+        # Require the authenticated YouTube cookie set rather than silently
+        # accepting a Google-only/anonymous export as account connection.
+        if not all(metadata[k] for k in ('youtube_sid', 'youtube_hsid', 'youtube_apisid')):
+            raise ValueError('authenticated YouTube cookie set missing')
+        directory = os.environ.get('YT_COOKIE_STORAGE_DIR', '/tmp/yemot-youtube-private')
+        if not os.path.isabs(directory) or os.path.islink(directory):
+            raise ValueError('invalid cookie directory')
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        if not os.path.isdir(directory):
+            raise ValueError('invalid cookie directory')
+        os.chmod(directory, 0o700)
+        target = os.path.join(directory, 'youtube.cookies.txt')
+        fd, tmp_path = tempfile.mkstemp(prefix='.cookie-', dir=directory)
+        with os.fdopen(fd, 'wb') as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(raw); output.flush(); os.fsync(output.fileno())
+        os.replace(tmp_path, target); tmp_path = None
+        os.environ['YT_COOKIES_FILE'] = target
+        _COOKIE_BOOT.update({'ok': True, **metadata})
+        log.info('YouTube cookie bootstrap metadata: %s', json.dumps(metadata, sort_keys=True))
+    except Exception:
+        # No malformed credential, decoded content or exception text in logs.
+        log.error('YouTube cookie bootstrap failed (details suppressed)')
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+_bootstrap_youtube_cookies()
+
+
+def _active_cookie_file():
+    if _COOKIE_BOOT['configured'] and not _COOKIE_BOOT['ok']:
+        raise RuntimeError('YouTube cookie bootstrap unavailable')
+    path = os.environ.get('YT_COOKIES_FILE', '').strip()
+    if not path:
+        return None
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise RuntimeError('YouTube cookie file unavailable')
+    return path
+
+
+class _CookieSafeYDLLogger:
+    def debug(self, msg):
+        pass
+    def warning(self, msg):
+        log.warning('YouTube extractor warning (details suppressed)')
+    def error(self, msg):
+        log.warning('YouTube extractor error (details suppressed)')
+
 _YT = {'at': None, 'at_exp': 0.0, 'key': None, 'vd': None, 'sts': None, 'cfg_at': 0.0}
 
 def _yt_token():
@@ -224,12 +331,19 @@ def yt_download(video_id, outtmpl):
             'match_filter': lambda info, **kw: 'song too long' if (info.get('duration') or 0) > 600 else None,
             'socket_timeout': 20, 'retries': 1,
         }
+        cookie_file = _active_cookie_file()
+        if cookie_file:
+            opts['cookiefile'] = cookie_file
+            opts['logger'] = _CookieSafeYDLLogger()
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=True)
         if not info:
             raise ValueError('song too long or no downloadable media')
         return info.get('title') or 'שיר', info.get('duration')
     except Exception as e:
+        if _COOKIE_BOOT['configured'] or os.environ.get('YT_COOKIES_FILE'):
+            log.warning('authenticated YouTube download failed (details suppressed)')
+            raise RuntimeError('YouTube download unavailable') from None
         log.warning('mweb PO-token download failed for %s: %s; trying existing TV route', video_id, e)
         return yt_download_tv(video_id, outtmpl)
 
