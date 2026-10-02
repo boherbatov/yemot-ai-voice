@@ -183,7 +183,7 @@ def yt_player(video_id):
     vd = r.get('videoDetails') or {}
     return vd.get('title') or 'שיר', vd.get('lengthSeconds'), ps.get('status')
 
-def yt_download(video_id, outtmpl):
+def yt_download_tv(video_id, outtmpl):
     """yt-dlp download through the authenticated TV client (PS4 UA) with deno decipher."""
     import yt_dlp
     from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS
@@ -210,6 +210,29 @@ def yt_download(video_id, outtmpl):
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
     return title, duration
+def yt_download(video_id, outtmpl):
+    """Use the official mweb PO-token route; retain the old TV path as fallback."""
+    import yt_dlp
+    try:
+        opts = {
+            'format': 'bestaudio/best', 'outtmpl': outtmpl,
+            'quiet': True, 'no_warnings': False, 'noplaylist': True,
+            'remote_components': ['ejs:github'],
+            'js_runtimes': {'deno': {}},
+            'extractor_args': {'youtube': {'player_client': ['mweb']},
+                               'youtubepot-bgutilhttp': {'base_url': ['http://127.0.0.1:4416']}},
+            'match_filter': lambda info, **kw: 'song too long' if (info.get('duration') or 0) > 600 else None,
+            'socket_timeout': 20, 'retries': 1,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=True)
+        if not info:
+            raise ValueError('song too long or no downloadable media')
+        return info.get('title') or 'שיר', info.get('duration')
+    except Exception as e:
+        log.warning('mweb PO-token download failed for %s: %s; trying existing TV route', video_id, e)
+        return yt_download_tv(video_id, outtmpl)
+
 EDGE_VOICE = os.environ.get('EDGE_VOICE', 'he-IL-HilaNeural')
 EDGE_RATE = os.environ.get('EDGE_RATE', '+25%')
 EXT_DIR = os.environ.get('YM_AI_EXT', '/1')          # the api extension folder
