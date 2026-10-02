@@ -727,8 +727,27 @@ def upload_reply(text, call_id, turn):
     return name, ym_path
 
 STT_HALLUCINATIONS = ('תודה שצפיתם', 'תודה על הצפייה', 'כתוביות', 'תרגום', 'amara', 'subtitles', 'סאבטייטלס', 'לייק ושתף', 'הירשמו לערוץ')
-BYE_RE = re.compile(r'^\W*(?:ביי(?: ביי)?|להתראות|שלום ולהתראות|תודה ולהתראות|תודה ביי|תודה זהו|זהו תודה|זהו|די תודה|סיימתי|יום טוב|לילה טוב)\W*$')
+BYE_RE = re.compile(r'^\W*(?:ביי(?: ביי)?|בי|להתראות|שלום ולהתראות|תודה ולהתראות|תודה ביי|תודה זהו|זהו תודה|זהו|די תודה|סיימתי|יום טוב|לילה טוב)\W*$')
 BACK_RE = re.compile(r'^\W*(?:חזרה לתפריט(?: הראשי)?|חזור לתפריט(?: הראשי)?|תפריט(?: ראשי)?|חזרה)\W*$')
+
+SILENCE_RMS = 25        # 16-bit RMS below this = nothing was said
+HALLUC_THANKS_RMS = 120  # a lone "תודה רבה" on a very quiet recording is Whisper's silence hallucination
+
+def audio_rms(wav_bytes):
+    """RMS of a PCM16 WAV, or None if it can't be measured."""
+    try:
+        import array
+        w = wave.open(io.BytesIO(wav_bytes))
+        if w.getsampwidth() != 2:
+            return None
+        a = array.array('h'); a.frombytes(w.readframes(w.getnframes()))
+        if w.getnchannels() > 1:
+            a = a[::w.getnchannels()]
+        if not len(a):
+            return 0.0
+        return (sum(x * x for x in a) / len(a)) ** 0.5
+    except Exception:
+        return None
 
 def clean_stt(text):
     """Whisper invents subtitle phrases on silence; treat those as nothing heard."""
@@ -2762,6 +2781,8 @@ HEB_STOP = {'מה','מי','איפה','מתי','איך','למה','כמה','את',
 
 TIMELY = re.compile(r'(?<![א-ת])ה?(?:חדשות|מזג|אתמול|היום|השבוע|ניצח|זכה|מחיר|שער|תוצאות|כותרות|עדכני|בחירות|מלחמ|ממשלה|נתניהו)')
 
+PLAIN_NEWS = re.compile(r'(?<![א-ת])ה?(?:חדשות|כותרות)')
+
 def hub_sources(query):
     """Return (context_text, sources). Only relevant hits, each with source name and date."""
     import html
@@ -2791,7 +2812,8 @@ def hub_sources(query):
         try:
             heads = news_headlines(5)
             if heads:
-                lines.append(f"מקור: כותרות ynet, נשלפו בזמן השיחה ({today()}), ייתכן שאינן עונות על השאלה: " + ' | '.join(heads))
+                hedge = '' if PLAIN_NEWS.search(query) else ', ייתכן שאינן עונות על השאלה'
+                lines.append(f"מקור: כותרות ynet, נשלפו בזמן השיחה ({today()}){hedge}: " + ' | '.join(heads))
         except Exception as e:
             log.info('hub news ctx failed: %s', e)
     return '\n'.join(lines), len(lines)
@@ -3833,7 +3855,15 @@ def yemot():
             claimed_recordings.add(rec_path)
         wav = ym_download('ivr2:' + rec_path if not rec_path.startswith('ivr2:') else rec_path)
         try:
-            user_text = clean_stt(groq_stt(wav, min_dur=0.5))
+            rms = audio_rms(wav)
+            if rms is not None and rms < SILENCE_RMS:
+                log.info('call=%s turn=%d silent recording rms=%.1f, skipping STT', call_id, turn, rms)
+                user_text = ''
+            else:
+                user_text = clean_stt(groq_stt(wav, min_dur=0.5))
+                if rms is not None and rms < HALLUC_THANKS_RMS and re.sub(r'[^\w ]', '', user_text).strip() in ('תודה', 'תודה רבה'):
+                    log.info('call=%s turn=%d lone thanks on quiet audio rms=%.1f, treated as silence', call_id, turn, rms)
+                    user_text = ''
         except Exception as e:
             log.error('call=%s stt failed: %s', call_id, str(e)[:200])
             with lock:
