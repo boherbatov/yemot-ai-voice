@@ -2291,17 +2291,16 @@ HUB_NEWSY_SYSTEM = (
 )
 
 HUB_ASSISTANTS = {
-    '1': {'model': 'groq', 'system': 'ozen', 'web': 'factualish', 'intro': None},
-    '2': {'model': 'gemini', 'system': 'chulin', 'web': 'always', 'intro': 'hub_chulin_intro'},
-    '3': {'model': 'groq', 'system': 'newsy', 'web': 'always', 'intro': 'hub_newsy_intro'},
+    '1': {'model': 'gemini', 'system': 'ozen', 'web': 'factualish', 'intro': 'hub_gemini_intro'},
+    '2': {'model': 'groq', 'system': 'ozen', 'web': 'factualish', 'intro': 'hub_groq_intro'},
 }
 
 HUB_PROMPTS = {
-    'hub_menu': 'מרכז עוזרי הבינה המלאכותית. לאוזן, החברה הוירטואלית לשיחה על הכל, הקישו 1. לחולין, הצ׳אטבוט השובב, הקישו 2. לעוזרת המידע העדכני, מחוברת לויקיפדיה ולחדשות האחרונות, הקישו 3. לחזרה לתפריט הראשי, הקישו 0.',
-    'hub_chulin_intro': 'היי, אני חולין! שאלו אותי כל שאלה, גם על דברים שקורים עכשיו בעולם. דברו אחרי הצליל, ולסיום הקישו סולמית.',
-    'hub_newsy_intro': 'היי! אני עוזרת המידע. אני מחוברת לויקיפדיה ולכותרות החדשות האחרונות, אז אפשר לשאול מה קורה בעולם עכשיו, או כל שאלה עובדתית. דברו אחרי הצליל, ולסיום הקישו סולמית.',
+    'hub_menu': 'בחרו מודל לשיחה. לג׳מיני הקישו 1. לגרוק הקישו 2. לחזרה לתפריט הראשי, הקישו 0.',
+    'hub_gemini_intro': 'בחרתם ג׳מיני. דברו אחרי הצליל, ולסיום הקישו סולמית.',
+    'hub_groq_intro': 'בחרתם גרוק. דברו אחרי הצליל, ולסיום הקישו סולמית.',
 }
-HUB_PROMPT_VERSION = 'v1'
+HUB_PROMPT_VERSION = 'v3two' 
 
 CHULIN_SYSTEM = (
     'את "חולין", צ׳אטבוט קולי שובב וחכם בקו טלפוני. '
@@ -3325,8 +3324,8 @@ def yemot():
                 intro = 'greeting_back' if (h.get('summary') or h.get('turns')) else 'greeting_new'
             return text_response(f'read=f-{intro}=S{turn+1},no,record,{IN_DIR},,no')
         return text_response(f'read=f-hub_menu=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
-    sess.setdefault('assistant', '1')
-    assist = HUB_ASSISTANTS.get(sess['assistant'], HUB_ASSISTANTS['1'])
+    sess.setdefault('assistant', '2')
+    assist = HUB_ASSISTANTS.get(sess['assistant'], HUB_ASSISTANTS['2'])
 
     t0 = time.time()
     try:
