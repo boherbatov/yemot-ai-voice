@@ -150,6 +150,79 @@ class _CookieSafeYDLLogger:
     def error(self, msg):
         log.warning('YouTube extractor error (details suppressed)')
 
+from flask import g, has_request_context
+def _redact_cookie_diagnostic(message):
+    text = str(message)
+    # Replace known secret values before any truncation or normalization.
+    for key in ('YT_COOKIES_B64', 'YT_REFRESH_TOKEN', 'BRIDGE_SECRET', 'YM_PASS', 'YM_SYSTEM',
+                'GROQ_API_KEY', 'GEMINI_API_KEY', 'TELEGRAM_SESSION', 'TELEGRAM_API_HASH'):
+        value = os.environ.get(key, '')
+        if value:
+            text = text.replace(value, '[redacted]')
+    try:
+        path = _active_cookie_file()
+        if path:
+            with open(path, encoding='utf-8-sig') as source:
+                for line in source:
+                    fields = line.rstrip('\r\n').split('\t')
+                    if len(fields) == 7 and len(fields[6]) >= 3:
+                        text = text.replace(fields[6], '[redacted]')
+    except Exception:
+        return 'diagnostic redaction unavailable'
+    text = re.sub(r'https?://[^\s]+', '[URL redacted]', text)
+    text = re.sub(r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}', '[email redacted]', text)
+    text = re.sub(r'(?im)(authorization|cookie|set-cookie)\s*[:=].*$', r'\1: [redacted]', text)
+    text = re.sub(r'[A-Za-z0-9_+/.=-]{60,}', '[long value redacted]', text)
+    text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+    return text[:1500]
+
+
+class _CookieDiagnosticYDLLogger:
+    def debug(self, msg):
+        pass
+    def warning(self, msg):
+        if len(g.cookie_diagnostic) < 6:
+            g.cookie_diagnostic.append({'level': 'warning', 'message': _redact_cookie_diagnostic(msg)})
+    def error(self, msg):
+        if len(g.cookie_diagnostic) < 6:
+            g.cookie_diagnostic.append({'level': 'error', 'message': _redact_cookie_diagnostic(msg)})
+
+
+_MUSIC_DIAG_LOCK = threading.Lock()
+_MUSIC_DIAG_USED = False
+@app.route('/music-download-diagnostic', methods=['POST'])
+def music_download_diagnostic():
+    global _MUSIC_DIAG_USED
+    if not admin_secret_ok():
+        return 'forbidden', 403
+    with _MUSIC_DIAG_LOCK:
+        if _MUSIC_DIAG_USED:
+            return {'error': 'already used'}, 409
+        _MUSIC_DIAG_USED = True
+    report = []
+    # Real relevant singer results after the first passing LC-MEfJW1LU.
+    for ident in ('sbaIhyj74R8', 'o9XLqfVRIbY', 'OVAcZXsePYI'):
+        g.cookie_diagnostic = []
+        tmp = f'/tmp/stest-diag-{time.time_ns()}'
+        row = {'video_id': ident}
+        started = time.monotonic()
+        try:
+            title, duration = yt_download(ident, tmp + '.%(ext)s')
+            row.update(ok=True, title=_redact_cookie_diagnostic(title), duration=duration)
+        except Exception as exc:
+            row.update(ok=False, error=_redact_cookie_diagnostic(exc))
+        finally:
+            import glob
+            for path in glob.glob(tmp + '.*'):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        row['warnings'] = g.cookie_diagnostic
+        row['elapsed_s'] = round(time.monotonic()-started, 2)
+        report.append(row)
+    return {'videos': report}
+
 from youtube_solver_check import check as _youtube_solver_check
 _YT_SOLVER_READY = _youtube_solver_check()
 log.info('YouTube solver readiness: %s', json.dumps(_YT_SOLVER_READY, sort_keys=True))
@@ -382,7 +455,7 @@ def yt_download(video_id, outtmpl):
         cookie_file = _active_cookie_file()
         if cookie_file:
             opts['cookiefile'] = cookie_file
-            opts['logger'] = _CookieSafeYDLLogger()
+            opts['logger'] = _CookieDiagnosticYDLLogger() if has_request_context() and hasattr(g, 'cookie_diagnostic') else _CookieSafeYDLLogger()
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=True)
         if not info:
@@ -398,6 +471,8 @@ def yt_download(video_id, outtmpl):
         return info.get('title') or 'שיר', info.get('duration')
     except Exception as e:
         if _COOKIE_BOOT['configured'] or os.environ.get('YT_COOKIES_FILE'):
+            if has_request_context() and hasattr(g, 'cookie_diagnostic'):
+                g.cookie_diagnostic.append({'level': 'exception', 'message': _redact_cookie_diagnostic(e)})
             log.warning('authenticated YouTube download failed (details suppressed)')
             raise RuntimeError('YouTube download unavailable') from None
         log.warning('mweb PO-token download failed for %s: %s; trying existing TV route', video_id, e)
