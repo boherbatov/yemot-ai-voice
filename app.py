@@ -2637,10 +2637,18 @@ def fetch_pod(call_id, pod_idx, ep_idx, pod=None):
                     f.write(source)
                 proc = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-v', 'error',
                                       '-i', source_path, '-vn', '-ar', '8000', '-ac', '1',
-                                      '-f', 'wav', 'pipe:1'], capture_output=True, timeout=600)
+                                      '-f', 's16le', 'pipe:1'], capture_output=True, timeout=600)
                 if proc.returncode:
                     raise RuntimeError('podcast decoding: ' + proc.stderr.decode('utf-8', 'ignore')[-400:])
-                data = proc.stdout
+                # A WAV piped by ffmpeg has unknown length in its header.
+                # Wrap raw PCM ourselves so Yemot sees an accurate duration.
+                buf = io.BytesIO()
+                with wave.open(buf, 'wb') as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(8000)
+                    w.writeframes(proc.stdout)
+                data = buf.getvalue()
             del source
             name = 'pod' + safe_name(call_id)[-16:]
             ym_upload(data, name + '.wav', f'/3/{name}.wav')
