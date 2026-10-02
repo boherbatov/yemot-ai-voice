@@ -709,11 +709,14 @@ ARTIST_PAGE_LIMIT = 25     # results screen announces the first 25 (5 pages of 5
 LIB_DIR = os.environ.get('YM_LIB_EXT', '/16')            # playlists root extension
 
 def ym_list_files(path):
-    r = ym_get('GetIVR2Dir', path=ym_p(path))
-    d = r.json()
+    # GetFiles includes marker/text files; GetIVR2Dir supplies subdirectories.
+    # Neither response alone contains the complete listing.
+    d = ym_get('GetFiles', path=ym_p(path)).json()
     if d.get('responseStatus') != 'OK':
         return []
-    return (d.get('files') or []) + [dict(f, fileType='EXT') for f in (d.get('dirs') or [])]
+    dirs = ym_get('GetIVR2Dir', path=ym_p(path)).json()
+    return (d.get('files') or []) + [dict(f, fileType='EXT')
+                                    for f in (dirs.get('dirs') or [])]
 
 def playlist_next_number():
     nums = []
