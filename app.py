@@ -150,79 +150,6 @@ class _CookieSafeYDLLogger:
     def error(self, msg):
         log.warning('YouTube extractor error (details suppressed)')
 
-from flask import g, has_request_context
-def _redact_cookie_diagnostic(message):
-    text = str(message)
-    # Replace known secret values before any truncation or normalization.
-    for key in ('YT_COOKIES_B64', 'YT_REFRESH_TOKEN', 'BRIDGE_SECRET', 'YM_PASS', 'YM_SYSTEM',
-                'GROQ_API_KEY', 'GEMINI_API_KEY', 'TELEGRAM_SESSION', 'TELEGRAM_API_HASH'):
-        value = os.environ.get(key, '')
-        if value:
-            text = text.replace(value, '[redacted]')
-    try:
-        path = _active_cookie_file()
-        if path:
-            with open(path, encoding='utf-8-sig') as source:
-                for line in source:
-                    fields = line.rstrip('\r\n').split('\t')
-                    if len(fields) == 7 and len(fields[6]) >= 3:
-                        text = text.replace(fields[6], '[redacted]')
-    except Exception:
-        return 'diagnostic redaction unavailable'
-    text = re.sub(r'https?://[^\s]+', '[URL redacted]', text)
-    text = re.sub(r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}', '[email redacted]', text)
-    text = re.sub(r'(?im)(authorization|cookie|set-cookie)\s*[:=].*$', r'\1: [redacted]', text)
-    text = re.sub(r'[A-Za-z0-9_+/.=-]{60,}', '[long value redacted]', text)
-    text = re.sub(r'\x1b\[[0-9;]*m', '', text)
-    return text[:1500]
-
-
-class _CookieDiagnosticYDLLogger:
-    def debug(self, msg):
-        pass
-    def warning(self, msg):
-        if len(g.cookie_diagnostic) < 6:
-            g.cookie_diagnostic.append({'level': 'warning', 'message': _redact_cookie_diagnostic(msg)})
-    def error(self, msg):
-        if len(g.cookie_diagnostic) < 6:
-            g.cookie_diagnostic.append({'level': 'error', 'message': _redact_cookie_diagnostic(msg)})
-
-
-_MUSIC_DIAG_LOCK = threading.Lock()
-_MUSIC_DIAG_USED = False
-@app.route('/music-download-diagnostic', methods=['POST'])
-def music_download_diagnostic():
-    global _MUSIC_DIAG_USED
-    if not admin_secret_ok():
-        return 'forbidden', 403
-    with _MUSIC_DIAG_LOCK:
-        if _MUSIC_DIAG_USED:
-            return {'error': 'already used'}, 409
-        _MUSIC_DIAG_USED = True
-    report = []
-    # Real relevant singer results after the first passing LC-MEfJW1LU.
-    for ident in ('sbaIhyj74R8', 'o9XLqfVRIbY', 'OVAcZXsePYI'):
-        g.cookie_diagnostic = []
-        tmp = f'/tmp/stest-diag-{time.time_ns()}'
-        row = {'video_id': ident}
-        started = time.monotonic()
-        try:
-            title, duration = yt_download(ident, tmp + '.%(ext)s')
-            row.update(ok=True, title=_redact_cookie_diagnostic(title), duration=duration)
-        except Exception as exc:
-            row.update(ok=False, error=_redact_cookie_diagnostic(exc))
-        finally:
-            import glob
-            for path in glob.glob(tmp + '.*'):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-        row['warnings'] = g.cookie_diagnostic
-        row['elapsed_s'] = round(time.monotonic()-started, 2)
-        report.append(row)
-    return {'videos': report}
-
 from youtube_solver_check import check as _youtube_solver_check
 _YT_SOLVER_READY = _youtube_solver_check()
 log.info('YouTube solver readiness: %s', json.dumps(_YT_SOLVER_READY, sort_keys=True))
@@ -280,10 +207,17 @@ def _yt_result_rows(data):
         if key in data:
             roots.append(data[key])
     rows, tokens, seen = [], [], set()
-    def add(ident, title):
+    def add(ident, title, duration_text=''):
         ident, title = str(ident or ''), _yt_result_title(title)
         if not re.fullmatch(r'[A-Za-z0-9_-]{11}', ident) or not title or ident in seen:
             return
+        duration_text = _yt_result_title(duration_text)
+        if re.fullmatch(r'\d+(?::\d{1,2}){1,2}', duration_text):
+            seconds = 0
+            for part in duration_text.split(':'):
+                seconds = seconds * 60 + int(part)
+            if seconds > 600:
+                return
         seen.add(ident); rows.append((ident, title))
     def walk(obj):
         if isinstance(obj, dict):
@@ -293,7 +227,7 @@ def _yt_result_rows(data):
                 add(lv.get('contentId'), metadata.get('title'))
             vr = obj.get('videoRenderer')
             if isinstance(vr, dict):
-                add(vr.get('videoId'), vr.get('title'))
+                add(vr.get('videoId'), vr.get('title'), vr.get('lengthText'))
             cc = obj.get('continuationCommand')
             if isinstance(cc, dict) and cc.get('token'):
                 tokens.append(cc['token'])
@@ -435,6 +369,16 @@ def yt_download_tv(video_id, outtmpl):
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
     return title, duration
+class SongTooLongError(ValueError):
+    pass
+
+def _song_duration_filter(info, **kwargs):
+    duration = info.get('duration')
+    if isinstance(duration, (int, float)) and duration > 600:
+        log.warning('YouTube download refused by duration cap: %ss > 600s', duration)
+        raise SongTooLongError('song exceeds 10-minute limit')
+    return None
+
 def yt_download(video_id, outtmpl):
     """Use the official mweb PO-token route; retain the old TV path as fallback."""
     import yt_dlp
@@ -449,13 +393,14 @@ def yt_download(video_id, outtmpl):
             'js_runtimes': {'deno': {'path': os.environ.get('YT_DENO_PATH', '/opt/venv/bin/deno')}},
             'extractor_args': {'youtube': {'player_client': ['mweb']},
                                'youtubepot-bgutilhttp': {'base_url': ['http://127.0.0.1:4416']}},
-            'match_filter': lambda info, **kw: 'song too long' if (info.get('duration') or 0) > 600 else None,
+            'match_filter': _song_duration_filter,
+            'cachedir': False,
             'socket_timeout': 20, 'retries': 1,
         }
         cookie_file = _active_cookie_file()
         if cookie_file:
             opts['cookiefile'] = cookie_file
-            opts['logger'] = _CookieDiagnosticYDLLogger() if has_request_context() and hasattr(g, 'cookie_diagnostic') else _CookieSafeYDLLogger()
+            opts['logger'] = _CookieSafeYDLLogger()
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=True)
         if not info:
@@ -469,10 +414,10 @@ def yt_download(video_id, outtmpl):
             log.warning('YouTube download returned metadata but produced no media file')
             raise ValueError('download produced no media file')
         return info.get('title') or 'שיר', info.get('duration')
+    except SongTooLongError:
+        raise
     except Exception as e:
         if _COOKIE_BOOT['configured'] or os.environ.get('YT_COOKIES_FILE'):
-            if has_request_context() and hasattr(g, 'cookie_diagnostic'):
-                g.cookie_diagnostic.append({'level': 'exception', 'message': _redact_cookie_diagnostic(e)})
             log.warning('authenticated YouTube download failed (details suppressed)')
             raise RuntimeError('YouTube download unavailable') from None
         log.warning('mweb PO-token download failed for %s: %s; trying existing TV route', video_id, e)
@@ -1043,6 +988,7 @@ SONG_PROMPTS = {
     'song_searching': 'רגע אחד, אני מחפשת את השיר. זה יכול לקחת חצי דקה.',
     'song_wait': 'עוד ממש קצת, השיר כבר בדרך.',
     'song_notfound': 'סליחה, לא מצאתי את זה. נסו שוב.',
+    'song_too_long': 'השיר ארוך מעשר דקות ולכן אי אפשר להשמיע אותו בקו. בחרו שיר קצר יותר.',
     'song_disk': 'השרת עמוס כרגע ואין מקום להוריד את השיר. נסו שוב בעוד דקה או שתיים.',
     'song_more': 'מה בא לכם עכשיו?',
     'song_bye': 'כיף היה! נתראה בשיר הבא. להתראות!',
@@ -1082,9 +1028,9 @@ LIB_PROMPTS = ('lib_pick', 'lib_bad', 'lib_choose', 'lib_for', 'lib_for_list', '
 
 # prompts the extension-2 upgrade needs on Yemot; uploaded once by _auto_setup_song2
 SONG2_NEW_PROMPTS = ('song_mode', 'song_how', 'song_typehow', 'song_artist', 'song_artist_voice',
-                     'artist_typehow', 'song_ask', 'song_more', 'song_notfound', 'song_after',
+                     'artist_typehow', 'song_ask', 'song_more', 'song_notfound', 'song_too_long', 'song_after',
                      'song_artist_ask', 'song_auto_next', 'song_queue_done', 'song_radio_on', 'song_after_free', 'song_disk')
-SONG2_PROMPT_VERSION = 'v6disk'
+SONG2_PROMPT_VERSION = 'v_download_duration_20261002'
 
 ARTIST_RESULT_LIMIT = 60   # singer radio: everything the paginated search yields
 ARTIST_PAGE_LIMIT = 25     # results screen announces the first 25 (5 pages of 5)
@@ -1259,7 +1205,7 @@ def fetch_queue_song(call_id, idx):
     except Exception as e:
         if job.get(f'{key}_want') == idx:
             log.warning('queue song failed call=%s idx=%s: %s', call_id, idx, e)
-            job.update(**{f'{key}_status': 'error', f'{key}_err': 'disk' if isinstance(e, DiskLowError) else str(e)[:200]})
+            job.update(**{f'{key}_status': 'error', f'{key}_err': 'disk' if isinstance(e, DiskLowError) else 'too_long' if isinstance(e, SongTooLongError) else str(e)[:200]})
     finally:
         _cleanup_tmp(tmp)
 
@@ -1371,7 +1317,10 @@ def fetch_results(call_id, query):
     if not job:
         return
     try:
+        search_started = time.monotonic()
         results = yt_search_results(query, limit=15)
+        log.info('song search phase elapsed=%.2fs count=%d', time.monotonic()-search_started, len(results))
+        menu_started = time.monotonic()
         cid = re.sub(r'\D', '', call_id)[-6:]
         pages = []
         for p in range(0, len(results), 5):
@@ -1386,6 +1335,7 @@ def fetch_results(call_id, query):
             ym_upload(tts_wav(' '.join(parts)), name + '.wav', f'{SONG_DIR}/{name}.wav')
             pages.append(name)
         job.update(status='ready', results=results, pages=pages, page_idx=0)
+        log.info('song menu TTS/upload phase elapsed=%.2fs pages=%d', time.monotonic()-menu_started, len(pages))
         log.info('song results call=%s: %d results, %d pages', call_id, len(results), len(pages))
     except Exception as e:
         log.warning('song results failed call=%s: %s', call_id, e)
@@ -1460,6 +1410,9 @@ def wait_step(call_id, job, turn):
             job['started'] = time.time()
             start_prefetch(call_id, idx + 1, force=True)
             return wait_step(call_id, job, turn)
+        if job.get(f'{key}_err') == 'too_long':
+            job.update(stage='ask', status='idle', mode='single')
+            return text_response('read=f-song_too_long.f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
         job.update(stage='ask', status='idle', mode='single')
         return text_response(f'read=f-song_notfound.f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
     queue = job.get('queue') or []
