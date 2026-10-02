@@ -3568,7 +3568,7 @@ def _auto_setup_pniot():
         except Exception as e:
             log.warning('pniot marker failed: %s', e)
 
-ROOT_MENU_TEXT = 'ברוכים הבאים! למרכז עוזרי הבינה המלאכותית, הקישו 1. לשירים מיוטיוב ולרשימות השירים שלכם, הקישו 2. לפודקאסטים, הקישו 3. לויקיפדיה, הקישו 4. לפניות להנהלה, הקישו 5. לתרגום, הקישו 6. למרכז החדשות, הקישו 7. לחזרה להאזנה אחרונה, הקישו סולמית.'
+ROOT_MENU_TEXT = 'ברוכים הבאים! למרכז עוזרי הבינה המלאכותית, הקישו 1. לשירים מיוטיוב ולרשימות השירים שלכם, הקישו 2. לפודקאסטים, הקישו 3. לויקיפדיה, הקישו 4. לחזרה להאזנה אחרונה, הקישו סולמית.'
 
 POD_PROMPT_VERSION = 'v3'
 
@@ -3606,15 +3606,15 @@ def _auto_setup_pod3():
 
 threading.Thread(target=_auto_setup_pod3, daemon=True).start()
 
-threading.Thread(target=_auto_setup_pniot, daemon=True).start()
+# Extension 5 installer disabled by owner request; implementation retained.
 
-threading.Thread(target=_auto_setup_newscenter, daemon=True).start()
+# Extension 7/8 installer disabled by owner request; implementation retained.
 
 threading.Thread(target=_auto_setup_hub, daemon=True).start()
 
 threading.Thread(target=_auto_setup_song2, daemon=True).start()
 
-threading.Thread(target=_auto_setup_chulin, daemon=True).start()
+# Extension 9 installer disabled by owner request; implementation retained.
 
 def _auto_setup_library():
     if not (YM_SYSTEM and YM_PASS):
@@ -3639,3 +3639,22 @@ threading.Thread(target=_auto_setup_library, daemon=True).start()
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
 
+
+# Owner-requested IVR tree: preserve code/media, remove access to 5-9.
+def _auto_prune_ivr_tree():
+    import urllib.parse
+    if not (YM_SYSTEM and YM_PASS and BRIDGE_SECRET):
+        return
+    time.sleep(6)
+    try:
+        for ext in ('5', '6', '7', '8', '9'):
+            ym_upload_text('type=go_to_folder\ngo_to_folder=/\n', f'ivr2:/{ext}/ext.ini')
+        # Keep the resume shortcut even though the former news installer is disabled.
+        link = f'{PUBLIC_BASE_URL}/yemot-resume?secret={urllib.parse.quote(BRIDGE_SECRET)}'
+        ym_upload_text(f'type=api\napi_link={link}\napi_dir=/7\napi_url_post=no\n', 'ivr2:/#/ext.ini')
+        ym_upload(tts_wav(ROOT_MENU_TEXT), '000.wav', '/000.wav')
+        log.info('owner IVR tree applied: 1-4, resume#, removed 5-9 access')
+    except Exception as e:
+        log.exception('owner IVR tree update failed: %s', e)
+
+threading.Thread(target=_auto_prune_ivr_tree, daemon=True).start()
