@@ -16,4 +16,4 @@ for i in range(5):
     except Exception:
         time.sleep(1)
 PYTEST
-/opt/venv/bin/gunicorn -b 0.0.0.0:${PORT:-10000} -w 1 -k gthread --threads 8 -t 180 --access-logfile - app:app
+/opt/venv/bin/gunicorn -b 0.0.0.0:${PORT:-10000} -w 1 -k gthread --threads 8 -t 180 --access-logfile - --access-logformat '%(h)s %(t)s "%(m)s %(U)s" %(s)s %(b)s %(L)s' app:app

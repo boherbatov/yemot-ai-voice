@@ -451,6 +451,7 @@ SYSTEM_PROMPT = (
 )
 
 sessions = {}
+claimed_recordings = set()   # recordings already taken by a call (concurrent-call safety)
 stats = {'calls': 0, 'turns': 0, 'started': time.time(), 'errors': 0}
 lock = threading.Lock()
 
@@ -527,9 +528,14 @@ def ym_delete(ym_path):
 def ym_newest_file(ym_dir):
     j = ym_get('GetIVR2Dir', path=ym_p(ym_dir)).json()
     files = j.get('files') or []
-    if not files:
-        return None
-    return ym_dir.rstrip('/') + '/' + sorted(f['name'] for f in files)[-1]
+    base = ym_dir.rstrip('/') + '/'
+    with lock:
+        free = [f['name'] for f in files if base + f['name'] not in claimed_recordings]
+        if not free:
+            return None
+        pick = sorted(free)[-1]
+        claimed_recordings.add(base + pick)
+    return base + pick
 
 # ---------- History (stored on Yemot as .txt) ----------
 
@@ -538,25 +544,58 @@ def hist_path(phone):
     return f'{HIST_DIR}/{safe}.txt'
 
 def load_history(phone):
+    fresh = {'summary': '', 'turns': [], 'day': '', 'day_turns': 0}
     if not phone:
-        return {'summary': '', 'turns': [], 'day': '', 'day_turns': 0}
+        return fresh
+    p = hist_path(phone)
     try:
-        data = ym_download(hist_path(phone)).decode('utf-8')
-        h = json.loads(data)
+        try:
+            data = ym_download(p).decode('utf-8')
+            h = json.loads(data)
+        except Exception:
+            # an interrupted swap may leave only the temp copy
+            data = ym_download(p[:-4] + '.new').decode('utf-8')
+            h = json.loads(data)
+        if not isinstance(h, dict):
+            raise ValueError('history is not an object')
         h.setdefault('summary', ''); h.setdefault('turns', [])
         return h
-    except Exception:
-        return {'summary': '', 'turns': [], 'day': '', 'day_turns': 0}
+    except Exception as e:
+        # Distinguish "no history yet" from "could not read it": only a confirmed
+        # missing file may be treated as fresh. Otherwise block saving so a
+        # transient error cannot overwrite a caller's real history.
+        try:
+            d = ym_get('GetFiles', path=ym_p(HIST_DIR)).json()
+            if d.get('responseStatus') != 'OK':
+                raise RuntimeError('history dir listing not OK')
+            if safe_name(p) not in {f.get('name') for f in (d.get('files') or [])}:
+                return fresh
+        except Exception as e2:
+            log.warning('history existence check failed: %s', e2)
+        log.warning('history load failed for existing/unknown file, saving disabled this call: %s', e)
+        fresh['_nosave'] = True
+        return fresh
 
 def save_history(phone, h):
-    if not phone:
-        return
+    """Write history without ever leaving the caller with no file.
+    Returns True on success. Upload first to a temp name, then swap."""
+    if not phone or h.get('_nosave'):
+        return False
+    p = hist_path(phone)
+    body = json.dumps({k: v for k, v in h.items() if not k.startswith('_')}, ensure_ascii=False).encode('utf-8')
+    tmp = p[:-4] + '.new'
     try:
-        p = hist_path(phone)
-        ym_delete(p)
-        ym_upload(json.dumps(h, ensure_ascii=False).encode('utf-8'), safe_name(p), p)
+        ym_upload(body, safe_name(tmp), tmp)            # 1. new copy lands first
+        ym_delete(p)                                    # 2. swap
+        try:
+            ym_upload(body, safe_name(p), p)
+        except Exception:
+            ym_upload(body, safe_name(p), p)            # one retry; temp copy still exists
+        ym_delete(tmp)
+        return True
     except Exception as e:
-        log.warning('history save failed: %s', e)
+        log.warning('history save failed (previous history kept when possible): %s', e)
+        return False
 
 def safe_name(p):
     return p.rstrip('/').split('/')[-1]
@@ -649,6 +688,15 @@ def tts_wav(text, rate=None, voice=None):
     return buf.getvalue()
 
 # ---------- Helpers ----------
+
+def admin_secret_ok():
+    """Admin/helper routes: the secret must come in the X-Bridge-Secret header
+    or a POST form field, never the query string (query strings are logged).
+    Yemot-called routes keep their query secret because the PBX api_link
+    requires it."""
+    import hmac
+    got = request.headers.get('X-Bridge-Secret') or request.form.get('secret') or ''
+    return bool(BRIDGE_SECRET) and hmac.compare_digest(got.encode(), BRIDGE_SECRET.encode())
 
 @app.before_request
 def _log_every_request():
@@ -747,9 +795,9 @@ def status():
     with lock:
         return {'stats': stats, 'active_calls': len(sessions)}
 
-@app.route('/setup')
+@app.route('/setup', methods=['GET', 'POST'])
 def setup():
-    if request.args.get('secret') != BRIDGE_SECRET:
+    if not admin_secret_ok():
         return 'forbidden', 403
     report = {}
     # root menu greeting lives at /000.wav (played by the root menu extension)
@@ -1196,9 +1244,9 @@ def wait_step(call_id, job, turn):
 
 GOODBYE_WORDS = ('להתראות', 'ביי', 'נתק', 'לנתק', 'תודה ביי', 'די', 'סיום')
 
-@app.route('/ym-admin')
+@app.route('/ym-admin', methods=['GET', 'POST'])
 def ym_admin():
-    if request.args.get('secret') != BRIDGE_SECRET:
+    if not admin_secret_ok():
         return 'forbidden', 403
     action = request.args.get('action', 'ReadIniFile')
     path = request.args.get('path', '')
@@ -1223,10 +1271,10 @@ def ym_admin():
     except Exception as e:
         return {'ok': False, 'error': str(e)[:300]}, 502
 
-@app.route('/ym-read')
+@app.route('/ym-read', methods=['GET', 'POST'])
 def ym_read():
     # Temporary migration helper: read any PBX file as text (DownloadFile action).
-    if request.args.get('secret') != BRIDGE_SECRET:
+    if not admin_secret_ok():
         return 'forbidden', 403
     try:
         data = ym_download(request.args.get('path', ''))
@@ -1234,10 +1282,10 @@ def ym_read():
     except Exception as e:
         return {'ok': False, 'error': str(e)[:300]}, 502
 
-@app.route('/ym-write')
+@app.route('/ym-write', methods=['GET', 'POST'])
 def ym_write_route():
     # Temporary migration helper: write text to any PBX file (UploadTextFile action).
-    if request.args.get('secret') != BRIDGE_SECRET:
+    if not admin_secret_ok():
         return 'forbidden', 403
     try:
         return {'ok': True, 'data': ym_upload_text(request.args.get('text', ''), request.args.get('path', ''))}
@@ -2493,9 +2541,12 @@ HUB_ASSISTANTS = {
 HUB_PROMPTS = {
     'hub_menu': 'בחרו מודל לשיחה. לג׳מיני הקישו 1. לגרוק הקישו 2. לחזרה לתפריט הראשי, הקישו 0.',
     'hub_gemini_intro': 'בחרתם ג׳מיני. דברו אחרי הצליל, ולסיום הקישו סולמית.',
+    'hub_err_gemini': 'ג׳מיני לא זמין כרגע. אפשר לנסות שוב בעוד כמה דקות, או לבחור בגרוק. להתראות.',
+    'hub_err_groq': 'גרוק לא זמין כרגע. אפשר לנסות שוב בעוד כמה דקות, או לבחור בג׳מיני. להתראות.',
+    'hub_err_speech': 'לא הצלחתי לעבד את ההקלטה. אפשר לנסות שוב בעוד רגע. להתראות.',
     'hub_groq_intro': 'בחרתם גרוק. דברו אחרי הצליל, ולסיום הקישו סולמית.',
 }
-HUB_PROMPT_VERSION = 'v3two' 
+HUB_PROMPT_VERSION = 'v4err' 
 
 CHULIN_SYSTEM = (
     'את "חולין", צ׳אטבוט קולי שובב וחכם בקו טלפוני. '
@@ -2541,9 +2592,9 @@ CHULIN_PROMPTS = {
     'chulin_error': 'אוי, הייתה תקלה טכנית. נסו שוב קצת מאוחר יותר. להתראות!',
 }
 
-@app.route('/setup-typing')
+@app.route('/setup-typing', methods=['GET', 'POST'])
 def setup_typing():
-    if request.args.get('secret') != BRIDGE_SECRET:
+    if not admin_secret_ok():
         return 'forbidden', 403
     report = {}
     for name in SONG2_NEW_PROMPTS:
@@ -2596,9 +2647,9 @@ def setup_chulin_assets():
     except Exception as e: report['gemini_chat'] = f'FAIL: {e}'
     return report
 
-@app.route('/setup-chulin')
+@app.route('/setup-chulin', methods=['GET', 'POST'])
 def setup_chulin():
-    if request.args.get('secret') != BRIDGE_SECRET:
+    if not admin_secret_ok():
         return 'forbidden', 403
     return setup_chulin_assets()
 
@@ -3455,9 +3506,9 @@ def yemot_translate():
         log.exception('tr call=%s error: %s', call_id, e)
         return text_response('id_list_message=f-error')
 
-@app.route('/song-test')
+@app.route('/song-test', methods=['GET', 'POST'])
 def song_test():
-    if request.args.get('secret') != BRIDGE_SECRET:
+    if not admin_secret_ok():
         return 'forbidden', 403
     q = request.args.get('q', 'שלום עליכם')
     t0 = time.time()
@@ -3558,9 +3609,24 @@ def yemot():
             rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
         else:
             rec_path = ym_newest_file(IN_DIR)
+            log.warning('call=%s no explicit recording name from Yemot, used newest unclaimed: %s', call_id, rec_path)
+        if not rec_path:
+            raise RuntimeError('no recording found')
+        with lock:
+            claimed_recordings.add(rec_path)
         wav = ym_download('ivr2:' + rec_path if not rec_path.startswith('ivr2:') else rec_path)
-        user_text = groq_stt(wav)
+        try:
+            user_text = groq_stt(wav)
+        except Exception as e:
+            log.error('call=%s stt failed: %s', call_id, str(e)[:200])
+            with lock:
+                claimed_recordings.discard(rec_path)
+            ym_delete('ivr2:' + rec_path if not rec_path.startswith('ivr2:') else rec_path)
+            stats['errors'] += 1
+            return text_response('id_list_message=f-hub_err_speech')
         ym_delete('ivr2:' + rec_path if not rec_path.startswith('ivr2:') else rec_path)
+        with lock:
+            claimed_recordings.discard(rec_path)
         log.info('call=%s turn=%d stt(%.1fs): %s', call_id, turn, time.time()-t0, user_text[:80])
 
         if not user_text:
@@ -3595,7 +3661,12 @@ def yemot():
         for who, txt in h.get('turns', [])[-8:]:
             msgs.append({'role': 'user' if who == 'u' else 'assistant', 'content': txt})
         msgs.append({'role': 'user', 'content': user_text})
-        reply = gemini_chat(msgs) if assist['model'] == 'gemini' else groq_chat(msgs)
+        try:
+            reply = gemini_chat(msgs) if assist['model'] == 'gemini' else groq_chat(msgs)
+        except Exception as e:
+            log.error('call=%s %s provider failed: %s', call_id, assist['model'], str(e)[:200])
+            stats['errors'] += 1
+            return text_response('id_list_message=f-hub_err_' + assist['model'])
         is_bye = reply.upper().startswith('BYE')
         reply_text = re.sub(r'^BYE:?\s*', '', reply, flags=re.I).strip() or 'להתראות!'
         log.info('call=%s turn=%d llm(%.1fs) bye=%s: %s', call_id, turn, time.time()-t0, is_bye, reply_text[:80])
