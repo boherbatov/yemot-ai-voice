@@ -1300,7 +1300,10 @@ def fetch_queue_song(call_id, idx):
     if not job:
         return
     key = f'slot{idx % 2}'
-    tmp = f'/tmp/song-{call_id}-{idx}'
+    queue0 = job.get('queue') or []
+    vid0 = queue0[idx][0] if idx < len(queue0) else ''
+    # per-video temp name: a superseded speculative download can never touch the live one
+    tmp = f'/tmp/song-{call_id}-{idx}-' + re.sub(r'[^A-Za-z0-9]', '', vid0)[:12]
     try:
         queue = job.get('queue') or []
         video_id, hint = queue[idx]
@@ -1320,7 +1323,7 @@ def fetch_queue_song(call_id, idx):
             else:
                 text = f'שיר מספר {n}. {title}.'
             ann_wav = tts_wav(text)
-        if job.get(f'{key}_want') != idx:
+        if job.get(f'{key}_want') != idx or job.get(f'{key}_vwant') != video_id:
             log.info('queue song superseded call=%s idx=%s, discarding', call_id, idx)
             return
         with open(out, 'rb') as f:
@@ -1338,24 +1341,114 @@ def fetch_queue_song(call_id, idx):
         job.update(**{f'{key}_status': 'ready', f'{key}_title': title, f'{key}_video': video_id})
         log.info('queue song ready call=%s idx=%s title=%s', call_id, idx, (title or '')[:60])
     except Exception as e:
-        if job.get(f'{key}_want') == idx:
+        if job.get(f'{key}_want') == idx and job.get(f'{key}_vwant') == vid0:
             log.warning('queue song failed call=%s idx=%s: %s', call_id, idx, e)
             job.update(**{f'{key}_status': 'error', f'{key}_err': 'disk' if isinstance(e, DiskLowError) else 'too_long' if isinstance(e, SongTooLongError) else str(e)[:200]})
     finally:
         _cleanup_tmp(tmp)
 
 def start_prefetch(call_id, idx, force=False):
-    """Kick off the background download of queue[idx]; at most one runs at a time.
-    force=True retargets a slot whose previous fetch is now unwanted (back key)."""
+    """Kick off the background download of queue[idx]; at most one runs per slot.
+    force=True retargets a slot whose previous fetch is now unwanted (back key).
+    A slot busy with a different song (e.g. a speculative one) is always retargeted."""
     job = song_jobs.get(call_id)
     if not job or idx >= len(job.get('queue') or []):
         return
     key = f'slot{idx % 2}'
-    if not force and job.get(f'{key}_status') == 'working':
+    vid = job['queue'][idx][0]
+    same = job.get(f'{key}_want') == idx and job.get(f'{key}_vwant') == vid
+    if not force and job.get(f'{key}_status') == 'working' and same:
         return
     job[f'{key}_want'] = idx
+    job[f'{key}_vwant'] = vid
     job[f'{key}_status'] = 'working'
     threading.Thread(target=fetch_queue_song, args=(call_id, idx), daemon=True).start()
+
+def reuse_or_start_prefetch(call_id, idx):
+    """Caller picked queue[idx]: reuse the speculative download of the same song
+    (running, finished, or honestly too long) instead of downloading twice."""
+    job = song_jobs.get(call_id)
+    if not job or idx >= len(job.get('queue') or []):
+        return
+    key = f'slot{idx % 2}'
+    vid = job['queue'][idx][0]
+    st = job.get(f'{key}_status')
+    if (job.get(f'{key}_want') == idx and job.get(f'{key}_vwant') == vid
+            and (st in ('working', 'ready') or (st == 'error' and job.get(f'{key}_err') == 'too_long'))):
+        log.info('pick reuses speculative download call=%s status=%s', call_id, st)
+        return
+    start_prefetch(call_id, idx, force=True)
+
+def speculative_prefetch(call_id, job, results):
+    """While the results menu plays, download+convert result #1 so a pick of it starts at once.
+    Same pipeline (disk guard, too-long check); a different pick simply supersedes it."""
+    try:
+        if not results or not YT_REFRESH_TOKEN or str(results[0][0]).startswith('jm:'):
+            return
+        if song_jobs.get(call_id) is not job or job.get('stage') not in ('searching', 'pick'):
+            return                              # caller already picked or left
+        job['queue'] = [results[0]]
+        job['qidx'] = 0
+        start_prefetch(call_id, 0)
+        log.info('speculative prefetch call=%s video=%s', call_id, results[0][0])
+    except Exception as e:
+        log.info('speculative prefetch skipped: %s', str(e)[:100])
+
+def _result_page_text(chunk, first, intro_first):
+    parts = [intro_first] if first else ['התוצאות הבאות.']
+    for i, (_vid, t) in enumerate(chunk, 1):
+        t = re.sub(r'\s+', ' ', (t or '')).strip()[:70]
+        parts.append(f'{i}. {t}.')
+    parts.append('הקישו את מספר השיר. לתוצאות נוספות, הקישו 0.')
+    return ' '.join(parts)
+
+def publish_result_pages(call_id, job, results, tag, intro_first, page_limit=None):
+    """Page 1 is spoken as soon as it is uploaded (job ready); the other pages are built
+    in parallel in the background and flagged in job['pages_ready'] / ['pages_failed']."""
+    cid = re.sub(r'\D', '', call_id)[-6:]
+    n = len(results) if page_limit is None else min(len(results), page_limit)
+    starts = list(range(0, n, 5))
+    names = [f'res{cid}{tag}{p // 5}' for p in starts]
+    gen = job['gen'] = job.get('gen', 0) + 1
+    ready, failed = set(), set()
+    job.update(pages=names, pages_ready=ready, pages_failed=failed, page_idx=0)
+    def build(k):
+        p = starts[k]
+        text = _result_page_text(results[p:p + 5], k == 0, intro_first)
+        wav = tts_wav(text)
+        if job.get('gen') != gen or song_jobs.get(call_id) is not job:
+            return False                      # a newer search replaced this one
+        ym_delete(f'{SONG_DIR}/{names[k]}.wav')
+        ym_upload(wav, names[k] + '.wav', f'{SONG_DIR}/{names[k]}.wav')
+        return job.get('gen') == gen
+    def bg(k):
+        try:
+            if build(k):
+                ready.add(k)
+        except Exception as e:
+            log.warning('result page %d failed call=%s: %s', k, call_id, str(e)[:100])
+            failed.add(k)
+    threads = [threading.Thread(target=bg, args=(k,), daemon=True) for k in range(1, len(starts))]
+    for t in threads:
+        t.start()                              # pages 2.. build in parallel while page 1 is made
+    build(0)                                   # an exception here fails the whole search, as before
+    ready.add(0)
+    job.update(status='ready', results=results)
+    return names
+
+def next_result_page(job, wait=12.0):
+    """Index of the page after the current one; waits briefly if it is still being built,
+    skips pages that failed, and falls back to page 1."""
+    pages = job.get('pages') or []
+    ready, failed = job.get('pages_ready') or set(), job.get('pages_failed') or set()
+    for step in range(1, len(pages) + 1):
+        k = (job.get('page_idx', 0) + step) % len(pages)
+        deadline = time.time() + wait
+        while k not in ready and k not in failed and time.time() < deadline:
+            time.sleep(0.25)
+        if k in ready:
+            return k
+    return 0
 
 # ---------- Jamendo (free-music search, extension 2 key 4) ----------
 # Openly licensed (Creative Commons) catalog, official free API, non-commercial use.
@@ -1456,21 +1549,9 @@ def fetch_results(call_id, query):
         results = merged_song_search(query, limit=15)
         log.info('song search phase elapsed=%.2fs count=%d', time.monotonic()-search_started, len(results))
         menu_started = time.monotonic()
-        cid = re.sub(r'\D', '', call_id)[-6:]
-        pages = []
-        for p in range(0, len(results), 5):
-            chunk = results[p:p + 5]
-            parts = ['מצאתי את השירים האלה.'] if p == 0 else ['התוצאות הבאות.']
-            for i, (_vid, t) in enumerate(chunk, 1):
-                t = re.sub(r'\s+', ' ', (t or '')).strip()[:70]
-                parts.append(f'{i}. {t}.')
-            parts.append('הקישו את מספר השיר. לתוצאות נוספות, הקישו 0.')
-            name = f'res{cid}p{p // 5}'
-            ym_delete(f'{SONG_DIR}/{name}.wav')
-            ym_upload(tts_wav(' '.join(parts)), name + '.wav', f'{SONG_DIR}/{name}.wav')
-            pages.append(name)
-        job.update(status='ready', results=results, pages=pages, page_idx=0)
-        log.info('song menu TTS/upload phase elapsed=%.2fs pages=%d', time.monotonic()-menu_started, len(pages))
+        pages = publish_result_pages(call_id, job, results, 'p', 'מצאתי את השירים האלה.')
+        speculative_prefetch(call_id, job, results)
+        log.info('song menu page1 ready elapsed=%.2fs pages=%d', time.monotonic()-menu_started, len(pages))
         log.info('song results call=%s: %d results, %d pages', call_id, len(results), len(pages))
     except Exception as e:
         log.warning('song results failed call=%s: %s', call_id, e)
@@ -1483,20 +1564,8 @@ def fetch_artist_results(call_id, artist):
         return
     try:
         results = merged_song_search(artist, limit=ARTIST_RESULT_LIMIT, artist_mode=True, hn_max=30)
-        cid = re.sub(r'\D', '', call_id)[-6:]
-        pages = []
-        for p in range(0, min(len(results), ARTIST_PAGE_LIMIT), 5):
-            chunk = results[p:p + 5]
-            parts = [f'מצאתי שירים של {artist}.'] if p == 0 else ['התוצאות הבאות.']
-            for i, (_vid, t) in enumerate(chunk, 1):
-                t = re.sub(r'\s+', ' ', (t or '')).strip()[:70]
-                parts.append(f'{i}. {t}.')
-            parts.append('הקישו את מספר השיר. לתוצאות נוספות, הקישו 0.')
-            name = f'res{cid}a{p // 5}'
-            ym_delete(f'{SONG_DIR}/{name}.wav')
-            ym_upload(tts_wav(' '.join(parts)), name + '.wav', f'{SONG_DIR}/{name}.wav')
-            pages.append(name)
-        job.update(status='ready', results=results, pages=pages, page_idx=0)
+        pages = publish_result_pages(call_id, job, results, 'a', f'מצאתי שירים של {artist}.', ARTIST_PAGE_LIMIT)
+        speculative_prefetch(call_id, job, results)
         log.info('artist results call=%s artist=%r: %d results, %d pages',
                  call_id, artist[:60], len(results), len(pages))
     except Exception as e:
@@ -1806,7 +1875,7 @@ def yemot_song():
                 job.update(stage='ask', status='idle', mode='single')
                 return text_response(f'read=f-song_notfound.f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
             if s_val == '0':
-                job['page_idx'] = (job.get('page_idx', 0) + 1) % len(pages)
+                job['page_idx'] = next_result_page(job)
                 return text_response(f"read=f-{pages[job['page_idx']]}=S{turn+1},no,1,1,10,No,yes,,,,,,,,no")
             if s_val and s_val.isdigit() and 1 <= int(s_val) <= 5:
                 idx = job.get('page_idx', 0) * 5 + int(s_val) - 1
@@ -1816,11 +1885,11 @@ def yemot_song():
                         # singer radio: play the pick, then the rest of the singer's songs
                         job.update(stage='wait', status='idle', mode='artist',
                                    queue=list(results), qidx=idx, started=time.time())
-                        start_prefetch(call_id, idx)
+                        reuse_or_start_prefetch(call_id, idx)
                     else:
                         job.update(stage='wait', status='idle', mode='single',
                                    queue=[(video_id, title)], qidx=0, started=time.time())
-                        start_prefetch(call_id, 0)
+                        reuse_or_start_prefetch(call_id, 0)
                     return text_response(play_chain('f-song_searching', f'S{turn+1}'))
             return text_response(f"read=f-{pages[job.get('page_idx', 0)]}=S{turn+1},no,1,1,10,No,yes,,,,,,,,no")
 
