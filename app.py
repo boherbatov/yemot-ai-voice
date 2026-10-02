@@ -3519,7 +3519,7 @@ def _auto_setup_newscenter():
     try:
         link = f'{PUBLIC_BASE_URL}/yemot-resume?secret={urllib.parse.quote(BRIDGE_SECRET)}'
         ym_upload_text(f'type=api\napi_link={link}\napi_dir={NED_DIR}\napi_url_post=no\n',
-                       'ivr2:/#/ext.ini')
+                       'ivr2:/Hash/ext.ini')
         log.info('nc: /# ext.ini -> yemot-resume')
     except Exception as e:
         ok = False
@@ -3650,7 +3650,13 @@ def _auto_prune_ivr_tree():
             ym_upload_text('type=go_to_folder\ngo_to_folder=/\n', f'ivr2:/{ext}/ext.ini')
         # Keep the resume shortcut even though the former news installer is disabled.
         link = f'{PUBLIC_BASE_URL}/yemot-resume?secret={urllib.parse.quote(BRIDGE_SECRET)}'
-        ym_upload_text(f'type=api\napi_link={link}\napi_dir=/7\napi_url_post=no\n', 'ivr2:/#/ext.ini')
+        ym_upload_text(f'type=api\napi_link={link}\napi_dir=/7\napi_url_post=no\n', 'ivr2:/Hash/ext.ini')
+        root_config = ym_download('/ext.ini').decode('utf-8')
+        if not re.search(r'^hash_extension=', root_config, re.M):
+            root_config += '\nhash_extension=yes\n'
+        else:
+            root_config = re.sub(r'^hash_extension=.*$', 'hash_extension=yes', root_config, flags=re.M)
+        ym_upload_text(root_config, 'ivr2:/ext.ini')
         ym_upload(tts_wav(ROOT_MENU_TEXT), '000.wav', '/000.wav')
         log.info('owner IVR tree applied: 1-4, resume#, removed 5-9 access')
     except Exception as e:
