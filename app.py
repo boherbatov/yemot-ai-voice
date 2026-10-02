@@ -2783,6 +2783,26 @@ TIMELY = re.compile(r'(?<![א-ת])ה?(?:חדשות|מזג|אתמול|היום|ה
 
 PLAIN_NEWS = re.compile(r'(?<![א-ת])ה?(?:חדשות|כותרות)')
 
+HEB_MONTHS = ['ינואר', 'פברואר', 'מרץ', 'אפריל', 'מאי', 'יוני', 'יולי', 'אוגוסט', 'ספטמבר', 'אוקטובר', 'נובמבר', 'דצמבר']
+
+def hebrew_date(iso):
+    """'2026-10-02' -> '2 באוקטובר 2026'. Returns '' if it can't be parsed."""
+    m = re.match(r'(\d{4})-(\d{2})-(\d{2})', iso or '')
+    if not m:
+        return ''
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not 1 <= mo <= 12 or not 1 <= d <= 31:
+        return ''
+    return f'{d} ב{HEB_MONTHS[mo - 1]} {y}'
+
+def israel_today():
+    try:
+        from zoneinfo import ZoneInfo
+        import datetime
+        return datetime.datetime.now(ZoneInfo('Asia/Jerusalem')).strftime('%Y-%m-%d')
+    except Exception:
+        return time.strftime('%Y-%m-%d')
+
 def hub_sources(query):
     """Return (context_text, sources). Only relevant hits, each with source name and date."""
     import html
@@ -2800,8 +2820,9 @@ def hub_sources(query):
             hay = (hit.get('title', '') + ' ' + snip)
             if not snip or not (toks and any(w in hay for w in toks)):
                 continue
-            d = (hit.get('timestamp') or '')[:10]
-            lines.append(f"מקור: ויקיפדיה העברית, ערך {hit['title']}, ערך עודכן לאחרונה ב-{d or 'תאריך לא ידוע'}: {snip}")
+            d = hebrew_date(hit.get('timestamp') or '')
+            when = f'ב-{d}' if d else 'בתאריך לא ידוע'
+            lines.append(f"מקור: ויקיפדיה העברית, ערך {hit['title']}, ערך עודכן לאחרונה {when}: {snip}")
             if len(lines) >= 2:
                 break
     except StopIteration:
@@ -2813,13 +2834,13 @@ def hub_sources(query):
             heads = news_headlines(5)
             if heads:
                 hedge = '' if PLAIN_NEWS.search(query) else ', ייתכן שאינן עונות על השאלה'
-                lines.append(f"מקור: כותרות ynet, נשלפו בזמן השיחה ({today()}){hedge}: " + ' | '.join(heads))
+                lines.append(f"מקור: כותרות ynet, נשלפו בזמן השיחה ({hebrew_date(israel_today())}){hedge}: " + ' | '.join(heads))
         except Exception as e:
             log.info('hub news ctx failed: %s', e)
     return '\n'.join(lines), len(lines)
 
 HUB_SOURCE_RULES = ('להלן מקורות שנשלפו עבור השאלה, עם שם המקור ותאריך. אם את משתמשת בהם, צייני בקצרה את שם המקור ואת התאריך כפי שכתוב. '
-                    'אל תאמרי שהמידע עדכני אלא אם התאריך שבמקור באמת עדכני. אם המקורות לא עונים על השאלה, אמרי בכנות שלא מצאת מידע מהימן ואל תמציאי.')
+                    'תאריכים נכתבים כאן בצורה מדוברת (למשל 2 באוקטובר 2026): אמרי אותם בדיוק כפי שהם כתובים, בלי להמיר למספרים או לשנות. תאריך השליפה הוא רק זה שבסוגריים אחרי שם המקור; מספרים או תאריכים בתוך טקסט של כותרת שייכים לכותרת ואינם תאריך השליפה. אל תאמרי שהמידע עדכני אלא אם התאריך שבמקור באמת עדכני. אם המקורות לא עונים על השאלה, אמרי בכנות שלא מצאת מידע מהימן ואל תמציאי.')
 
 CHULIN_PROMPTS = {
     'chulin_menu': 'לבחירת צ׳אט חולין עם גרוק, הקישו 1. לבחירת אותה השיחה עם ג׳מיני, הקישו 2.',
