@@ -161,7 +161,7 @@ _DIAG_USED = False
 def _redact_cookie_diagnostic(message):
     text = str(message)
     # Replace known secret values before any truncation or normalization.
-    for key in ('YT_COOKIES_B64', 'YT_REFRESH_TOKEN', 'BRIDGE_SECRET', 'YM_PASS',
+    for key in ('YT_COOKIES_B64', 'YT_REFRESH_TOKEN', 'BRIDGE_SECRET', 'YM_PASS', 'YM_SYSTEM',
                 'GROQ_API_KEY', 'GEMINI_API_KEY', 'TELEGRAM_SESSION', 'TELEGRAM_API_HASH'):
         value = os.environ.get(key, '')
         if value:
@@ -177,6 +177,7 @@ def _redact_cookie_diagnostic(message):
     except Exception:
         return 'diagnostic redaction unavailable'
     text = re.sub(r'https?://[^\s]+', '[URL redacted]', text)
+    text = re.sub(r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}', '[email redacted]', text)
     text = re.sub(r'(?im)(authorization|cookie|set-cookie)\s*[:=].*$', r'\1: [redacted]', text)
     text = re.sub(r'[A-Za-z0-9_+/.=-]{60,}', '[long value redacted]', text)
     text = re.sub(r'\x1b\[[0-9;]*m', '', text)
@@ -264,6 +265,73 @@ def _yt_tv_context():
     return {'client': {'clientName': 'TVHTML5', 'clientVersion': TV_CLIENT_VER,
                        'hl': 'en', 'visitorData': _YT['vd']}}
 
+# Temporary authenticated diagnostic. Fixed query/video only, one attempt per process.
+# Never returns response bodies, cookies, headers, visitor data or account objects.
+def _music_search_shape(data):
+    from collections import Counter
+    counts, rows = Counter(), []
+    def walk(obj, path='root'):
+        if isinstance(obj, dict):
+            for key in ('videoRenderer', 'lockupViewModel', 'continuationCommand',
+                        'itemSectionRenderer', 'shelfRenderer', 'error'):
+                if key in obj:
+                    counts[key] += 1
+            for key in ('videoRenderer', 'lockupViewModel'):
+                row = obj.get(key)
+                if isinstance(row, dict) and len(rows) < 20:
+                    ident = str(row.get('videoId') or row.get('contentId') or '')
+                    title = row.get('title') or ((row.get('metadata') or {}).get('lockupMetadataViewModel') or {}).get('title') or {}
+                    title = title.get('content') or title.get('simpleText') or ''.join(x.get('text', '') for x in title.get('runs', [])) if isinstance(title, dict) else ''
+                    rows.append({'renderer': key, 'path': path[-180:],
+                                 'id': ident if re.fullmatch(r'[A-Za-z0-9_-]{11}', ident) else '<non-video-id>',
+                                 'id_length': len(ident), 'title': _redact_cookie_diagnostic(title)[:160],
+                                 'keys': sorted(row.keys())[:30]})
+            for key, value in obj.items():
+                walk(value, path + '/' + key)
+        elif isinstance(obj, list):
+            for value in obj:
+                walk(value, path + '/[]')
+    walk(data)
+    return {'top_keys': sorted(data.keys()) if isinstance(data, dict) else [],
+            'counts': dict(counts), 'video_rows': rows}
+
+@app.route('/music-diagnostic', methods=['POST'])
+def music_diagnostic():
+    global _DIAG_USED
+    if not admin_secret_ok():
+        return 'forbidden', 403
+    with _DIAG_LOCK:
+        if _DIAG_USED:
+            return {'error': 'already used'}, 409
+        _DIAG_USED = True
+    g.music_search_shapes = []
+    g.cookie_diagnostic = []
+    report = {'solver': _YT_SOLVER_READY, 'cookie_metadata': _COOKIE_BOOT}
+    try:
+        result = yt_search_results('אברימי רוט', limit=15)
+        report['parsed_results'] = [{'id': ident if re.fullmatch(r'[A-Za-z0-9_-]{11}', str(ident)) else '<non-video-id>',
+                                     'title': _redact_cookie_diagnostic(title)[:160]} for ident, title in result]
+    except Exception as exc:
+        report['search_error'] = _redact_cookie_diagnostic(exc)
+    report['search_shapes'] = g.music_search_shapes
+    tmp = f'/tmp/stest-diag-{time.time_ns()}'
+    try:
+        title, duration = yt_download('jNQXAC9IVRw', tmp + '.%(ext)s')
+        import glob
+        report['direct_video'] = {'title': _redact_cookie_diagnostic(title), 'duration': duration,
+                                  'files_created': len(glob.glob(tmp + '.*'))}
+    except Exception as exc:
+        report['download_error'] = _redact_cookie_diagnostic(exc)
+    finally:
+        import glob
+        for path in glob.glob(tmp + '.*'):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    report['warnings'] = g.cookie_diagnostic
+    return report
+
 def yt_search_results(query, limit=15):
     """Authenticated TV-surface search, paginated via continuation; up to `limit` (video_id, title) pairs."""
     import json as J, urllib.request as U
@@ -296,6 +364,8 @@ def yt_search_results(query, limit=15):
     r = J.load(U.urlopen(U.Request(
         f'https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key={_YT["key"]}',
         data=body, headers=_yt_headers()), timeout=30))
+    if has_request_context() and hasattr(g, 'music_search_shapes'):
+        g.music_search_shapes.append(_music_search_shape(r))
     walk(r)
     for _ in range(3):                       # continuation pages ("all the singer's songs")
         if not token or len(found) >= limit:
