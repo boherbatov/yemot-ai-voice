@@ -2,12 +2,14 @@
 set -eu
 POT_HOME="${POT_HOME:-/app/pot}"
 if [ ! -f "$POT_HOME/server/build/main.js" ]; then POT_HOME=/pot; fi
-node "$POT_HOME/server/build/main.js" &
+NODE="$POT_HOME/server/node_modules/node/bin/node"
+if [ ! -x "$NODE" ]; then NODE=node; fi
+"$NODE" "$POT_HOME/server/build/main.js" &
 POT_PID=$!
 trap 'kill "$POT_PID" 2>/dev/null || true' EXIT TERM INT
 /opt/venv/bin/python - <<'PYTEST'
 import time, urllib.request
-for i in range(30):
+for i in range(5):
     try:
         urllib.request.urlopen('http://127.0.0.1:4416/ping', timeout=1)
         break
