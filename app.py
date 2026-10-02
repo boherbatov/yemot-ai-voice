@@ -3220,6 +3220,7 @@ def wiki_spoken_text(text):
     text = html.unescape(code.strip_code(normalize=True, collapse=True))
     text = re.sub(r'https?://[^\s<>\[\]]+', ' ', text)
     text = re.sub(r'\[\d+(?:[ ,–-]+\d+)*\]', ' ', text)
+    text = re.sub(r'\[(?:דרוש מקור|דרושה הבהרה|מקור|הבהרה)(?:[^\]\n]*)\]', ' ', text)
     text = re.sub(r'(?m)^\s*[*#;:]+\s*', '', text)
     text = re.sub(r'[ \t]+', ' ', text)
     return '\n'.join(line.strip() for line in text.splitlines() if line.strip())
