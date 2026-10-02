@@ -573,9 +573,21 @@ def yt_download(video_id, outtmpl):
     except SongTooLongError:
         raise
     except Exception as e:
-        if _COOKIE_BOOT['configured'] or os.environ.get('YT_COOKIES_FILE'):
-            log.warning('authenticated YouTube download failed (details suppressed)')
-            raise RuntimeError('YouTube download unavailable') from None
+        authed = bool(_COOKIE_BOOT['configured'] or os.environ.get('YT_COOKIES_FILE'))
+        if authed:
+            # cookie details stay out of the logs; only the error class and a redacted short reason
+            reason = re.sub(r'[A-Za-z0-9_%./=+-]{40,}', '<redacted>', str(e))[:200]
+            log.warning('authenticated YouTube download failed for %s: %s: %s', video_id, type(e).__name__, reason)
+            if not YT_REFRESH_TOKEN:
+                raise RuntimeError('YouTube download unavailable') from None
+            log.info('trying TV-client fallback for %s', video_id)
+            try:
+                return yt_download_tv(video_id, outtmpl)
+            except SongTooLongError:
+                raise
+            except Exception as e2:
+                log.warning('TV-client fallback failed for %s: %s', video_id, type(e2).__name__)
+                raise RuntimeError('YouTube download unavailable') from None
         log.warning('mweb PO-token download failed for %s: %s; trying existing TV route', video_id, e)
         return yt_download_tv(video_id, outtmpl)
 
@@ -643,6 +655,9 @@ def ym_p(p):
     return p if p.startswith('ivr2:') else 'ivr2:' + p
 
 def ym_download(path):
+    p_ = str(path or '')
+    if not p_ or p_.endswith('/') or p_.rsplit('/', 1)[-1] in ('None', 'null', ''):
+        raise ValueError('no recording path')
     r = ym_get('DownloadFile', path=ym_p(path))
     return r.content
 
@@ -1147,6 +1162,7 @@ SONG_PROMPTS = {
     'song_wait': 'עוד ממש קצת, השיר כבר בדרך.',
     'song_notfound': 'סליחה, לא מצאתי את זה. נסו שוב.',
     'song_too_long': 'השיר ארוך מעשר דקות ולכן אי אפשר להשמיע אותו בקו. בחרו שיר קצר יותר.',
+    'song_dlfail': 'ההורדה נכשלה, נסו שיר אחר.',
     'song_disk': 'השרת עמוס כרגע ואין מקום להוריד את השיר. נסו שוב בעוד דקה או שתיים.',
     'song_more': 'מה בא לכם עכשיו?',
     'song_bye': 'כיף היה! נתראה בשיר הבא. להתראות!',
@@ -1187,8 +1203,8 @@ LIB_PROMPTS = ('lib_pick', 'lib_bad', 'lib_choose', 'lib_for', 'lib_for_list', '
 # prompts the extension-2 upgrade needs on Yemot; uploaded once by _auto_setup_song2
 SONG2_NEW_PROMPTS = ('song_mode', 'song_how', 'song_typehow', 'song_artist', 'song_artist_voice',
                      'artist_typehow', 'song_ask', 'song_more', 'song_notfound', 'song_too_long', 'song_after',
-                     'song_artist_ask', 'song_auto_next', 'song_queue_done', 'song_radio_on', 'song_after_free', 'song_disk', 'song_ai_ask', 'song_ai_unknown')
-SONG2_PROMPT_VERSION = 'v_ai_search_20261002'
+                     'song_artist_ask', 'song_auto_next', 'song_queue_done', 'song_radio_on', 'song_after_free', 'song_disk', 'song_ai_ask', 'song_ai_unknown', 'song_dlfail')
+SONG2_PROMPT_VERSION = 'v_dlfail_20261002'
 
 ARTIST_RESULT_LIMIT = 60   # singer radio: everything the paginated search yields
 ARTIST_PAGE_LIMIT = 25     # results screen announces the first 25 (5 pages of 5)
@@ -1819,8 +1835,17 @@ def wait_step(call_id, job, turn):
         if job.get(f'{key}_err') == 'too_long':
             job.update(stage='ask', status='idle', mode='single')
             return text_response('read=f-song_too_long.f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
-        job.update(stage='ask', status='idle', mode='single')
-        return text_response(f'read=f-song_notfound.f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
+        alts = job.get('alts') or []
+        if job.get('mode') == 'single' and alts and queue:
+            # the chosen result could not be downloaded: try the next search result instead
+            nxt = alts.pop(0)
+            log.info('download failover call=%s: %s -> %s', call_id, queue[0][0], nxt[0])
+            job.update(alts=alts, queue=[nxt], qidx=0, started=time.time())
+            start_prefetch(call_id, 0, force=True)
+            return wait_step(call_id, job, turn)
+        # the search DID find the song, so never say it was not found
+        job.update(stage='ask', status='idle', mode='single', alts=[])
+        return text_response('read=f-song_dlfail.f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
     queue = job.get('queue') or []
     job.update(stage='play', name=slot_name(call_id, idx),
                title=job.get(f'{key}_title') or (queue[idx][1] if idx < len(queue) else '') or 'שיר',
@@ -1905,10 +1930,13 @@ def yemot_song():
         resume_pending.pop(call_id, None)
         return text_response('')
 
-    s_val, turn = None, 0
+    s_val, turn, s_none = None, 0, False
     for k, v in params.items():
         if re.fullmatch(r'S\d+', k):
             s_val, turn = v, int(k[1:])
+    if s_val is not None and s_val.strip().lower() in ('none', 'null', 'undefined'):
+        s_none = True
+        s_val = ''     # Yemot sent a literal "None" (no recording): never build a path from it
 
     with lock:
         job = song_jobs.setdefault(call_id, {'stage': 'ask', 'status': 'idle', 'started': time.time()})
@@ -1968,6 +1996,8 @@ def yemot_song():
         stage = job['stage']
 
         if stage == 'ask':
+            if s_none:   # literal "None" from Yemot = no recording; ask again instead of fetching a path
+                return text_response(f'read=f-didnt_hear.f-song_ask=S{turn+1},no,record,{IN_DIR},,no')
             typed = s_val == '' or bool(re.fullmatch(r'[0-9*]+', s_val or ''))
             if typed:
                 text = multitap_decode(s_val, job.get('tlang', 'he'))
@@ -2062,6 +2092,8 @@ def yemot_song():
             return text_response(play_chain('f-song_searching', f'S{turn+1}'))
 
         if stage == 'artist_voice':
+            if not s_val:
+                return text_response(f'read=f-didnt_hear.f-song_artist_ask=S{turn+1},no,record,{IN_DIR},,no')
             rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
             wav = ym_download(rec_path)
             artist = groq_stt(wav)
@@ -2118,8 +2150,11 @@ def yemot_song():
                                    queue=list(results), qidx=idx, started=time.time())
                         reuse_or_start_prefetch(call_id, idx)
                     else:
+                        alts_ = [r_ for i_, r_ in enumerate(results)
+                                 if i_ != idx and not str(r_[0]).startswith('jm:')][:3]
                         job.update(stage='wait', status='idle', mode='single',
-                                   queue=[(video_id, title)], qidx=0, started=time.time())
+                                   queue=[(video_id, title)], qidx=0, started=time.time(),
+                                   alts=alts_)
                         reuse_or_start_prefetch(call_id, 0)
                     return text_response(play_chain('f-song_searching', f'S{turn+1}'))
             return text_response(f"read=f-{pages[job.get('page_idx', 0)]}=S{turn+1},no,1,1,10,No,yes,,,,,,,,no")
@@ -4717,4 +4752,5 @@ def _auto_prune_ivr_tree():
         log.exception('owner IVR tree update failed: %s', e)
 
 threading.Thread(target=_auto_prune_ivr_tree, daemon=True).start()
+
 
