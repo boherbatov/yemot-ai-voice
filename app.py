@@ -445,7 +445,7 @@ SYSTEM_PROMPT = (
     'כללים קשיחים: '
     '1) עני תמיד בעברית בלבד, בשפה מדוברת וטבעית. '
     '2) תשובות קצרות: משפט אחד עד שלושה משפטים. לעולם לא רשימות, מספור, אימוג׳י, כוכביות או סימנים מיוחדים - הטקסט מוקרא בקול. '
-    '3) אם המשתמש נפרד או מבקש לסיים (ביי, להתראות, די, תודה זהו) - התחילי את התשובה במילה BYE: ולאחריה משפט פרידה אחד קצר. '
+    '3) אם המשתמש נפרד או מבקש לסיים (ביי, להתראות, די, תודה זהו) - התחילי את התשובה במילה BYE: ולאחריה משפט פרידה אחד קצר. את המילה BYE כותבים רק בתחילת התשובה, לעולם לא באמצע או בסוף, ולא בשיחה רגילה. '
     '4) אם הבקשה לא ברורה, בקשי שיחזור בשאלה קצרה. '
     '5) את בקו אישי וחברותי - שיחה קלה, לא רשמית. '
     '6) לעולם אל תאמרי שהמידע עדכני או מהאינטרנט אלא אם צורף לך מקור עם תאריך. אל תמציאי מקורות, מספרים או תאריכים.'
@@ -748,6 +748,19 @@ def audio_rms(wav_bytes):
         return (sum(x * x for x in a) / len(a)) ** 0.5
     except Exception:
         return None
+
+BYE_MARK_LEAD = re.compile(r'^\s*BYE\b\s*:?\s*', re.I)
+BYE_MARK_ANY = re.compile(r'\s*(?<![A-Za-z])BYE(?![A-Za-z])\s*:?\s*')
+
+def split_bye(reply):
+    """Return (is_bye, spoken_text). The goodbye marker may appear at the start
+    (as instructed) or, sometimes, in the middle/end of the model's answer."""
+    r = (reply or '').strip()
+    is_bye = bool(BYE_MARK_LEAD.match(r)) or bool(BYE_MARK_ANY.search(r))
+    r = BYE_MARK_LEAD.sub('', r, count=1)
+    r = BYE_MARK_ANY.sub(' ', r)
+    r = re.sub(r'\s{2,}', ' ', r).strip()
+    return is_bye, (r or ('להתראות!' if is_bye else ''))
 
 def clean_stt(text):
     """Whisper invents subtitle phrases on silence; treat those as nothing heard."""
@@ -3966,8 +3979,8 @@ def yemot():
             stats['errors'] += 1
             return text_response('id_list_message=f-hub_err_' + assist['model'])
         t_llm_done = time.time()
-        is_bye = reply.upper().startswith('BYE')
-        reply_text = re.sub(r'^BYE:?\s*', '', reply, flags=re.I).strip() or 'להתראות!'
+        is_bye, reply_text = split_bye(reply)
+        reply_text = reply_text or 'להתראות!'
         log.info('call=%s turn=%d llm(%.1fs) bye=%s: %s', call_id, turn, time.time()-t0, is_bye, reply_text[:80])
 
         # --- persist history ---
