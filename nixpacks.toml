@@ -1,8 +1,8 @@
 [phases.setup]
-nixPkgs = ["python312", "ffmpeg", "deno", "nodejs_22", "git"]
+nixPkgs = ["python312", "ffmpeg", "nodejs_22", "git"]
 
 [phases.install]
-cmds = ["python -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt", "git clone --single-branch --branch 2.0.0 --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /app/pot && cd /app/pot/server && npm ci && npm install --no-save node@22.23.3 && npx tsc"]
+cmds = ["python -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt && /opt/venv/bin/python youtube_solver_check.py", "git clone --single-branch --branch 2.0.0 --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /app/pot && cd /app/pot/server && npm ci && npm install --no-save node@22.23.3 && npx tsc"]
 
 [start]
 cmd = "sh start.sh"

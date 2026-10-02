@@ -7,3 +7,5 @@ yt-dlp==2026.8.19
 imageio-ffmpeg>=0.5.1
 telethon>=1.40
 bgutil-ytdlp-pot-provider==2.0.0
+yt-dlp-ejs==0.8.0
+deno==2.9.5

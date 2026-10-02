@@ -224,6 +224,10 @@ def song_diagnostic():
             except OSError:
                 pass
 
+from youtube_solver_check import check as _youtube_solver_check
+_YT_SOLVER_READY = _youtube_solver_check()
+log.info('YouTube solver readiness: %s', json.dumps(_YT_SOLVER_READY, sort_keys=True))
+
 _YT = {'at': None, 'at_exp': 0.0, 'key': None, 'vd': None, 'sts': None, 'cfg_at': 0.0}
 
 def _yt_token():
@@ -394,12 +398,13 @@ def yt_download_tv(video_id, outtmpl):
 def yt_download(video_id, outtmpl):
     """Use the official mweb PO-token route; retain the old TV path as fallback."""
     import yt_dlp
+    if not _YT_SOLVER_READY.get('ok'):
+        raise RuntimeError('YouTube solver unavailable')
     try:
         opts = {
             'format': 'bestaudio/best', 'outtmpl': outtmpl,
             'quiet': True, 'no_warnings': False, 'noplaylist': True,
-            'remote_components': ['ejs:github'],
-            'js_runtimes': {'deno': {}},
+            'js_runtimes': {'deno': {'path': os.environ.get('YT_DENO_PATH', '/opt/venv/bin/deno')}},
             'extractor_args': {'youtube': {'player_client': ['mweb']},
                                'youtubepot-bgutilhttp': {'base_url': ['http://127.0.0.1:4416']}},
             'match_filter': lambda info, **kw: 'song too long' if (info.get('duration') or 0) > 600 else None,
