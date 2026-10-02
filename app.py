@@ -196,7 +196,7 @@ def yt_download(video_id, outtmpl):
     tv['INNERTUBE_CONTEXT']['client']['userAgent'] = PS4_UA
     tv['INNERTUBE_CONTEXT']['client']['clientVersion'] = TV_CLIENT_VER
     opts = {
-        'format': '18/bestaudio/best',
+        'format': 'bestaudio/18/best',
         'outtmpl': outtmpl,
         'quiet': True, 'no_warnings': True, 'noplaylist': True,
         'remote_components': ['ejs:github'],
@@ -478,23 +478,41 @@ def today():
 # The container disk is small; leaked per-call files (songs, editions, telegram
 # streams, podcasts, tts) filled it once and broke every TTS reply with
 # Errno 28. Sweep anything older than 20 minutes, also right at boot.
+_active_tmp = set()
+_tmp_lock = threading.Lock()
+_media_slots = threading.BoundedSemaphore(2)
+
+def _tmp_janitor_once():
+    import glob
+    now = time.time()
+    removed = 0
+    with _tmp_lock:
+        active = tuple(_active_tmp)
+    for pat in ('/tmp/song-*', '/tmp/ned-*', '/tmp/tg-*', '/tmp/pod-*',
+                '/tmp/stest-*', '/tmp/tts-*', '/tmp/wiki-*'):
+        for path in glob.glob(pat):
+            if any(path.startswith(prefix) for prefix in active):
+                continue
+            try:
+                # Unfinished downloads can be huge. Never retain abandoned media
+                # for twenty minutes on this small shared disk.
+                if now - os.path.getmtime(path) > 120:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                    removed += 1
+            except OSError:
+                pass
+    return removed
+
 def _tmp_janitor():
-    import glob as _jglob
-    pats = ('/tmp/song-*', '/tmp/ned-*', '/tmp/tg-*', '/tmp/pod-*',
-            '/tmp/stest-*', '/tmp/tts-*', '/tmp/wiki-*')
     while True:
         try:
-            now = time.time()
-            for pat in pats:
-                for f_ in _jglob.glob(pat):
-                    try:
-                        if now - os.path.getmtime(f_) > 1200:
-                            os.remove(f_)
-                    except OSError:
-                        pass
+            _tmp_janitor_once()
         except Exception:
-            pass
-        time.sleep(600)
+            log.exception('temporary media cleanup failed')
+        time.sleep(60)
 
 threading.Thread(target=_tmp_janitor, daemon=True).start()
 
@@ -503,6 +521,7 @@ threading.Thread(target=_tmp_janitor, daemon=True).start()
 @app.route('/healthz')
 def healthz():
     return {'ok': True, 'uptime_s': int(time.time()-stats['started']),
+            'disk_free_mb': shutil.disk_usage('/tmp').free // 1048576,
             'env': {'ym': bool(YM_SYSTEM and YM_PASS), 'groq': bool(GROQ_API_KEY), 'gemini': bool(GEMINI_API_KEY), 'secret': bool(BRIDGE_SECRET)}}
 
 @app.route('/status')
@@ -555,7 +574,7 @@ def setup():
             report[name] = f'FAIL: {e}'
     for name in LIB_PROMPTS:
         try:
-            report[name] = 'OK' if ym_upload(tts_wav(SONG_PROMPTS[name]), name + '.wav', f'/5/{name}.wav') else 'FAIL'
+            report[name] = 'OK' if ym_upload(tts_wav(SONG_PROMPTS[name]), name + '.wav', f'{LIB_DIR}/{name}.wav') else 'FAIL'
         except Exception as e:
             report[name] = f'FAIL: {e}'
     for name, text in SONG_PROMPTS.items():
@@ -690,11 +709,11 @@ ARTIST_PAGE_LIMIT = 25     # results screen announces the first 25 (5 pages of 5
 LIB_DIR = os.environ.get('YM_LIB_EXT', '/16')            # playlists root extension
 
 def ym_list_files(path):
-    r = ym_get('GetFiles', path=ym_p(path))
+    r = ym_get('GetIVR2Dir', path=ym_p(path))
     d = r.json()
     if d.get('responseStatus') != 'OK':
         return []
-    return d.get('files') or []
+    return (d.get('files') or []) + [dict(f, fileType='EXT') for f in (d.get('dirs') or [])]
 
 def playlist_next_number():
     nums = []
@@ -710,7 +729,7 @@ def playlist_exists(n):
     return False
 
 def playlist_named(n):
-    for f in ym_list_files('ivr2:/5'):
+    for f in ym_list_files(f'ivr2:{LIB_DIR}'):
         if f.get('name') == f'plname_{n}.wav':
             return True
     return False
@@ -753,6 +772,8 @@ def _download_convert(call_id, video_id, search_title=None, tmp=None):
     if not YT_REFRESH_TOKEN:
         raise ValueError('YT_REFRESH_TOKEN not set')
     tmp = tmp or f'/tmp/song-{call_id}'
+    with _tmp_lock:
+        _active_tmp.add(tmp)
     title, _dur = yt_download(video_id, tmp + '.%(ext)s')
     if title == 'שיר' and search_title:
         title = search_title
@@ -768,6 +789,8 @@ def _download_convert(call_id, video_id, search_title=None, tmp=None):
 
 def _cleanup_tmp(tmp):
     import glob as _glob
+    with _tmp_lock:
+        _active_tmp.discard(tmp)
     for f_ in _glob.glob(tmp + '.*'):
         try: os.remove(f_)
         except OSError: pass
@@ -925,6 +948,7 @@ def wait_step(call_id, job, turn):
         if job.get('mode') in ('artist', 'radio') and idx + 1 < len(queue):
             job['qidx'] = idx + 1
             job['started'] = time.time()
+            start_prefetch(call_id, idx + 1, force=True)
             return wait_step(call_id, job, turn)
         job.update(stage='ask', status='idle', mode='single')
         return text_response(f'read=f-song_notfound.f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
@@ -1210,6 +1234,7 @@ def yemot_song():
                 return text_response(f'read=f-song_notfound.f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
             job['stage'] = 'wait'
             job['started'] = time.time()
+            start_prefetch(call_id, idx + 1, force=True)
             return wait_step(call_id, job, turn)
 
         if stage == 'wait':
@@ -1411,7 +1436,7 @@ def yemot_lib():
             try:
                 wav = ym_download(rec_path)
                 if n:
-                    ym_upload(wav, f'plname_{n}.wav', f'/5/plname_{n}.wav')
+                    ym_upload(wav, f'plname_{n}.wav', f'{LIB_DIR}/plname_{n}.wav')
                 ym_delete(rec_path)
             except Exception as e:
                 log.warning('lib name save failed pl=%s: %s', n, e)
@@ -1565,8 +1590,17 @@ NED_PROMPTS = {
 }
 
 def kan_latest_edition(program_id='11544'):
-    d = requests.get(f'https://mobapi.kan.org.il/api/mobile/program?id={program_id}',
-                     headers={'User-Agent': 'Mozilla/5.0'}, timeout=20).json()
+    for attempt in range(3):
+        r = requests.get(f'https://mobapi.kan.org.il/api/mobile/program?id={program_id}',
+                         headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
+        try:
+            r.raise_for_status()
+            d = r.json()
+            break
+        except (requests.RequestException, ValueError):
+            if attempt == 2:
+                raise
+            time.sleep(1 + attempt)
     entries = d.get('entry') or []
     if not entries:
         raise ValueError('no episodes')
@@ -1582,7 +1616,7 @@ def kan_latest_edition(program_id='11544'):
 ned_jobs = {}
 
 NED_STATIC = {'nc_menu', 'nc_chmenu', 'nc_after_flash', 'ned_searching', 'ned_wait',
-              'ned_notfound', 'ned_after', 'tg_listing', 'tg_searching', 'tg_notfound',
+              'ned_notfound', 'ned_after', 'tg_listing', 'tg_searching', 'tg_notfound', 'tg_paused',
               'news_searching', 'news_wait', 'news_intro', 'news_error', 'tg_end', 'rs_menu', 'rs_none'}
 
 def ned_sweep_stale():
@@ -1624,6 +1658,10 @@ def fetch_ned(call_id):
     import imageio_ffmpeg, glob as _glob
     job = ned_jobs[call_id]
     tmp = f'/tmp/ned-{call_id}'
+    proc = None
+    ferr = None
+    with _tmp_lock:
+        _active_tmp.add(tmp)
     try:
         url, title = kan_latest_edition()
         log.info('ned call=%s: %s -> %s', call_id, title, url[:80])
@@ -1664,6 +1702,17 @@ def fetch_ned(call_id):
     except Exception as e:
         log.warning('ned fetch failed call=%s: %s', call_id, e)
         job.update(status='error', err=str(e)[:200])
+
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+        if ferr is not None:
+            ferr.close()
+        with _tmp_lock:
+            _active_tmp.discard(tmp)
+        for path in _glob.glob(tmp + '*'):
+            try: os.remove(path)
+            except OSError: pass
 
 
 def upload_chunks_loop(proc, tmp, prefix, job, ferr_name):
@@ -2098,9 +2147,9 @@ def yemot_pniot():
         if re.fullmatch(r'S\d+', k):
             s_val, turn = v, int(k[1:])
 
+    if TG_PAUSED:
+        return text_response('id_list_message=f-pniot_paused')
     if s_val is None:
-        if TG_PAUSED:
-            return text_response('id_list_message=f-pniot_paused')
         return text_response(f'read=f-pniot_intro=S1,no,record,{PNIOT_DIR}/in,,no')
 
     try:
@@ -2499,42 +2548,54 @@ def itunes_podcast_search(term):
     return None
 
 def feed_enclosures(feed_url):
-    req = urllib.request.Request(feed_url, headers={'User-Agent': 'Mozilla/5.0'})
-    data = urllib.request.urlopen(req, timeout=25).read().decode('utf-8', 'ignore')
-    encs = re.findall(r'<enclosure[^>]*url="([^"]+)"', data)
-    return encs
+    import xml.etree.ElementTree as ET
+    r = requests.get(feed_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=25)
+    r.raise_for_status()
+    # XML parsing decodes &amp; in signed media URLs; regex left it literal,
+    # causing Omny to reject otherwise valid episodes with HTTP 400.
+    root = ET.fromstring(r.content)
+    return [el.attrib['url'] for el in root.iter()
+            if el.tag.split('}')[-1] == 'enclosure' and el.attrib.get('url')]
 
 def fetch_pod(call_id, pod_idx, ep_idx, pod=None):
-    job = pod_jobs[call_id]
-    tmp = f'/tmp/pod-{call_id}'
+    job = pod_jobs.get(call_id)
+    if not job:
+        return
+    tmp = f'/tmp/pod-{safe_name(call_id)}'
+    with _tmp_lock:
+        _active_tmp.add(tmp)
     try:
         import imageio_ffmpeg
         pod = pod or PODCASTS[pod_idx]
         encs = feed_enclosures(pod['feed'])
-        if ep_idx >= len(encs):
-            ep_idx = len(encs) - 1
-        if ep_idx < 0:
-            ep_idx = 0
+        if not encs:
+            raise ValueError('podcast feed has no audio episodes')
+        ep_idx = min(max(ep_idx, 0), len(encs) - 1)
         url = encs[ep_idx]
         log.info('pod %s ep %d: %s', pod['title'], ep_idx, url[:80])
-        mp3 = tmp + '.src'
-        urllib.request.urlretrieve(url, mp3)
         out = tmp + '.wav'
-        subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-i', mp3,
-                        '-ar', '8000', '-ac', '1', '-f', 'wav', out],
-                       check=True, capture_output=True, timeout=600)
-        name = 'pod' + re.sub(r'\D', '', call_id)[-6:]
-        with open(out, 'rb') as f:
-            ym_upload(f.read(), name + '.wav', f'/3/{name}.wav')
-        for f_ in (tmp + '.src', out):
-            try: os.remove(f_)
-            except OSError: pass
+        # Decode from the network directly. Keeping a whole video/source plus
+        # the decoded WAV filled the free host's disk on failed downloads.
+        with _media_slots:
+            _tmp_janitor_once()
+            if shutil.disk_usage('/tmp').free < 96 * 1048576:
+                raise RuntimeError('not enough temporary disk space for podcast')
+            proc = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y',
+                                  '-headers', 'User-Agent: Mozilla/5.0\r\n',
+                                  '-i', url, '-vn', '-ar', '8000', '-ac', '1',
+                                  '-f', 'wav', out], capture_output=True, timeout=600)
+            if proc.returncode:
+                raise RuntimeError('podcast audio conversion: ' + proc.stderr.decode('utf-8', 'ignore')[-400:])
+            name = 'pod' + safe_name(call_id)[-16:]
+            with open(out, 'rb') as f:
+                ym_upload(f.read(), name + '.wav', f'/3/{name}.wav')
         job.update(status='ready', name=name, ep=ep_idx)
         log.info('pod ready call=%s %s ep %d', call_id, pod['title'], ep_idx)
     except Exception as e:
         log.warning('pod fetch failed call=%s: %s', call_id, e)
         job.update(status='error', err=str(e)[:200])
-
+    finally:
+        _cleanup_tmp(tmp)
 
 def pod_display_name(title):
     t = (title or '').split('|')[0].strip()
@@ -2846,11 +2907,6 @@ def wiki_sections(text):
 def fetch_wiki(call_id, title, sub):
     job = wiki_jobs[call_id]
     try:
-        # clean previous article folders under /4
-        for f in ym_list_files('ivr2:/4'):
-            if f.get('fileType') == 'EXT' and f.get('name', '').isdigit() and f['name'] != sub:
-                try: ym_delete(f'/4/{f["name"]}')
-                except Exception: pass
         text = wiki_article_by_title(title)
         if not text:
             job.update(status='error', err='not found')
@@ -3023,7 +3079,7 @@ def fetch_translation(call_id, text, src_i, dst_i):
         out = r.json()['choices'][0]['message']['content'].strip()
         log.info('translate %s->%s: %r -> %r', src_en, dst_en, text[:50], out[:60])
         wav = tts_wav(out, voice=dst_voice)
-        name = 'tr' + re.sub(r'\D', '', call_id)[-6:]
+        name = 'tr' + safe_name(call_id)[-16:]
         old = job.get('name')
         if old and old != name:
             try: ym_delete(f'/6/{old}.wav')
@@ -3496,6 +3552,26 @@ threading.Thread(target=_auto_setup_hub, daemon=True).start()
 threading.Thread(target=_auto_setup_song2, daemon=True).start()
 
 threading.Thread(target=_auto_setup_chulin, daemon=True).start()
+
+def _auto_setup_library():
+    if not (YM_SYSTEM and YM_PASS):
+        return
+    time.sleep(12)
+    try:
+        names = {f.get('name') for f in ym_list_files(f'ivr2:{LIB_DIR}')}
+        if 'prompts_lib_v2.txt' in names:
+            return
+        link = f'{PUBLIC_BASE_URL}/yemot-lib?secret={BRIDGE_SECRET}'
+        ym_upload_text(f'type=api\napi_link={link}\napi_dir={LIB_DIR}\napi_url_post=no\n',
+                       f'{LIB_DIR}/ext.ini')
+        for name in LIB_PROMPTS:
+            ym_upload(tts_wav(SONG_PROMPTS[name]), name + '.wav', f'{LIB_DIR}/{name}.wav')
+        ym_upload_text('ok', f'{LIB_DIR}/prompts_lib_v2.txt')
+        log.info('library entry and prompts installed')
+    except Exception:
+        log.exception('library setup failed')
+
+threading.Thread(target=_auto_setup_library, daemon=True).start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
