@@ -447,7 +447,8 @@ SYSTEM_PROMPT = (
     '2) תשובות קצרות: משפט אחד עד שלושה משפטים. לעולם לא רשימות, מספור, אימוג׳י, כוכביות או סימנים מיוחדים - הטקסט מוקרא בקול. '
     '3) אם המשתמש נפרד או מבקש לסיים (ביי, להתראות, די, תודה זהו) - התחילי את התשובה במילה BYE: ולאחריה משפט פרידה אחד קצר. '
     '4) אם הבקשה לא ברורה, בקשי שיחזור בשאלה קצרה. '
-    '5) את בקו אישי וחברותי - שיחה קלה, לא רשמית.'
+    '5) את בקו אישי וחברותי - שיחה קלה, לא רשמית. '
+    '6) לעולם אל תאמרי שהמידע עדכני או מהאינטרנט אלא אם צורף לך מקור עם תאריך. אל תמציאי מקורות, מספרים או תאריכים.'
 )
 
 sessions = {}
@@ -582,6 +583,8 @@ def save_history(phone, h):
     if not phone or h.get('_nosave'):
         return False
     p = hist_path(phone)
+    h['v'] = 2
+    h['updated'] = time.strftime('%Y-%m-%d %H:%M')
     body = json.dumps({k: v for k, v in h.items() if not k.startswith('_')}, ensure_ascii=False).encode('utf-8')
     tmp = p[:-4] + '.new'
     try:
@@ -637,10 +640,10 @@ def resume_take(call_id, ext):
 
 # ---------- Groq ----------
 
-def groq_stt(wav_bytes, language='he'):
+def groq_stt(wav_bytes, language='he', min_dur=1.2):
     if wav_bytes[:4] == b'RIFF' and len(wav_bytes) >= 44:
         dur = (len(wav_bytes) - 44) / 16000.0
-        if dur < 1.2:
+        if dur < min_dur:
             log.info('stt skip: recording too short (%.2fs)', dur)
             return ''
     r = requests.post(f'{GROQ}/audio/transcriptions',
@@ -723,6 +726,36 @@ def upload_reply(text, call_id, turn):
     ym_upload(wav, name, ym_path)
     return name, ym_path
 
+STT_HALLUCINATIONS = ('תודה שצפיתם', 'תודה על הצפייה', 'כתוביות', 'תרגום', 'amara', 'subtitles', 'סאבטייטלס', 'לייק ושתף', 'הירשמו לערוץ')
+BYE_RE = re.compile(r'^\W*(?:ביי(?: ביי)?|להתראות|שלום ולהתראות|תודה ולהתראות|תודה ביי|תודה זהו|זהו תודה|זהו|די תודה|סיימתי|יום טוב|לילה טוב)\W*$')
+BACK_RE = re.compile(r'^\W*(?:חזרה לתפריט(?: הראשי)?|חזור לתפריט(?: הראשי)?|תפריט(?: ראשי)?|חזרה)\W*$')
+
+def clean_stt(text):
+    """Whisper invents subtitle phrases on silence; treat those as nothing heard."""
+    t = (text or '').strip()
+    low = t.lower()
+    if any(h in low for h in STT_HALLUCINATIONS) and len(t.split()) <= 8:
+        return ''
+    return t
+
+FORGET_RE = re.compile(r'(תשכח|תשכחי|שכח|שכחי|תמחק|תמחוק|תמחקי|מחק|מחקי|תנקה|נקה|נקי)\s+(לי\s+)?(את\s+)?(כל\s+)?(ה)?(היסטוריה|היסטוריית|שיחות|זיכרון|הזיכרון)')
+
+def forget_history(phone):
+    """Delete this caller's stored history. Returns True only if no history file remains."""
+    if not phone:
+        return True
+    p = hist_path(phone)
+    ym_delete(p); ym_delete(p[:-4] + '.new')
+    try:
+        d = ym_get('GetFiles', path=ym_p(HIST_DIR)).json()
+        if d.get('responseStatus') != 'OK':
+            return False
+        names = {f.get('name') for f in (d.get('files') or [])}
+        return safe_name(p) not in names and safe_name(p[:-4] + '.new') not in names
+    except Exception as e:
+        log.warning('forget verify failed: %s', e)
+        return False
+
 def summarize_if_needed(phone, h):
     if len(h['turns']) <= 10:
         return h
@@ -730,7 +763,7 @@ def summarize_if_needed(phone, h):
         convo = '\n'.join(f"{'מתקשר' if t[0]=='u' else 'אוזן'}: {t[1]}" for t in h['turns'][:-4])
         summ = groq_chat([{'role': 'system', 'content': 'סכמי בעברית בשניים-שלושה משפטים את השיחה הבאה, בגוף שלישי, כולל נושאים ופתרונות עיקריים.'},
                           {'role': 'user', 'content': (h.get('summary','') + '\n' + convo).strip()}], max_tokens=120)
-        h['summary'] = summ
+        h['summary'] = summ[:700]
         h['turns'] = h['turns'][-4:]
     except Exception as e:
         log.warning('summarize failed: %s', e)
@@ -928,6 +961,7 @@ SONG_PROMPTS = {
     'song_searching': 'רגע אחד, אני מחפשת את השיר. זה יכול לקחת חצי דקה.',
     'song_wait': 'עוד ממש קצת, השיר כבר בדרך.',
     'song_notfound': 'סליחה, לא מצאתי את זה. נסו שוב.',
+    'song_disk': 'השרת עמוס כרגע ואין מקום להוריד את השיר. נסו שוב בעוד דקה או שתיים.',
     'song_more': 'מה בא לכם עכשיו?',
     'song_bye': 'כיף היה! נתראה בשיר הבא. להתראות!',
     'song_after': 'לשמירת השיר ברשימה, הקישו 1. לשיר נוסף, הקישו 2. לסיום, הקישו 3. לרדיו עם שירים דומים, הקישו 4.',
@@ -967,8 +1001,8 @@ LIB_PROMPTS = ('lib_pick', 'lib_bad', 'lib_choose', 'lib_for', 'lib_for_list', '
 # prompts the extension-2 upgrade needs on Yemot; uploaded once by _auto_setup_song2
 SONG2_NEW_PROMPTS = ('song_mode', 'song_how', 'song_typehow', 'song_artist', 'song_artist_voice',
                      'artist_typehow', 'song_ask', 'song_more', 'song_notfound', 'song_after',
-                     'song_artist_ask', 'song_auto_next', 'song_queue_done', 'song_radio_on', 'song_after_free')
-SONG2_PROMPT_VERSION = 'v5'
+                     'song_artist_ask', 'song_auto_next', 'song_queue_done', 'song_radio_on', 'song_after_free', 'song_disk')
+SONG2_PROMPT_VERSION = 'v6disk'
 
 ARTIST_RESULT_LIMIT = 60   # singer radio: everything the paginated search yields
 ARTIST_PAGE_LIMIT = 25     # results screen announces the first 25 (5 pages of 5)
@@ -1036,12 +1070,31 @@ def slot_name(call_id, idx):
     """Alternating Yemot file slots so the next song can upload while this one plays."""
     return ('song' if idx % 2 == 0 else 'next') + re.sub(r'\D', '', call_id)[-6:]
 
+class DiskLowError(RuntimeError):
+    pass
+
+MIN_FREE_MB_DOWNLOAD = int(os.environ.get('MIN_FREE_MB_DOWNLOAD', '20'))
+
+def disk_guard(min_mb=None):
+    """Refuse a large download when /tmp is nearly full (the host has ~63 MB free at idle)."""
+    need = (min_mb or MIN_FREE_MB_DOWNLOAD) * 1048576
+    if shutil.disk_usage('/tmp').free < need:
+        try:
+            _tmp_janitor_once()
+        except Exception:
+            pass
+        free = shutil.disk_usage('/tmp').free
+        if free < need:
+            log.warning('disk guard: %d MB free, need %d MB', free // 1048576, need // 1048576)
+            raise DiskLowError('not enough temporary disk space')
+
 def _download_convert(call_id, video_id, search_title=None, tmp=None):
     """yt-dlp download -> 8k mono wav. Returns (title, wav_path); caller uploads/cleans."""
     import imageio_ffmpeg, glob as _glob
     if not YT_REFRESH_TOKEN and not video_id.startswith('jm:'):
         raise ValueError('YT_REFRESH_TOKEN not set')
     tmp = tmp or f'/tmp/song-{call_id}'
+    disk_guard()
     with _tmp_lock:
         _active_tmp.add(tmp)
     if video_id.startswith('jm:'):
@@ -1119,7 +1172,7 @@ def fetch_queue_song(call_id, idx):
     except Exception as e:
         if job.get(f'{key}_want') == idx:
             log.warning('queue song failed call=%s idx=%s: %s', call_id, idx, e)
-            job.update(**{f'{key}_status': 'error', f'{key}_err': str(e)[:200]})
+            job.update(**{f'{key}_status': 'error', f'{key}_err': 'disk' if isinstance(e, DiskLowError) else str(e)[:200]})
     finally:
         _cleanup_tmp(tmp)
 
@@ -1147,8 +1200,7 @@ def _jm_get(path, **params):
     if not JAMENDO_CLIENT_ID:
         raise ValueError('JAMENDO_CLIENT_ID not set')
     params.update(client_id=JAMENDO_CLIENT_ID, format='json')
-    from urllib.parse import urlencode, quote
-    r = requests.get(f'{JAMENDO_API}/{path}/?' + urlencode(params, quote_via=quote), timeout=20)
+    r = requests.get(f'{JAMENDO_API}/{path}/', params=params, timeout=20)
     r.raise_for_status()
     d = r.json()
     if (d.get('headers') or {}).get('status') != 'success':
@@ -1164,15 +1216,8 @@ def _jm_remember(t):
 
 def jamendo_search(query, limit=15):
     """Returns [('jm:<id>', 'name - artist'), ...] and fills the track cache."""
-    # Jamendo's API intermittently answers success with 0 results for a query that has hits
-    # (seen ~1 in 3 calls), so an empty answer is retried a few times before giving up.
-    res = []
-    for attempt in range(5):
-        res = _jm_get('tracks', search=query, limit=limit, audioformat='mp31',
-                      boost='popularity_month')
-        if res:
-            break
-        time.sleep(0.6)
+    res = _jm_get('tracks', search=query, limit=limit, audioformat='mp31',
+                  boost='popularity_month', type='single albumtrack')
     out = []
     for t in res:
         tid = _jm_remember(t)
@@ -1319,6 +1364,10 @@ def wait_step(call_id, job, turn):
             return text_response(play_chain('f-song_wait', f'S{turn+1}'))
     if st == 'error':
         queue = job.get('queue') or []
+        if job.get(f'{key}_err') == 'disk':
+            # every next song would fail the same way: say so honestly instead of "not found"
+            job.update(stage='ask', status='idle', mode='single')
+            return text_response('read=f-song_disk.f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
         if job.get('mode') in ('artist', 'radio') and idx + 1 < len(queue):
             job['qidx'] = idx + 1
             job['started'] = time.time()
@@ -2654,9 +2703,12 @@ HUB_PROMPTS = {
     'hub_err_gemini': 'ג׳מיני לא זמין כרגע. אפשר לנסות שוב בעוד כמה דקות, או לבחור בגרוק. להתראות.',
     'hub_err_groq': 'גרוק לא זמין כרגע. אפשר לנסות שוב בעוד כמה דקות, או לבחור בג׳מיני. להתראות.',
     'hub_err_speech': 'לא הצלחתי לעבד את ההקלטה. אפשר לנסות שוב בעוד רגע. להתראות.',
+    'didnt_hear': 'סליחה, לא שמעתי טוב. אפשר לחזור על זה? דברו אחרי הצליל, ולסיום הקישו סולמית.',
+    'error': 'סליחה, הייתה תקלה טכנית. נסו שוב קצת מאוחר יותר. להתראות!',
+    'tired': 'וואו, דיברנו היום המון! נגמרו לי הכוחות להיום. נדבר מחר, בסדר? להתראות!',
     'hub_groq_intro': 'בחרתם גרוק. דברו אחרי הצליל, ולסיום הקישו סולמית.',
 }
-HUB_PROMPT_VERSION = 'v4err' 
+HUB_PROMPT_VERSION = 'v5voice' 
 
 CHULIN_SYSTEM = (
     'את "חולין", צ׳אטבוט קולי שובב וחכם בקו טלפוני. '
@@ -2692,6 +2744,60 @@ def web_context(query):
             log.info('chulin news ctx failed: %s', e)
     return '\n'.join(parts)
 
+
+# ---- extension 1: search policy (greetings/free chat never search; sourced facts only) ----
+SMALLTALK = re.compile(r'^\W*(שלום|היי|הי|הלו|בוקר טוב|ערב טוב|צהריים טובים|לילה טוב|מה נשמע|מה שלומך|מה המצב|מה קורה|תודה|תודה רבה|בסדר|אוקיי|אוקי|סבבה|כן|לא|ביי|להתראות|יופי|אחלה|מעולה)\b[\s\w]{0,20}\W*$')
+FACT_CUES = re.compile(r'(?<![א-ת])ה?(?:חדשות|מזג|עדכני|מי זה|מי היא|מי הוא|מה זה|מי ניצח|ניצח|זכה|מחיר|שער|מלחמ|בחירות|כותרות|ממשלה|נתניהו|מונדיאל|ליגה|תוצאות|ראש הממשלה|נשיא|באיזו שנה|בירת|כמה תושבים|כמה אנשים)')
+
+def hub_wants_search(text):
+    t = re.sub(r'\s+', ' ', (text or '')).strip()
+    if len(t.split()) <= 1 or SMALLTALK.match(t):
+        return False
+    return bool(FACT_CUES.search(t))
+
+def _content_tokens(q):
+    return [w for w in re.findall(r'[\u0590-\u05FFA-Za-z0-9]{3,}', q or '') if w not in HEB_STOP]
+
+HEB_STOP = {'מה','מי','איפה','מתי','איך','למה','כמה','את','של','על','עם','זה','זאת','הוא','היא','אני','אתה','יש','לי','לך','אפשר','תגיד','תגידי','ספר','ספרי','לגבי','בבקשה','היום','השבוע','אתמול'}
+
+TIMELY = re.compile(r'(?<![א-ת])ה?(?:חדשות|מזג|אתמול|היום|השבוע|ניצח|זכה|מחיר|שער|תוצאות|כותרות|עדכני|בחירות|מלחמ|ממשלה|נתניהו)')
+
+def hub_sources(query):
+    """Return (context_text, sources). Only relevant hits, each with source name and date."""
+    import html
+    toks = _content_tokens(query)
+    lines = []
+    timely = bool(TIMELY.search(query))
+    try:
+        if timely:
+            raise StopIteration   # Wikipedia is not a source for time-sensitive questions
+        r = requests.get('https://he.wikipedia.org/w/api.php',
+                         params={'action': 'query', 'list': 'search', 'srsearch': query, 'utf8': 1, 'format': 'json',
+                                 'srlimit': 3, 'srprop': 'snippet|timestamp'}, headers=WIKI_HEADERS, timeout=12)
+        for hit in r.json().get('query', {}).get('search', []):
+            snip = html.unescape(re.sub(r'<[^>]+>', '', hit.get('snippet', ''))).strip()
+            hay = (hit.get('title', '') + ' ' + snip)
+            if not snip or not (toks and any(w in hay for w in toks)):
+                continue
+            d = (hit.get('timestamp') or '')[:10]
+            lines.append(f"מקור: ויקיפדיה העברית, ערך {hit['title']}, ערך עודכן לאחרונה ב-{d or 'תאריך לא ידוע'}: {snip}")
+            if len(lines) >= 2:
+                break
+    except StopIteration:
+        pass
+    except Exception as e:
+        log.info('hub wiki ctx failed: %s', e)
+    if timely:
+        try:
+            heads = news_headlines(5)
+            if heads:
+                lines.append(f"מקור: כותרות ynet, נשלפו בזמן השיחה ({today()}), ייתכן שאינן עונות על השאלה: " + ' | '.join(heads))
+        except Exception as e:
+            log.info('hub news ctx failed: %s', e)
+    return '\n'.join(lines), len(lines)
+
+HUB_SOURCE_RULES = ('להלן מקורות שנשלפו עבור השאלה, עם שם המקור ותאריך. אם את משתמשת בהם, צייני בקצרה את שם המקור ואת התאריך כפי שכתוב. '
+                    'אל תאמרי שהמידע עדכני אלא אם התאריך שבמקור באמת עדכני. אם המקורות לא עונים על השאלה, אמרי בכנות שלא מצאת מידע מהימן ואל תמציאי.')
 
 CHULIN_PROMPTS = {
     'chulin_menu': 'לבחירת צ׳אט חולין עם גרוק, הקישו 1. לבחירת אותה השיחה עם ג׳מיני, הקישו 2.',
@@ -3727,7 +3833,7 @@ def yemot():
             claimed_recordings.add(rec_path)
         wav = ym_download('ivr2:' + rec_path if not rec_path.startswith('ivr2:') else rec_path)
         try:
-            user_text = groq_stt(wav)
+            user_text = clean_stt(groq_stt(wav, min_dur=0.5))
         except Exception as e:
             log.error('call=%s stt failed: %s', call_id, str(e)[:200])
             with lock:
@@ -3743,9 +3849,35 @@ def yemot():
         if not user_text:
             sess['empty'] += 1
             if sess['empty'] >= 2:
-                return text_response('id_list_message=f-error')
+                with lock:
+                    sessions.pop(call_id, None)
+                nm, _ = upload_reply('לא שמעתי אותך. נסו להתקשר שוב. להתראות!', call_id, turn)
+                return text_response(f'id_list_message=f-{nm[:-4]}')
             return text_response(f'read=f-didnt_hear=S{turn+1},no,record,{IN_DIR},,no')
         sess['empty'] = 0
+
+        # --- spoken exit / back: same behaviour for both assistants, decided in code ---
+        norm = user_text.strip()
+        if BACK_RE.match(norm):
+            with lock:
+                sessions.pop(call_id, None)
+            log.info('call=%s spoken back to main menu', call_id)
+            return text_response('go_to_folder=/')
+        if BYE_RE.match(norm):
+            with lock:
+                sessions.pop(call_id, None)
+            nm, _ = upload_reply('להתראות! היה כיף לדבר איתך.', call_id, turn)
+            log.info('call=%s spoken goodbye', call_id)
+            return text_response(f'id_list_message=f-{nm[:-4]}')
+
+        # --- caller asked to forget their history ---
+        if FORGET_RE.search(user_text):
+            ok = forget_history(phone)
+            sess['hist'] = h = {'summary': '', 'turns': [], 'day': h.get('day', ''), 'day_turns': h.get('day_turns', 0)}
+            msg = 'מחקתי את ההיסטוריה שלך. נתחיל מחדש. במה אפשר לעזור?' if ok else 'לא הצלחתי למחוק את ההיסטוריה כרגע. נסו שוב מאוחר יותר.'
+            log.info('call=%s forget history ok=%s', call_id, ok)
+            name, _ = upload_reply(msg, call_id, turn)
+            return text_response(f'read=f-{name[:-4]}=S{turn+1},no,record,{IN_DIR},,no')
 
         # --- daily cap ---
         if h.get('day') != today():
@@ -3761,14 +3893,18 @@ def yemot():
         msgs = [{'role': 'system', 'content': sys_prompt}]
         if h.get('summary') and assist['system'] == 'ozen':
             msgs.append({'role': 'system', 'content': 'רקע משיחות קודמות עם המתקשר הזה: ' + h['summary']})
-        want_web = assist['web'] == 'always' or (assist['web'] == 'factualish' and FACTUALISH.search(user_text))
+        want_web = assist['web'] == 'always' or (assist['web'] == 'factualish' and hub_wants_search(user_text))
+        n_src = 0
         if want_web:
             try:
-                ctx = web_context(user_text)
+                ctx, n_src = hub_sources(user_text)
                 if ctx:
-                    msgs.append({'role': 'system', 'content': 'מידע עדכני מהאינטרנט שנשלף כרגע, הסתמכי עליו אם רלוונטי:\n' + ctx})
+                    msgs.append({'role': 'system', 'content': HUB_SOURCE_RULES + '\n' + ctx})
+                else:
+                    msgs.append({'role': 'system', 'content': 'חיפשנו ברשת ולא נמצא מקור רלוונטי לשאלה. אם זו שאלה עובדתית, אמרי בכנות שאין לך מידע מהימן ואל תמציאי.'})
             except Exception as e:
                 log.info('chat web ctx failed: %s', e)
+        log.info('call=%s turn=%d search=%s sources=%d', call_id, turn, want_web, n_src)
         for who, txt in h.get('turns', [])[-8:]:
             msgs.append({'role': 'user' if who == 'u' else 'assistant', 'content': txt})
         msgs.append({'role': 'user', 'content': user_text})
@@ -3778,6 +3914,7 @@ def yemot():
             log.error('call=%s %s provider failed: %s', call_id, assist['model'], str(e)[:200])
             stats['errors'] += 1
             return text_response('id_list_message=f-hub_err_' + assist['model'])
+        t_llm_done = time.time()
         is_bye = reply.upper().startswith('BYE')
         reply_text = re.sub(r'^BYE:?\s*', '', reply, flags=re.I).strip() or 'להתראות!'
         log.info('call=%s turn=%d llm(%.1fs) bye=%s: %s', call_id, turn, time.time()-t0, is_bye, reply_text[:80])
@@ -3790,7 +3927,9 @@ def yemot():
         save_history(phone, h)
 
         # --- synthesize + upload reply ---
+        t_tts0 = time.time()
         name, ym_path = upload_reply(reply_text, call_id, turn)
+        log.info('TIMING call=%s turn=%d total=%.1fs stt_to_llm_done=%.1fs tts+upload=%.1fs search=%s', call_id, turn, time.time()-t0, t_llm_done-t0, time.time()-t_tts0, want_web)
         stats['turns'] += 1
 
         if is_bye:
