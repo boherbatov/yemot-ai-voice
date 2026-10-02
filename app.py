@@ -2574,15 +2574,26 @@ def fetch_pod(call_id, pod_idx, ep_idx, pod=None):
         url = encs[ep_idx]
         log.info('pod %s ep %d: %s', pod['title'], ep_idx, url[:80])
         out = tmp + '.wav'
-        # Decode from the network directly. Keeping a whole video/source plus
-        # the decoded WAV filled the free host's disk on failed downloads.
+        # Stream the download to a file. The bundled ffmpeg does not support
+        # HTTPS on every host, so only requests handles the network input.
         with _media_slots:
             _tmp_janitor_once()
-            if shutil.disk_usage('/tmp').free < 96 * 1048576:
+            free = shutil.disk_usage('/tmp').free
+            if free < 96 * 1048576:
                 raise RuntimeError('not enough temporary disk space for podcast')
+            source = tmp + '.src'
+            downloaded = 0
+            with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'},
+                              stream=True, timeout=(20, 45)) as r:
+                r.raise_for_status()
+                with open(source, 'wb') as f:
+                    for chunk in r.iter_content(65536):
+                        downloaded += len(chunk)
+                        if downloaded > min(128 * 1048576, free - 80 * 1048576):
+                            raise RuntimeError('podcast source exceeds safe temporary space')
+                        f.write(chunk)
             proc = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y',
-                                  '-headers', 'User-Agent: Mozilla/5.0\r\n',
-                                  '-i', url, '-vn', '-ar', '8000', '-ac', '1',
+                                  '-i', source, '-vn', '-ar', '8000', '-ac', '1',
                                   '-f', 'wav', out], capture_output=True, timeout=600)
             if proc.returncode:
                 raise RuntimeError('podcast audio conversion: ' + proc.stderr.decode('utf-8', 'ignore')[-400:])
