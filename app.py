@@ -921,7 +921,8 @@ SONG_PROMPTS = {
     'song_how': 'באיזו דרך לחפש? להקלדה בעברית, הקישו 1. לחיפוש בדיבור, הקישו 2. להקלדה באנגלית, הקישו 3.',
     'artist_typehow': 'הקלידו את שם הזמר, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לסיום הקישו סולמית.',
     'song_artist_voice': 'אם בא לכם, אמרו גם את שם הזמר. דברו אחרי הצליל, ולסיום הקישו סולמית. לחיפוש בלי זמר, הקישו סולמית ישר.',
-    'song_mode': 'מה בא לכם? לחיפוש לפי שיר, הקישו 1. לחיפוש לפי זמר, הקישו 2. להרשימות השירים שלכם, הקישו 3.',
+    'song_mode': 'מה בא לכם? לחיפוש לפי שיר, הקישו 1. לחיפוש לפי זמר, הקישו 2. להרשימות השירים שלכם, הקישו 3. לחיפוש במאגרי מוזיקה חופשיים, הקישו 4.',
+    'song_after_free': 'לשמירת השיר ברשימה, הקישו 1. לשיר נוסף, הקישו 2. לסיום, הקישו 3.',
     'song_typehow': 'הקלידו את שם השיר, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לסיום הקישו סולמית.',
     'song_artist': 'עכשיו הקלידו את שם הזמר, או הקישו רק סולמית לדילוג.',
     'song_searching': 'רגע אחד, אני מחפשת את השיר. זה יכול לקחת חצי דקה.',
@@ -966,8 +967,8 @@ LIB_PROMPTS = ('lib_pick', 'lib_bad', 'lib_choose', 'lib_for', 'lib_for_list', '
 # prompts the extension-2 upgrade needs on Yemot; uploaded once by _auto_setup_song2
 SONG2_NEW_PROMPTS = ('song_mode', 'song_how', 'song_typehow', 'song_artist', 'song_artist_voice',
                      'artist_typehow', 'song_ask', 'song_more', 'song_notfound', 'song_after',
-                     'song_artist_ask', 'song_auto_next', 'song_queue_done', 'song_radio_on')
-SONG2_PROMPT_VERSION = 'v4'
+                     'song_artist_ask', 'song_auto_next', 'song_queue_done', 'song_radio_on', 'song_after_free')
+SONG2_PROMPT_VERSION = 'v5'
 
 ARTIST_RESULT_LIMIT = 60   # singer radio: everything the paginated search yields
 ARTIST_PAGE_LIMIT = 25     # results screen announces the first 25 (5 pages of 5)
@@ -1038,12 +1039,16 @@ def slot_name(call_id, idx):
 def _download_convert(call_id, video_id, search_title=None, tmp=None):
     """yt-dlp download -> 8k mono wav. Returns (title, wav_path); caller uploads/cleans."""
     import imageio_ffmpeg, glob as _glob
-    if not YT_REFRESH_TOKEN:
+    if not YT_REFRESH_TOKEN and not video_id.startswith('jm:'):
         raise ValueError('YT_REFRESH_TOKEN not set')
     tmp = tmp or f'/tmp/song-{call_id}'
     with _tmp_lock:
         _active_tmp.add(tmp)
-    title, _dur = yt_download(video_id, tmp + '.%(ext)s')
+    if video_id.startswith('jm:'):
+        info = jamendo_download(video_id[3:], tmp + '.mp3')
+        title = f"{info['name']} - {info['artist']}".strip(' -')
+    else:
+        title, _dur = yt_download(video_id, tmp + '.%(ext)s')
     if title == 'שיר' and search_title:
         title = search_title
     files = sorted(_glob.glob(tmp + '.*'))
@@ -1082,7 +1087,10 @@ def fetch_queue_song(call_id, idx):
         if not title or title == 'שיר':
             title = hint or title or 'שיר'
         ann_wav = None
-        if job.get('mode') in ('artist', 'radio'):
+        if video_id.startswith('jm:'):
+            info = _jm_cache.get(video_id[3:]) or {}
+            ann_wav = tts_wav(f"{info.get('name') or title}. מוזיקה מג'מנדו, האמן {info.get('artist') or 'לא ידוע'}.")
+        elif job.get('mode') in ('artist', 'radio'):
             n = idx + 1
             if n == 1:
                 text = (f'שיר מספר {n}. {title}. לדילוג לשיר הבא, הקישו 9. '
@@ -1127,6 +1135,95 @@ def start_prefetch(call_id, idx, force=False):
     job[f'{key}_want'] = idx
     job[f'{key}_status'] = 'working'
     threading.Thread(target=fetch_queue_song, args=(call_id, idx), daemon=True).start()
+
+# ---------- Jamendo (free-music search, extension 2 key 4) ----------
+# Openly licensed (Creative Commons) catalog, official free API, non-commercial use.
+# Songs are converted per call into temp files and deleted - no caching/offline copies.
+JAMENDO_CLIENT_ID = os.environ.get('JAMENDO_CLIENT_ID', '')
+JAMENDO_API = 'https://api.jamendo.com/v3.0'
+_jm_cache = {}   # track id -> {'name','artist','audio','shareurl'}
+
+def _jm_get(path, **params):
+    if not JAMENDO_CLIENT_ID:
+        raise ValueError('JAMENDO_CLIENT_ID not set')
+    params.update(client_id=JAMENDO_CLIENT_ID, format='json')
+    r = requests.get(f'{JAMENDO_API}/{path}/', params=params, timeout=20)
+    r.raise_for_status()
+    d = r.json()
+    if (d.get('headers') or {}).get('status') != 'success':
+        raise ValueError('jamendo error: ' + str((d.get('headers') or {}).get('error_message'))[:150])
+    return d.get('results') or []
+
+def _jm_remember(t):
+    tid = str(t.get('id') or '')
+    if tid and t.get('audio'):
+        _jm_cache[tid] = {'name': t.get('name') or 'שיר', 'artist': t.get('artist_name') or '',
+                          'audio': t['audio'], 'shareurl': t.get('shareurl') or ''}
+    return tid
+
+def jamendo_search(query, limit=15):
+    """Returns [('jm:<id>', 'name - artist'), ...] and fills the track cache."""
+    res = _jm_get('tracks', search=query, limit=limit, audioformat='mp31',
+                  boost='popularity_month', type='single albumtrack')
+    out = []
+    for t in res:
+        tid = _jm_remember(t)
+        if tid in _jm_cache:
+            i = _jm_cache[tid]
+            out.append((f'jm:{tid}', f"{i['name']} - {i['artist']}".strip(' -')))
+    return out
+
+def jamendo_download(tid, outpath):
+    """Stream the mp3 of a Jamendo track to outpath; returns the track dict."""
+    info = _jm_cache.get(tid)
+    if not info:
+        res = _jm_get('tracks', id=tid, audioformat='mp31')
+        if not res or _jm_remember(res[0]) not in _jm_cache:
+            raise ValueError('jamendo track not found')
+        info = _jm_cache[tid]
+    with requests.get(info['audio'], stream=True, timeout=30) as r:
+        r.raise_for_status()
+        with open(outpath, 'wb') as f:
+            for chunk in r.iter_content(65536):
+                f.write(chunk)
+    if os.path.getsize(outpath) < 2000:
+        raise ValueError('jamendo audio too small')
+    log.info('jamendo track=%s page=%s', tid, info.get('shareurl'))
+    return info
+
+def fetch_free_results(call_id, query):
+    """Key-4 search: same paged results screen as fetch_results, Jamendo as the source."""
+    job = song_jobs.get(call_id)
+    if not job:
+        return
+    try:
+        results = jamendo_search(query, limit=15)
+        if not results:
+            raise ValueError('no results')
+        cid = re.sub(r'\D', '', call_id)[-6:]
+        pages = []
+        for p in range(0, len(results), 5):
+            chunk = results[p:p + 5]
+            parts = ['מצאתי את השירים האלה.'] if p == 0 else ['התוצאות הבאות.']
+            for i, (_vid, t) in enumerate(chunk, 1):
+                t = re.sub(r'\s+', ' ', (t or '')).strip()[:70]
+                parts.append(f'{i}. {t}.')
+            parts.append('הקישו את מספר השיר. לתוצאות נוספות, הקישו 0.')
+            name = f'res{cid}p{p // 5}'
+            ym_delete(f'{SONG_DIR}/{name}.wav')
+            ym_upload(tts_wav(' '.join(parts)), name + '.wav', f'{SONG_DIR}/{name}.wav')
+            pages.append(name)
+        job.update(status='ready', results=results, pages=pages, page_idx=0)
+        log.info('free results call=%s: %d results', call_id, len(results))
+    except Exception as e:
+        log.warning('free results failed call=%s: %s', call_id, e)
+        job.update(status='error', err=str(e)[:200])
+
+def _results_fn(job):
+    return fetch_free_results if job.get('kind') == 'free' else fetch_results
+
+def _query_kind(job):
+    return 'free' if job.get('kind') == 'free' else 'song'
 
 def fetch_results(call_id, query):
     """Multi-result search: announce up to 3 pages of 5 results as TTS prompts."""
@@ -1346,8 +1443,8 @@ def yemot_song():
             return text_response(f'read=f-song_ask=S1,no,record,{IN_DIR},,no')
         if how is not None:
             return text_response('read=f-song_how=HOW,no,1,1,10,No,yes,,,,,,,,no')
-        if mode in ('1', '2'):
-            job['kind'] = 'song' if mode == '1' else 'artist'
+        if mode in ('1', '2', '4'):
+            job['kind'] = {'1': 'song', '2': 'artist', '4': 'free'}[mode]
             return text_response('read=f-song_how=HOW,no,1,1,10,No,yes,,,,,,,,no')
         if mode == '3':
             with lock:
@@ -1400,9 +1497,9 @@ def yemot_song():
                 job['stage'] = 'ask'
                 return text_response(f'read=f-song_ask=S{turn+1},no,record,{IN_DIR},,no')
             log.info('song voice query call=%s song=%r artist=%r', call_id, song[:60], artist[:60])
-            job.update(stage='searching', status='working', kind='song', query=q,
+            job.update(stage='searching', status='working', kind=_query_kind(job), query=q,
                        started=time.time())
-            threading.Thread(target=fetch_results, args=(call_id, q), daemon=True).start()
+            threading.Thread(target=_results_fn(job), args=(call_id, q), daemon=True).start()
             return text_response(play_chain('f-song_searching', f'S{turn+1}'))
 
         if stage == 'ask_artist':
@@ -1414,13 +1511,17 @@ def yemot_song():
             if not song and not artist:
                 return text_response(multitap_read('f-song_typehow', f'S{turn+1}', allow_empty=True))
             if not song:
+                if job.get('kind') == 'free':
+                    job.update(stage='searching', status='working', query=artist, started=time.time())
+                    threading.Thread(target=fetch_free_results, args=(call_id, artist), daemon=True).start()
+                    return text_response(play_chain('f-song_searching', f'S{turn+1}'))
                 job.update(stage='searching', status='working', kind='artist',
                            artist=artist, started=time.time())
                 threading.Thread(target=fetch_artist_results, args=(call_id, artist), daemon=True).start()
                 return text_response(play_chain('f-song_searching', f'S{turn+1}'))
             q = clean_song_query((song + ' ' + artist).strip())
-            job.update(stage='searching', status='working', kind='song', query=q, started=time.time())
-            threading.Thread(target=fetch_results, args=(call_id, q), daemon=True).start()
+            job.update(stage='searching', status='working', kind=_query_kind(job), query=q, started=time.time())
+            threading.Thread(target=_results_fn(job), args=(call_id, q), daemon=True).start()
             return text_response(play_chain('f-song_searching', f'S{turn+1}'))
 
         if stage == 'artist_typed':
@@ -1535,7 +1636,8 @@ def yemot_song():
             job['stage'] = 'after'
             if in_seq and job.get('qidx', 0) + 1 < len(queue):
                 return text_response(f'read=f-song_auto_next=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
-            return text_response(f'read=f-song_after=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
+            after_p = 'song_after_free' if str(job.get('video_id') or '').startswith('jm:') else 'song_after'
+            return text_response(f'read=f-{after_p}=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
 
         if stage == 'after':
             if s_val == '1':
@@ -1548,7 +1650,7 @@ def yemot_song():
                 with lock:
                     song_jobs.pop(call_id, None)
                 return text_response('id_list_message=f-song_bye')
-            if s_val == '4' and job.get('video_id'):
+            if s_val == '4' and job.get('video_id') and not str(job.get('video_id')).startswith('jm:'):
                 job.update(stage='radio_build', status='working', mode='radio', started=time.time())
                 threading.Thread(target=fetch_radio, args=(call_id, job['video_id'], job.get('title')), daemon=True).start()
                 return text_response(play_chain('f-song_radio_on', f'S{turn+1}'))
