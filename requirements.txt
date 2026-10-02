@@ -9,3 +9,4 @@ telethon>=1.40
 bgutil-ytdlp-pot-provider==2.0.0
 yt-dlp-ejs==0.8.0
 deno==2.9.5
+mwparserfromhell==0.7.2

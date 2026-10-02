@@ -3149,7 +3149,33 @@ def wiki_article_by_title(title):
     extract = next(iter(pages.values()), {}).get('extract', '')
     return (extract or '').strip()
 
+def wiki_spoken_text(text):
+    """Clean ext-4 article text, including residual markup in plain extracts."""
+    import html
+    import mwparserfromhell
+    code = mwparserfromhell.parse(text or '')
+    # Drop non-spoken content before strip_code, which otherwise retains refs
+    # and file captions. Spaces prevent adjacent words from being joined.
+    for node in list(code.filter_templates(recursive=False)):
+        code.replace(node, ' ')
+    for node in reversed(code.filter_tags()):
+        if str(node.tag).strip().lower() in ('ref', 'references', 'table', 'math', 'score'):
+            code.replace(node, ' ')
+    for node in list(code.filter_wikilinks()):
+        namespace = str(node.title).split(':', 1)[0].strip().lower()
+        if namespace in ('קובץ', 'תמונה', 'קטגוריה', 'file', 'image', 'category'):
+            code.replace(node, ' ')
+    # Preserve heading titles, link labels and emphasis text, not their syntax.
+    text = html.unescape(code.strip_code(normalize=True, collapse=True))
+    text = re.sub(r'https?://[^\s<>\[\]]+', ' ', text)
+    text = re.sub(r'\[\d+(?:[ ,–-]+\d+)*\]', ' ', text)
+    text = re.sub(r'(?m)^\s*[*#;:]+\s*', '', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    return '\n'.join(line.strip() for line in text.splitlines() if line.strip())
+
+
 def wiki_sections(text):
+    text = wiki_spoken_text(text)
     paras = [p.strip() for p in re.split(r'\n+', text) if p.strip()]
     out, cur = [], ''
     for p in paras:
@@ -3169,6 +3195,9 @@ def fetch_wiki(call_id, title, sub):
             job.update(status='error', err='not found')
             return
         sections = wiki_sections(text)
+        if not sections:
+            job.update(status='error', err='no spoken text')
+            return
         log.info('wiki %r: %d sections', title, len(sections))
         ym_upload_text('type=playfile\n', f'ivr2:/4/{sub}/ext.ini')
         results = [None] * len(sections)
