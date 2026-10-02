@@ -2582,27 +2582,45 @@ def fetch_pod(call_id, pod_idx, ep_idx, pod=None):
         with _media_slots:
             _tmp_janitor_once()
             free = shutil.disk_usage('/tmp').free
-            if free < 96 * 1048576:
+            if free < 12 * 1048576:
                 raise RuntimeError('not enough temporary disk space for podcast')
-            source = tmp + '.src'
-            downloaded = 0
+            # Sources live only in memory, not beside a decoded WAV on disk.
+            # This free host has only ~63 MB free immediately after boot.
+            source = bytearray()
             with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'},
                               stream=True, timeout=(20, 45)) as r:
                 r.raise_for_status()
-                with open(source, 'wb') as f:
-                    for chunk in r.iter_content(65536):
-                        downloaded += len(chunk)
-                        if downloaded > min(128 * 1048576, free - 80 * 1048576):
-                            raise RuntimeError('podcast source exceeds safe temporary space')
-                        f.write(chunk)
-            proc = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y',
-                                  '-i', source, '-vn', '-ar', '8000', '-ac', '1',
-                                  '-f', 'wav', out], capture_output=True, timeout=600)
-            if proc.returncode:
-                raise RuntimeError('podcast audio conversion: ' + proc.stderr.decode('utf-8', 'ignore')[-400:])
+                for chunk in r.iter_content(65536):
+                    if len(source) + len(chunk) > 64 * 1048576:
+                        raise RuntimeError('podcast source exceeds safe memory limit')
+                    source.extend(chunk)
+            # MP3 decodes without disk. M4A needs ffmpeg and a seekable
+            # compressed input; only that input uses disk, never the big WAV.
+            import miniaudio, io, wave
+            try:
+                sound = miniaudio.decode(bytes(source), output_format=miniaudio.SampleFormat.SIGNED16,
+                                         nchannels=1, sample_rate=8000)
+                buf = io.BytesIO()
+                with wave.open(buf, 'wb') as w:
+                    w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+                    w.writeframes(bytes(sound.samples))
+                data = buf.getvalue()
+                del sound, buf
+            except miniaudio.DecodeError:
+                if len(source) > shutil.disk_usage('/tmp').free - 12 * 1048576:
+                    raise RuntimeError('M4A source exceeds safe temporary space')
+                source_path = tmp + '.src'
+                with open(source_path, 'wb') as f:
+                    f.write(source)
+                proc = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-v', 'error',
+                                      '-i', source_path, '-vn', '-ar', '8000', '-ac', '1',
+                                      '-f', 'wav', 'pipe:1'], capture_output=True, timeout=600)
+                if proc.returncode:
+                    raise RuntimeError('podcast decoding: ' + proc.stderr.decode('utf-8', 'ignore')[-400:])
+                data = proc.stdout
+            del source
             name = 'pod' + safe_name(call_id)[-16:]
-            with open(out, 'rb') as f:
-                ym_upload(f.read(), name + '.wav', f'/3/{name}.wav')
+            ym_upload(data, name + '.wav', f'/3/{name}.wav')
         job.update(status='ready', name=name, ep=ep_idx)
         log.info('pod ready call=%s %s ep %d', call_id, pod['title'], ep_idx)
     except Exception as e:
