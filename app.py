@@ -150,81 +150,6 @@ class _CookieSafeYDLLogger:
     def error(self, msg):
         log.warning('YouTube extractor error (details suppressed)')
 
-# Explicit one-attempt diagnostic, gated OFF by default and deadline.
-# Request-scoped logger returns only redacted yt-dlp warning/error text.
-from flask import g, has_request_context
-import hmac
-_DIAG_LOCK = threading.Lock()
-_DIAG_USED = False
-
-
-def _redact_cookie_diagnostic(message):
-    text = str(message)
-    # Replace known secret values before any truncation or normalization.
-    for key in ('YT_COOKIES_B64', 'YT_REFRESH_TOKEN', 'BRIDGE_SECRET', 'YM_PASS', 'YM_SYSTEM',
-                'GROQ_API_KEY', 'GEMINI_API_KEY', 'TELEGRAM_SESSION', 'TELEGRAM_API_HASH'):
-        value = os.environ.get(key, '')
-        if value:
-            text = text.replace(value, '[redacted]')
-    try:
-        path = _active_cookie_file()
-        if path:
-            with open(path, encoding='utf-8-sig') as source:
-                for line in source:
-                    fields = line.rstrip('\r\n').split('\t')
-                    if len(fields) == 7 and len(fields[6]) >= 3:
-                        text = text.replace(fields[6], '[redacted]')
-    except Exception:
-        return 'diagnostic redaction unavailable'
-    text = re.sub(r'https?://[^\s]+', '[URL redacted]', text)
-    text = re.sub(r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}', '[email redacted]', text)
-    text = re.sub(r'(?im)(authorization|cookie|set-cookie)\s*[:=].*$', r'\1: [redacted]', text)
-    text = re.sub(r'[A-Za-z0-9_+/.=-]{60,}', '[long value redacted]', text)
-    text = re.sub(r'\x1b\[[0-9;]*m', '', text)
-    return text[:1500]
-
-
-class _CookieDiagnosticYDLLogger:
-    def debug(self, msg):
-        pass
-    def warning(self, msg):
-        if len(g.cookie_diagnostic) < 6:
-            g.cookie_diagnostic.append({'level': 'warning', 'message': _redact_cookie_diagnostic(msg)})
-    def error(self, msg):
-        if len(g.cookie_diagnostic) < 6:
-            g.cookie_diagnostic.append({'level': 'error', 'message': _redact_cookie_diagnostic(msg)})
-
-
-@app.route('/song-diagnostic', methods=['POST'])
-def song_diagnostic():
-    global _DIAG_USED
-    if not hmac.compare_digest(request.headers.get('Authorization', ''), 'Bearer ' + BRIDGE_SECRET):
-        return {'error': 'unavailable'}, 404
-    try:
-        allowed = os.environ.get('YT_DIAGNOSTIC_ONCE') == 'yes' and time.time() < int(os.environ.get('YT_DIAGNOSTIC_EXPIRES', '0'))
-    except ValueError:
-        allowed = False
-    with _DIAG_LOCK:
-        if not allowed or _DIAG_USED:
-            return {'error': 'unavailable'}, 404
-        _DIAG_USED = True
-    # Fixed direct video; no extra search, fallback or caller-controlled requests.
-    g.cookie_diagnostic = []
-    tmp = f'/tmp/stest-diag-{time.time_ns()}'
-    try:
-        title, duration = yt_download('jNQXAC9IVRw', tmp + '.%(ext)s')
-        return {'ok': True, 'duration': duration, 'diagnostic': g.cookie_diagnostic}
-    except Exception as exc:
-        return {'ok': False, 'error': _redact_cookie_diagnostic(exc), 'diagnostic': g.cookie_diagnostic}
-    finally:
-        # Context is gone after response; ordinary requests keep safe logger.
-        import glob
-        for path in glob.glob(tmp + '.*'):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-
 from youtube_solver_check import check as _youtube_solver_check
 _YT_SOLVER_READY = _youtube_solver_check()
 log.info('YouTube solver readiness: %s', json.dumps(_YT_SOLVER_READY, sort_keys=True))
@@ -265,120 +190,92 @@ def _yt_tv_context():
     return {'client': {'clientName': 'TVHTML5', 'clientVersion': TV_CLIENT_VER,
                        'hl': 'en', 'visitorData': _YT['vd']}}
 
-# Temporary authenticated diagnostic. Fixed query/video only, one attempt per process.
-# Never returns response bodies, cookies, headers, visitor data or account objects.
-def _music_search_shape(data):
-    from collections import Counter
-    counts, rows = Counter(), []
-    def walk(obj, path='root'):
-        if isinstance(obj, dict):
-            for key in ('videoRenderer', 'lockupViewModel', 'continuationCommand',
-                        'itemSectionRenderer', 'shelfRenderer', 'error'):
-                if key in obj:
-                    counts[key] += 1
-            for key in ('videoRenderer', 'lockupViewModel'):
-                row = obj.get(key)
-                if isinstance(row, dict) and len(rows) < 20:
-                    ident = str(row.get('videoId') or row.get('contentId') or '')
-                    title = row.get('title') or ((row.get('metadata') or {}).get('lockupMetadataViewModel') or {}).get('title') or {}
-                    title = title.get('content') or title.get('simpleText') or ''.join(x.get('text', '') for x in title.get('runs', [])) if isinstance(title, dict) else ''
-                    rows.append({'renderer': key, 'path': path[-180:],
-                                 'id': ident if re.fullmatch(r'[A-Za-z0-9_-]{11}', ident) else '<non-video-id>',
-                                 'id_length': len(ident), 'title': _redact_cookie_diagnostic(title)[:160],
-                                 'keys': sorted(row.keys())[:30]})
-            for key, value in obj.items():
-                walk(value, path + '/' + key)
-        elif isinstance(obj, list):
-            for value in obj:
-                walk(value, path + '/[]')
-    walk(data)
-    return {'top_keys': sorted(data.keys()) if isinstance(data, dict) else [],
-            'counts': dict(counts), 'video_rows': rows}
+def _yt_result_title(value):
+    if isinstance(value, str):
+        return value.strip()
+    if not isinstance(value, dict):
+        return ''
+    return str(value.get('content') or value.get('simpleText') or
+               ''.join(str(run.get('text') or '') for run in value.get('runs', []) if isinstance(run, dict))).strip()
 
-@app.route('/music-diagnostic', methods=['POST'])
-def music_diagnostic():
-    global _DIAG_USED
-    if not admin_secret_ok():
-        return 'forbidden', 403
-    with _DIAG_LOCK:
-        if _DIAG_USED:
-            return {'error': 'already used'}, 409
-        _DIAG_USED = True
-    g.music_search_shapes = []
-    g.cookie_diagnostic = []
-    report = {'solver': _YT_SOLVER_READY, 'cookie_metadata': _COOKIE_BOOT}
-    try:
-        result = yt_search_results('אברימי רוט', limit=15)
-        report['parsed_results'] = [{'id': ident if re.fullmatch(r'[A-Za-z0-9_-]{11}', str(ident)) else '<non-video-id>',
-                                     'title': _redact_cookie_diagnostic(title)[:160]} for ident, title in result]
-    except Exception as exc:
-        report['search_error'] = _redact_cookie_diagnostic(exc)
-    report['search_shapes'] = g.music_search_shapes
-    tmp = f'/tmp/stest-diag-{time.time_ns()}'
-    try:
-        title, duration = yt_download('jNQXAC9IVRw', tmp + '.%(ext)s')
-        import glob
-        report['direct_video'] = {'title': _redact_cookie_diagnostic(title), 'duration': duration,
-                                  'files_created': len(glob.glob(tmp + '.*'))}
-    except Exception as exc:
-        report['download_error'] = _redact_cookie_diagnostic(exc)
-    finally:
-        import glob
-        for path in glob.glob(tmp + '.*'):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-    report['warnings'] = g.cookie_diagnostic
-    return report
+def _yt_result_rows(data):
+    """Only search contents/continuations, never account/overlay/watch recommendations.
+    TV lockup contentType is not reliably a string; video IDs are exactly 11 chars.
+    """
+    roots = []
+    for key in ('contents', 'continuationContents', 'onResponseReceivedCommands', 'onResponseReceivedActions'):
+        if key in data:
+            roots.append(data[key])
+    rows, tokens, seen = [], [], set()
+    def add(ident, title):
+        ident, title = str(ident or ''), _yt_result_title(title)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{11}', ident) or not title or ident in seen:
+            return
+        seen.add(ident); rows.append((ident, title))
+    def walk(obj):
+        if isinstance(obj, dict):
+            lv = obj.get('lockupViewModel')
+            if isinstance(lv, dict):
+                metadata = (lv.get('metadata') or {}).get('lockupMetadataViewModel') or {}
+                add(lv.get('contentId'), metadata.get('title'))
+            vr = obj.get('videoRenderer')
+            if isinstance(vr, dict):
+                add(vr.get('videoId'), vr.get('title'))
+            cc = obj.get('continuationCommand')
+            if isinstance(cc, dict) and cc.get('token'):
+                tokens.append(cc['token'])
+            for key, val in obj.items():
+                if key not in ('adSlotRenderer', 'promotedVideoRenderer', 'promotedSparklesWebRenderer'):
+                    walk(val)
+        elif isinstance(obj, list):
+            for val in obj:
+                walk(val)
+    for root in roots:
+        walk(root)
+    return rows, (tokens[-1] if tokens else None)
+
+def _yt_title_relevant(query, title):
+    import unicodedata
+    def words(text):
+        text = ''.join(c for c in unicodedata.normalize('NFKD', str(text).casefold())
+                       if not unicodedata.combining(c))
+        text = text.translate(str.maketrans('ךםןףץ', 'כמנפצ'))
+        result = []
+        for word in re.findall(r'[a-z0-9\u05d0-\u05ea]+', text):
+            # Common spelling differences, e.g. אברימי / אברמי.
+            if re.search(r'[\u05d0-\u05ea]', word):
+                word = word.replace('י', '').replace('ו', '')
+            if len(word) >= 2 and word not in ('שיר', 'שירים', 'song', 'songs', 'music'):
+                result.append(word)
+        return set(result)
+    wanted, present = words(query), words(title)
+    if not wanted:
+        return False
+    matches = len(wanted & present)
+    return matches >= max(1, (len(wanted) + 1) // 2)
 
 def yt_search_results(query, limit=15):
-    """Authenticated TV-surface search, paginated via continuation; up to `limit` (video_id, title) pairs."""
+    """TV search videos with titles only; reject channel/album IDs and empty rows."""
     import json as J, urllib.request as U
     _yt_cfg()
     found, seen, token = [], set(), None
-    def walk(o):
-        nonlocal token
-        if isinstance(o, dict):
-            lv = o.get('lockupViewModel')
-            if lv and 'VIDEO' in str(lv.get('contentType', '')) and lv.get('contentId'):
-                title = (((lv.get('metadata') or {}).get('lockupMetadataViewModel') or {})
-                         .get('title') or {}).get('content')
-                if lv['contentId'] not in seen:
-                    seen.add(lv['contentId'])
-                    found.append((lv['contentId'], title))
-            vr = o.get('videoRenderer')
-            if vr and vr.get('videoId') and vr['videoId'] not in seen:
-                seen.add(vr['videoId'])
-                t = (vr.get('title') or {}).get('runs', [{}])[0].get('text')
-                found.append((vr['videoId'], t))
-            cc = o.get('continuationCommand')
-            if isinstance(cc, dict) and cc.get('token'):
-                token = cc['token']
-            for v in o.values():
-                walk(v)
-        elif isinstance(o, list):
-            for v in o:
-                walk(v)
-    body = J.dumps({'context': _yt_tv_context(), 'query': query}).encode()
-    r = J.load(U.urlopen(U.Request(
-        f'https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key={_YT["key"]}',
-        data=body, headers=_yt_headers()), timeout=30))
-    if has_request_context() and hasattr(g, 'music_search_shapes'):
-        g.music_search_shapes.append(_music_search_shape(r))
-    walk(r)
-    for _ in range(3):                       # continuation pages ("all the singer's songs")
-        if not token or len(found) >= limit:
+    def request_page(body):
+        response = J.load(U.urlopen(U.Request(
+            f'https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key={_YT["key"]}',
+            data=J.dumps(body).encode(), headers=_yt_headers()), timeout=30))
+        return _yt_result_rows(response)
+    rows, token = request_page({'context': _yt_tv_context(), 'query': query,
+                                'params': 'EgIQAfABAQ=='})
+    for page in range(4):
+        for ident, title in rows:
+            if ident not in seen and _yt_title_relevant(query, title):
+                found.append((ident, title)); seen.add(ident)
+        if not token or len(found) >= limit or page == 3:
             break
         try:
-            body = J.dumps({'context': _yt_tv_context(), 'continuation': token}).encode()
-            r = J.load(U.urlopen(U.Request(
-                f'https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key={_YT["key"]}',
-                data=body, headers=_yt_headers()), timeout=30))
-            token = None
-            walk(r)
-        except Exception as e:
-            log.warning('search continuation failed: %s', e)
+            rows, token = request_page({'context': _yt_tv_context(), 'continuation': token})
+        except Exception:
+            log.warning('search continuation unavailable')
             break
     if not found:
         raise ValueError('no video results')
@@ -468,6 +365,8 @@ def yt_download_tv(video_id, outtmpl):
 def yt_download(video_id, outtmpl):
     """Use the official mweb PO-token route; retain the old TV path as fallback."""
     import yt_dlp
+    if not re.fullmatch(r'[A-Za-z0-9_-]{11}', str(video_id)):
+        raise ValueError('invalid YouTube video id')
     if not _YT_SOLVER_READY.get('ok'):
         raise RuntimeError('YouTube solver unavailable')
     try:
@@ -483,16 +382,22 @@ def yt_download(video_id, outtmpl):
         cookie_file = _active_cookie_file()
         if cookie_file:
             opts['cookiefile'] = cookie_file
-            opts['logger'] = _CookieDiagnosticYDLLogger() if has_request_context() and getattr(g, 'cookie_diagnostic', None) is not None else _CookieSafeYDLLogger()
+            opts['logger'] = _CookieSafeYDLLogger()
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=True)
         if not info:
+            log.warning('YouTube download refused: duration limit or no downloadable media')
             raise ValueError('song too long or no downloadable media')
+        import glob
+        media_files = [p for p in glob.glob(outtmpl.replace('%(ext)s', '*'))
+                       if os.path.isfile(p) and os.path.getsize(p) > 0
+                       and not p.endswith(('.part', '.ytdl', '.json', '.jpg', '.webp', '.png'))]
+        if not media_files:
+            log.warning('YouTube download returned metadata but produced no media file')
+            raise ValueError('download produced no media file')
         return info.get('title') or 'שיר', info.get('duration')
     except Exception as e:
         if _COOKIE_BOOT['configured'] or os.environ.get('YT_COOKIES_FILE'):
-            if has_request_context() and getattr(g, 'cookie_diagnostic', None) is not None:
-                g.cookie_diagnostic.append({'level': 'exception', 'message': _redact_cookie_diagnostic(e)})
             log.warning('authenticated YouTube download failed (details suppressed)')
             raise RuntimeError('YouTube download unavailable') from None
         log.warning('mweb PO-token download failed for %s: %s; trying existing TV route', video_id, e)
@@ -1203,12 +1108,17 @@ def _download_convert(call_id, video_id, search_title=None, tmp=None):
         info = jamendo_download(video_id[3:], tmp + '.mp3')
         title = f"{info['name']} - {info['artist']}".strip(' -')
     else:
+        if not re.fullmatch(r'[A-Za-z0-9_-]{11}', str(video_id)):
+            raise ValueError('invalid YouTube video id')
         title, _dur = yt_download(video_id, tmp + '.%(ext)s')
     if title == 'שיר' and search_title:
         title = search_title
-    files = sorted(_glob.glob(tmp + '.*'))
+    files = sorted(path for path in _glob.glob(tmp + '.*')
+                   if os.path.isfile(path) and os.path.getsize(path) > 0
+                   and not path.endswith(('.part', '.ytdl', '.json', '.jpg', '.webp', '.png')))
     if not files:
-        raise ValueError('no file downloaded')
+        log.warning('YouTube/media download produced no nonempty media file')
+        raise ValueError('download produced no media file')
     src_f = files[0]
     out = tmp + '.wav'
     subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-i', src_f,
@@ -3873,7 +3783,9 @@ def song_test():
         info = {'entries': None}
         ent = {'duration': dur, 'title': title}
         log.info('song-test video=%s dl=%.1fs', video_id, time.time() - t1)
-        files = sorted(_glob.glob(tmp + '.*'))
+        files = sorted(path for path in _glob.glob(tmp + '.*')
+                   if os.path.isfile(path) and os.path.getsize(path) > 0
+                   and not path.endswith(('.part', '.ytdl', '.json', '.jpg', '.webp', '.png')))
         if not files:
             return {'ok': False, 'error': 'no file downloaded', 'title': ent.get('title'), 'duration': ent.get('duration')}
         src = files[0]
