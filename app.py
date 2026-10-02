@@ -397,8 +397,10 @@ hngn_source = types.SimpleNamespace(
     hngn_results=hngn_results, HNGN_TIMEOUT=HNGN_TIMEOUT, parse_songs=parse_songs)
 
 def merged_song_search(query, limit=15, artist_mode=False, hn_max=5):
-    """hngn results first (accurate Hebrew titles), then YouTube, deduped by video id.
-    hngn failure is silent (YouTube only); YouTube failure alone does not hide hngn hits."""
+    """Four sources: hngn (accurate Hebrew titles), the owner's Drive library (local index),
+    YouTube and Jamendo, deduped by id. hngn/Jamendo/Drive failures are silent; YouTube failure
+    alone does not hide the other hits. Drive and Jamendo run beside the YouTube request, so they
+    add no latency."""
     box = {}
     def run_hn():
         try:
@@ -407,21 +409,39 @@ def merged_song_search(query, limit=15, artist_mode=False, hn_max=5):
         except Exception as e:
             log.info('hngn unavailable (%s), YouTube only', str(e)[:80])
             box['hn'] = []
+    def run_jm():
+        try:
+            rows = jamendo_search(query, limit=10) if JAMENDO_CLIENT_ID else []
+            box['jm'] = [(v, t) for v, t in rows if _yt_title_relevant(query, t)]
+        except Exception as e:
+            log.info('jamendo unavailable (%s)', str(e)[:80])
+            box['jm'] = []
     th = threading.Thread(target=run_hn, daemon=True)
     th.start()
+    tj = threading.Thread(target=run_jm, daemon=True)
+    tj.start()
+    try:
+        gd = drive_search(query, limit=30 if artist_mode else 5)
+    except Exception as e:
+        log.info('drive search unavailable (%s)', str(e)[:80])
+        gd = []
     yt, yt_err = [], None
     try:
         yt = yt_search_results(query, limit=limit)
     except Exception as e:
         yt_err = e
     th.join(timeout=hngn_source.HNGN_TIMEOUT + 2)
+    tj.join(timeout=3)
+    jm = list(box.get('jm') or [])
+    jm_n = 10 if artist_mode else 3
     out, seen = [], set()
-    for vid, title in list(box.get('hn') or []) + list(yt):
+    for vid, title in list(box.get('hn') or []) + gd + list(yt[:5]) + jm[:jm_n] + list(yt[5:]):
         if vid not in seen:
             seen.add(vid); out.append((vid, title))
     if not out:
         raise yt_err or ValueError('no video results')
-    log.info('merged search: hngn=%d youtube=%d total=%d', len(box.get('hn') or []), len(yt), len(out))
+    log.info('merged search: hngn=%d drive=%d youtube=%d jamendo=%d total=%d', len(box.get('hn') or []),
+             len(gd), len(yt), len(jm), len(out))
     return out[:limit]
 
 def yt_search_video_id(query):
@@ -629,7 +649,7 @@ def ym_download(path):
 def ym_upload(local_bytes, filename, ym_path):
     r = requests.post(f'{YM_API}/UploadFile',
                       data={'token': YM_TOKEN, 'path': ym_p(ym_path)},
-                      files={'file': (filename, local_bytes)}, timeout=60)
+                      files={'file': (filename, local_bytes)}, timeout=max(60, len(local_bytes) // 100000))
     r.raise_for_status()
     j = r.json() if r.headers.get('content-type','').startswith('application/json') else {'raw': r.text[:200]}
     if isinstance(j, dict) and j.get('success') is False:
@@ -1257,7 +1277,7 @@ def disk_guard(min_mb=None):
 def _download_convert(call_id, video_id, search_title=None, tmp=None):
     """yt-dlp download -> 8k mono wav. Returns (title, wav_path); caller uploads/cleans."""
     import imageio_ffmpeg, glob as _glob
-    if not YT_REFRESH_TOKEN and not video_id.startswith('jm:'):
+    if not YT_REFRESH_TOKEN and not video_id.startswith(('jm:', 'gd:')):
         raise ValueError('YT_REFRESH_TOKEN not set')
     tmp = tmp or f'/tmp/song-{call_id}'
     disk_guard()
@@ -1266,6 +1286,8 @@ def _download_convert(call_id, video_id, search_title=None, tmp=None):
     if video_id.startswith('jm:'):
         info = jamendo_download(video_id[3:], tmp + '.mp3')
         title = f"{info['name']} - {info['artist']}".strip(' -')
+    elif video_id.startswith('gd:'):
+        title = drive_download(video_id[3:], tmp + '.gdr')
     else:
         if not re.fullmatch(r'[A-Za-z0-9_-]{11}', str(video_id)):
             raise ValueError('invalid YouTube video id')
@@ -1282,7 +1304,7 @@ def _download_convert(call_id, video_id, search_title=None, tmp=None):
     out = tmp + '.wav'
     subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-i', src_f,
                     '-ar', '8000', '-ac', '1', '-f', 'wav', out],
-                   check=True, capture_output=True, timeout=120)
+                   check=True, capture_output=True, timeout=600 if video_id.startswith('gd:') else 120)
     return title, out
 
 def _cleanup_tmp(tmp):
@@ -1386,7 +1408,8 @@ def speculative_prefetch(call_id, job, results):
     """While the results menu plays, download+convert result #1 so a pick of it starts at once.
     Same pipeline (disk guard, too-long check); a different pick simply supersedes it."""
     try:
-        if not results or not YT_REFRESH_TOKEN or str(results[0][0]).startswith('jm:'):
+        first_id = str(results[0][0]) if results else ''
+        if not results or first_id.startswith('jm:') or (not YT_REFRESH_TOKEN and not first_id.startswith('gd:')):
             return
         if song_jobs.get(call_id) is not job or job.get('stage') not in ('searching', 'pick'):
             return                              # caller already picked or left
@@ -1508,6 +1531,117 @@ def jamendo_download(tid, outpath):
     log.info('jamendo track=%s page=%s', tid, info.get('shareurl'))
     return info
 
+# ---------- Google Drive library "מוזיקה מכל הלב" (extension 2 search source) ----------
+# Local static index (drive_index.json.gz: [file_id, name, folder_path, size]) generated once from the
+# Drive API; searched in memory (sub-second). Playback downloads the file through the Drive API with
+# the line owner's own OAuth refresh token (env GDRIVE_CLIENT_ID / GDRIVE_CLIENT_SECRET /
+# GDRIVE_REFRESH_TOKEN, scope drive.readonly). The files are not public, so with those env vars
+# unset the Drive source is skipped silently - nothing is offered that cannot be played.
+GDRIVE_CLIENT_ID = os.environ.get('GDRIVE_CLIENT_ID', '')
+GDRIVE_CLIENT_SECRET = os.environ.get('GDRIVE_CLIENT_SECRET', '')
+GDRIVE_REFRESH_TOKEN = os.environ.get('GDRIVE_REFRESH_TOKEN', '')
+DRIVE_INDEX_PATH = os.environ.get('DRIVE_INDEX_PATH') or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'drive_index.json.gz')
+DRIVE_MAX_MB = int(os.environ.get('DRIVE_MAX_MB', '60'))   # disk-bound (the host has little /tmp), not a policy length cap
+log_gd = logging.getLogger('gdrive')
+_gd = {'rows': None, 'norm': None, 'by_id': {}, 'tok': None, 'tok_exp': 0.0}
+_gd_lock = threading.Lock()
+
+def drive_enabled():
+    return bool(GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET and GDRIVE_REFRESH_TOKEN
+                and os.path.isfile(DRIVE_INDEX_PATH))
+
+_GD_STOP = {'שיר', 'שירים', 'song', 'songs', 'music', 'של', 'את', 'עם', 'על', 'מאת', 'הרב', 'mp3'}
+
+def _gd_norm(text):
+    text = re.sub(r'[\u0591-\u05C7]', '', text or '')                    # niqqud / cantillation
+    text = re.sub(r"[\"'`\u05f3\u05f4\u2018\u2019\u201c\u201d\-_.,:;!?()\[\]/\\]", ' ', text)
+    return re.sub(r'\s+', ' ', text).strip().lower()
+
+def _gd_load():
+    if _gd['rows'] is not None:
+        return
+    with _gd_lock:
+        if _gd['rows'] is not None:
+            return
+        import gzip
+        with gzip.open(DRIVE_INDEX_PATH, 'rt', encoding='utf-8') as fh:
+            rows = json.load(fh)
+        _gd['norm'] = [(_gd_norm(r[1]), _gd_norm(r[2])) for r in rows]
+        _gd['by_id'] = {r[0]: r for r in rows}
+        _gd['rows'] = rows
+        log_gd.info('drive index loaded: %d files', len(rows))
+
+def drive_search(query, limit=5):
+    """[('gd:<file id>', 'file name')] ranked by token matches (name counts more than folder path)."""
+    if not drive_enabled():
+        return []
+    _gd_load()
+    toks = [t for t in _gd_norm(query).split() if len(t) >= 2 and t not in _GD_STOP]
+    if not toks:
+        return []
+    need = len(toks) if len(toks) <= 2 else len(toks) - 1
+    scored = []
+    for (nname, npath), row in zip(_gd['norm'], _gd['rows']):
+        in_name = sum(1 for t in toks if t in nname)
+        if in_name >= need:
+            scored.append((-in_name, 0, len(nname), row))
+            continue
+        both = sum(1 for t in toks if t in nname or t in npath)
+        if both >= need and in_name >= 1:
+            scored.append((-both, 1, len(nname), row))
+    scored.sort(key=lambda x: x[:3])
+    out = []
+    for _a, _b, _c, row in scored[:limit]:
+        out.append((f'gd:{row[0]}', os.path.splitext(row[1])[0].strip()))
+    return out
+
+def drive_title(fid):
+    _gd_load()
+    row = _gd['by_id'].get(fid)
+    return os.path.splitext(row[1])[0].strip() if row else 'שיר'
+
+def _gd_token():
+    if _gd['tok'] and time.time() < _gd['tok_exp'] - 60:
+        return _gd['tok']
+    r = requests.post('https://oauth2.googleapis.com/token', data={
+        'client_id': GDRIVE_CLIENT_ID, 'client_secret': GDRIVE_CLIENT_SECRET,
+        'refresh_token': GDRIVE_REFRESH_TOKEN, 'grant_type': 'refresh_token'}, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    _gd['tok'] = j['access_token']
+    _gd['tok_exp'] = time.time() + int(j.get('expires_in', 3600))
+    return _gd['tok']
+
+def drive_download(fid, outpath):
+    """Stream a Drive file to outpath with the owner's OAuth token. Returns the display title."""
+    if not drive_enabled():
+        raise ValueError('drive not configured')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{10,80}', fid):
+        raise ValueError('invalid drive id')
+    url = f'https://www.googleapis.com/drive/v3/files/{fid}'
+    for attempt in (1, 2):
+        with requests.get(url, params={'alt': 'media', 'supportsAllDrives': 'true'},
+                          headers={'Authorization': f'Bearer {_gd_token()}'},
+                          stream=True, timeout=30) as r:
+            if r.status_code == 401 and attempt == 1:
+                _gd['tok'] = None
+                continue
+            r.raise_for_status()
+            size = int(r.headers.get('content-length') or 0)
+            if size > DRIVE_MAX_MB * 1048576:
+                log_gd.warning('drive file %s refused: %d MB > %d MB cap', fid, size >> 20, DRIVE_MAX_MB)
+                raise SongTooLongError('drive file too large for the line host')
+            disk_guard(max(MIN_FREE_MB_DOWNLOAD, int(size * 2.3 / 1048576) + 5))   # file + its wav
+            with open(outpath, 'wb') as f:
+                for chunk in r.iter_content(65536):
+                    f.write(chunk)
+            break
+    if os.path.getsize(outpath) < 2000:
+        raise ValueError('drive audio too small')
+    log_gd.info('drive download ok id=%s bytes=%d', fid, os.path.getsize(outpath))
+    return drive_title(fid)
+
 def fetch_free_results(call_id, query):
     """Key-4 search: same paged results screen as fetch_results, Jamendo as the source."""
     job = song_jobs.get(call_id)
@@ -1604,6 +1738,17 @@ def fetch_ai_results(call_id, description):
             if results:
                 job['query'] = cand
                 break
+        try:
+            extra, seen_gd = [], {r[0] for r in (results or [])}
+            for q_ in list(cands) + [description]:
+                for item in drive_search(q_, limit=5):
+                    if item[0] not in seen_gd:
+                        seen_gd.add(item[0]); extra.append(item)
+            if extra:
+                results = extra[:5] + list(results or [])    # Drive library hits first, then the rest
+                results = results[:15]
+        except Exception as e:
+            log.info('ai drive search skipped: %s', str(e)[:80])
         if not results:
             job.update(status='error', err='ai_unknown')
             return
@@ -2023,7 +2168,7 @@ def yemot_song():
             job['stage'] = 'after'
             if in_seq and job.get('qidx', 0) + 1 < len(queue):
                 return text_response(f'read=f-song_auto_next=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
-            after_p = 'song_after_free' if str(job.get('video_id') or '').startswith('jm:') else 'song_after'
+            after_p = 'song_after_free' if str(job.get('video_id') or '').startswith(('jm:', 'gd:')) else 'song_after'
             return text_response(f'read=f-{after_p}=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
 
         if stage == 'after':
@@ -2037,7 +2182,7 @@ def yemot_song():
                 with lock:
                     song_jobs.pop(call_id, None)
                 return text_response('id_list_message=f-song_bye')
-            if s_val == '4' and job.get('video_id') and not str(job.get('video_id')).startswith('jm:'):
+            if s_val == '4' and job.get('video_id') and not str(job.get('video_id')).startswith(('jm:', 'gd:')):
                 job.update(stage='radio_build', status='working', mode='radio', started=time.time())
                 threading.Thread(target=fetch_radio, args=(call_id, job['video_id'], job.get('title')), daemon=True).start()
                 return text_response(play_chain('f-song_radio_on', f'S{turn+1}'))
@@ -4572,3 +4717,4 @@ def _auto_prune_ivr_tree():
         log.exception('owner IVR tree update failed: %s', e)
 
 threading.Thread(target=_auto_prune_ivr_tree, daemon=True).start()
+
