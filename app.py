@@ -1397,6 +1397,419 @@ def _cleanup_tmp(tmp):
         try: os.remove(f_)
         except OSError: pass
 
+# ---------- Long files: segmented conversion (SEGMENT_LONG) ----------
+# A song/file over the normal caps (YouTube > 600 s, Drive > DRIVE_MAX_MB) is converted and uploaded in
+# sequential segments of SEGMENT_SECONDS: ffmpeg reads only that time range straight from the remote
+# audio stream (nothing but one small wav touches the disk), the wav is validated and uploaded to Yemot
+# as its own file, then deleted. Segment N+1 is prepared while N plays; the poll that follows the end of a
+# segment starts the next one. Normal-length songs never enter this code. SEGMENT_LONG=0 restores the
+# old refusal; any source that cannot be segmented safely still raises SongTooLongError (old behaviour).
+def _env_int(name, default, lo=None, hi=None):
+    try:
+        v = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        v = default
+    if lo is not None:
+        v = max(lo, v)
+    if hi is not None:
+        v = min(hi, v)
+    return v
+
+SEGMENT_LONG = os.environ.get('SEGMENT_LONG', '1') != '0'
+SEGMENT_SECONDS = _env_int('SEGMENT_SECONDS', 600, 60, 900)          # one segment wav = SEGMENT_SECONDS * 16 KB (600 s = 9.6 MB)
+SEGMENT_FFMPEG_TIMEOUT = _env_int('SEGMENT_FFMPEG_TIMEOUT', 420, 60, 1800)
+SEGMENT_WAIT_MAX_S = 150
+_FF_HTTPS = {}
+
+def _ff_exe():
+    import imageio_ffmpeg
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+def _ffmpeg_https_ok():
+    """Segmenting reads the remote stream with ffmpeg; refuse (old behaviour) when this ffmpeg has no https."""
+    if 'ok' not in _FF_HTTPS:
+        ok = False
+        try:
+            r = subprocess.run([_ff_exe(), '-hide_banner', '-protocols'], capture_output=True, timeout=20)
+            txt = (r.stdout + r.stderr).decode('utf-8', 'ignore')
+            inp = txt.split('Input:', 1)[1].split('Output:', 1)[0]
+            ok = bool(re.search(r'^\s*https\s*$', inp, re.M))
+        except Exception:
+            ok = False
+        _FF_HTTPS['ok'] = ok
+        log.info('segmenting: ffmpeg https support = %s', ok)
+    return _FF_HTTPS['ok']
+
+def _ff_input_opts(src):
+    url = src['url']
+    if not str(url).startswith(('http://', 'https://')):
+        return []
+    opts = ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5']
+    hdrs = dict(src.get('headers') or {})
+    ua = next((hdrs.pop(k) for k in list(hdrs) if k.lower() == 'user-agent'), None)
+    if ua:
+        opts += ['-user_agent', str(ua)]
+    if hdrs:
+        opts += ['-headers', ''.join(f'{k}: {v}\r\n' for k, v in hdrs.items())]
+    return opts
+
+def _probe_duration(src):
+    """Total duration (s) from ffmpeg's own header read; None when unknown."""
+    r = subprocess.run([_ff_exe(), '-hide_banner', '-nostdin'] + _ff_input_opts(src) + ['-i', src['url']],
+                       capture_output=True, timeout=90)
+    m = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', r.stderr.decode('utf-8', 'ignore'))
+    if not m:
+        return None
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+
+def yt_stream_info(video_id):
+    """Metadata + direct audio-only stream URL for a YouTube video (no download, no duration cap).
+    Raises SongTooLongError when the stream cannot be read in time ranges safely."""
+    import yt_dlp
+    if not re.fullmatch(r'[A-Za-z0-9_-]{11}', str(video_id)):
+        raise ValueError('invalid YouTube video id')
+    if not _YT_SOLVER_READY.get('ok'):
+        raise RuntimeError('YouTube solver unavailable')
+    opts = {
+        'format': 'bestaudio[ext=m4a]/bestaudio', 'quiet': True, 'no_warnings': False, 'noplaylist': True,
+        'js_runtimes': {'deno': {'path': os.environ.get('YT_DENO_PATH', '/opt/venv/bin/deno')}},
+        'extractor_args': {'youtube': {'player_client': ['mweb']},
+                           'youtubepot-bgutilhttp': {'base_url': ['http://127.0.0.1:4416']}},
+        'cachedir': False, 'socket_timeout': 20, 'retries': 1,
+    }
+    cookie_file = _active_cookie_file()
+    if cookie_file:
+        opts['cookiefile'] = cookie_file
+        opts['logger'] = _CookieSafeYDLLogger()
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
+    if not info:
+        raise ValueError('no stream info')
+    if info.get('is_live') or info.get('live_status') in ('is_live', 'is_upcoming'):
+        log.warning('segmenting refused for %s: live stream', video_id)
+        raise SongTooLongError('live stream')
+    fmt = info if info.get('url') else next(iter(info.get('requested_formats') or []), None)
+    if not fmt or not fmt.get('url'):
+        log.warning('segmenting refused for %s: no direct stream url', video_id)
+        raise SongTooLongError('no direct stream')
+    if str(fmt.get('protocol') or 'https') not in ('http', 'https'):
+        log.warning('segmenting refused for %s: protocol %s is fragmented', video_id, fmt.get('protocol'))
+        raise SongTooLongError('fragmented stream')
+    if (fmt.get('vcodec') or 'none') != 'none':
+        log.warning('segmenting refused for %s: format carries video', video_id)
+        raise SongTooLongError('stream carries video')
+    dur = info.get('duration')
+    return {'title': info.get('title') or 'שיר', 'total': float(dur) if isinstance(dur, (int, float)) and dur > 0 else None,
+            'src': {'url': fmt['url'], 'headers': dict(fmt.get('http_headers') or info.get('http_headers') or {}),
+                    'at': time.time()}}
+
+def _seg_name(call_id, idx, k):
+    """Yemot file for segment k of the long item in slot idx; two alternating names per slot so segment
+    k+1 can upload while k plays."""
+    return f'sg{idx % 2}{k % 2}' + re.sub(r'\D', '', call_id)[-6:]
+
+def _seg_src(plan, refresh=False):
+    if plan['kind'] == 'gd':
+        if refresh:
+            _gd['tok'] = None
+        return {'url': f"https://www.googleapis.com/drive/v3/files/{plan['fid']}?alt=media&supportsAllDrives=true",
+                'headers': {'Authorization': f'Bearer {_gd_token()}'}}
+    if refresh or time.time() - plan['src']['at'] > 7200:
+        plan['src'] = yt_stream_info(plan['vid'])['src']
+    return plan['src']
+
+def _seg_bounds(plan, k):
+    start = k * plan['seg_s']
+    dur = plan['seg_s'] if k < plan['n'] - 1 else plan['total'] - start
+    return start, dur
+
+def _seg_make(plan, k, out):
+    """ffmpeg time-range read -> 8 kHz mono wav at `out`, validated like every normal song."""
+    start, dur = _seg_bounds(plan, k)
+    disk_guard(max(MIN_FREE_MB_DOWNLOAD, int(dur * 16000 / 1048576) + 8))
+    last = None
+    for attempt in (1, 2):
+        try:
+            src = _seg_src(plan, refresh=(attempt == 2))
+            subprocess.run([_ff_exe(), '-y', '-nostdin', '-loglevel', 'error'] + _ff_input_opts(src) +
+                           ['-ss', f'{start:.3f}', '-i', src['url'], '-t', f'{dur:.3f}', '-vn',
+                            '-ar', '8000', '-ac', '1', '-f', 'wav', out],
+                           check=True, capture_output=True, timeout=SEGMENT_FFMPEG_TIMEOUT)
+            # YouTube durations are exact; Drive durations are estimated from the file header, so only check them for non-empty
+            secs = _validate_wav(out, dur if plan['kind'] == 'yt' else None)
+            return secs
+        except DiskLowError:
+            raise
+        except Exception as e:
+            last = e
+            log.warning('segment %d/%d ffmpeg attempt %d failed: %s', k + 1, plan['n'], attempt,
+                        type(e).__name__ if not isinstance(e, subprocess.CalledProcessError)
+                        else f"exit {e.returncode}")
+            try: os.remove(out)
+            except OSError: pass
+    raise last
+
+def _segment_first(call_id, idx, video_id, hint, tmp):
+    """Called when a normal conversion refused the item as too long. Builds the segment plan and the
+    first segment's wav at tmp + '.wav'. Raises SongTooLongError when it cannot be segmented safely
+    (the old refusal then applies); other errors fail the song like any download error."""
+    if not SEGMENT_LONG:
+        raise SongTooLongError('segmenting disabled')
+    if video_id.startswith('jm:'):
+        raise SongTooLongError('jamendo item')
+    if not _ffmpeg_https_ok():
+        log.warning('segmenting refused for %s: ffmpeg has no https support', video_id[:14])
+        raise SongTooLongError('ffmpeg without https')
+    if video_id.startswith('gd:'):
+        if not drive_enabled():
+            raise SongTooLongError('drive not configured')
+        fid = video_id[3:]
+        if not re.fullmatch(r'[A-Za-z0-9_-]{10,80}', fid):
+            raise ValueError('invalid drive id')
+        plan = {'kind': 'gd', 'fid': fid}
+        total = _probe_duration(_seg_src(plan))
+        title = drive_title(fid)
+    else:
+        info = yt_stream_info(video_id)
+        plan = {'kind': 'yt', 'src': info['src']}
+        total, title = info['total'], info['title']
+    if not total or total <= 0:
+        log.warning('segmenting refused for %s: duration unknown', video_id[:14])
+        raise SongTooLongError('duration unknown')
+    seg_s = SEGMENT_SECONDS
+    n = max(1, int(total // seg_s))
+    if total - n * seg_s >= 5:
+        n += 1                                    # a tail under 5 s is folded into the last segment
+    plan.update(vid=video_id, title=title, total=float(total), seg_s=seg_s, n=n, st={}, cur=None, want=None,
+                wait_since=None, err=None, lock=threading.Lock())
+    if title == 'שיר' and hint:
+        plan['title'] = title = hint
+    log.info('segmenting %s: %.0fs in %d segment(s) of %ds', video_id[:14], total, n, seg_s)
+    out = tmp + '.wav'
+    _seg_make(plan, 0, out)
+    return title, out, plan
+
+def _seg_current(call_id, job, key, plan):
+    return song_jobs.get(call_id) is job and job.get(f'{key}_seg') is plan
+
+def _seg_worker(call_id, job, key, idx, plan, k):
+    tmp = f'/tmp/song-{call_id}-s{idx}k{k}'
+    with _tmp_lock:
+        _active_tmp.add(tmp)
+    try:
+        if not _seg_current(call_id, job, key, plan):
+            raise RuntimeError('call moved on')
+        out = tmp + '.wav'
+        t0 = time.monotonic()
+        secs = _seg_make(plan, k, out)
+        if not _seg_current(call_id, job, key, plan):
+            raise RuntimeError('call moved on')
+        with open(out, 'rb') as f:
+            data = f.read()
+        try: os.remove(out)                         # local segment gone before the (slow) upload
+        except OSError: pass
+        name = _seg_name(call_id, idx, k)
+        ym_delete(f'{SONG_DIR}/{name}.wav')
+        ym_upload(data, name + '.wav', f'{SONG_DIR}/{name}.wav')
+        del data
+        plan['st'][k] = 'ready'
+        log.info('segment %d/%d ready call=%s wav=%.0fs in %.1fs', k + 1, plan['n'], call_id, secs, time.monotonic() - t0)
+    except Exception as e:
+        plan['st'][k] = 'error'
+        plan['err'] = 'disk' if isinstance(e, DiskLowError) else str(e)[:200]
+        log.warning('segment %d/%d failed call=%s: %s', k + 1, plan['n'], call_id, e)
+    finally:
+        _cleanup_tmp(tmp)
+
+def _seg_prepare(call_id, job, key, idx, plan, k):
+    if k < 0 or k >= plan['n']:
+        return
+    with plan['lock']:
+        if plan['st'].get(k) in ('working', 'ready'):
+            return
+        for j in list(plan['st']):                  # same-parity segments share a Yemot file: this one overwrites it
+            if j != k and j % 2 == k % 2:
+                plan['st'].pop(j, None)
+        plan['st'][k] = 'working'
+    threading.Thread(target=_seg_worker, args=(call_id, job, key, idx, plan, k), daemon=True).start()
+
+def _seg_on_play(call_id, job, key, idx, plan, k):
+    plan['cur'] = k
+    plan['want'] = None
+    plan['wait_since'] = None
+    _seg_prepare(call_id, job, key, idx, plan, k + 1)      # the next segment is prepared while this one plays
+
+def _seg_play_step(call_id, job, turn, key, idx, plan, s_val):
+    """Stage 'play' hook for a segmented item. Returns a response, or None to let the normal
+    end-of-song / key handling run. Empty input (the segment ended) starts the next segment; in single
+    mode 9 skips forward and 7 goes back one segment. Sequence-mode keys keep their per-song meaning."""
+    digit = (s_val or '').strip()
+    in_seq = job.get('mode') in ('artist', 'radio')
+    cur, n = plan['cur'], plan['n']
+    if digit == '':
+        target = plan['want'] if plan.get('want') is not None else cur + 1
+    elif not in_seq and digit == '9':
+        target = cur + 1
+    elif not in_seq and digit == '7':
+        target = max(cur - 1, 0)
+    else:
+        return None
+    if target >= n:
+        return None
+    plan['want'] = target
+    if plan['st'].get(target) is None:
+        _seg_prepare(call_id, job, key, idx, plan, target)
+    st = plan['st'].get(target)
+    if st == 'working':
+        if plan.get('wait_since') is None:
+            plan['wait_since'] = time.time()
+        if time.time() - plan['wait_since'] <= SEGMENT_WAIT_MAX_S:
+            if _block_until(lambda: plan['st'].get(target) != 'working', SONG_POLL_BLOCK_S):
+                st = plan['st'].get(target)
+            else:
+                return text_response(play_chain('f-song_wait', f'S{turn+1}'))
+        else:
+            plan['st'][target] = st = 'error'
+            plan['err'] = 'timeout'
+    if st == 'ready':
+        name = _seg_name(call_id, idx, target)
+        job['name'] = name
+        job['started'] = time.time()
+        log.info('segment %d/%d starts call=%s', target + 1, n, call_id)
+        _seg_on_play(call_id, job, key, idx, plan, target)
+        return text_response(play_chain('f-' + name, f'S{turn+1}'))
+    # a segment failed: honest outcome, same as a failed download
+    plan['want'] = None
+    log.warning('segmented item stopped at segment %d/%d call=%s: %s', target + 1, n, call_id, plan.get('err'))
+    queue = job.get('queue') or []
+    if in_seq and job.get('qidx', 0) + 1 < len(queue):
+        return None                                  # sequence: carries on with the next song
+    job.update(stage='ask', status='idle', mode='single')
+    prompt = 'f-song_disk' if plan.get('err') == 'disk' else 'f-song_dlfail'
+    return text_response(f'read={prompt}.f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
+
+# ---------- Temp-file sweeper + /disk-cleanup admin endpoint ----------
+# Only entries the app itself creates directly in /tmp (same name patterns as the 60 s janitor above,
+# plus the half-written Drive index) are ever deleted; everything else is only listed.
+_TEMP_GLOBS = ('/tmp/song-*', '/tmp/ned-*', '/tmp/tg-*', '/tmp/pod-*', '/tmp/stest-*', '/tmp/tts-*', '/tmp/wiki-*')
+TEMP_FILE_MAX_AGE_MINUTES = _env_int('TEMP_FILE_MAX_AGE_MINUTES', 60, 0)
+TEMP_SWEEP_INTERVAL_MINUTES = _env_int('TEMP_SWEEP_INTERVAL_MINUTES', 60, 0)    # 0 = off
+TEMP_MIN_AGE_FLOOR_S = 120                                                      # never touch anything younger (in-flight tts / downloads)
+
+def _entry_stat(path):
+    """(bytes, newest mtime) of a file or a directory tree; symlinks are not followed."""
+    st = os.lstat(path)
+    if not os.path.isdir(path) or os.path.islink(path):
+        return st.st_size, st.st_mtime
+    size, newest = 0, st.st_mtime
+    for root, dirs, files in os.walk(path):
+        for nm in files:
+            try:
+                s = os.lstat(os.path.join(root, nm))
+                size += s.st_size
+                newest = max(newest, s.st_mtime)
+            except OSError:
+                pass
+    return size, newest
+
+def _temp_managed_paths():
+    import glob
+    paths = []
+    for pat in _TEMP_GLOBS:
+        paths.extend(glob.glob(pat))
+    idx_tmp = DRIVE_LIVE_INDEX_PATH + '.tmp'
+    if os.path.dirname(idx_tmp) == '/tmp' and os.path.lexists(idx_tmp) and not _gd_refresh_lock.locked():
+        paths.append(idx_tmp)
+    return sorted({p for p in paths if os.path.dirname(p) == '/tmp'})
+
+def temp_sweep(max_age_s, run=False):
+    now = time.time()
+    max_age_s = max(TEMP_MIN_AGE_FLOOR_S, float(max_age_s))
+    with _tmp_lock:
+        active = tuple(_active_tmp)
+    managed, deleted, freed = [], [], 0
+    for path in _temp_managed_paths():
+        try:
+            size, mtime = _entry_stat(path)
+        except OSError:
+            continue
+        is_active = any(path.startswith(prefix) for prefix in active)
+        age = int(now - mtime)
+        stale = (not is_active) and age > max_age_s
+        managed.append({'path': path, 'bytes': size, 'age_s': age, 'active': is_active, 'stale': stale,
+                        'dir': os.path.isdir(path) and not os.path.islink(path)})
+        if stale and run:
+            with _tmp_lock:
+                if any(path.startswith(prefix) for prefix in _active_tmp):
+                    continue                          # became active since the scan
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+                deleted.append(path)
+                freed += size
+                log.info('temp sweep deleted %s (%d KB, %d s old)', path, size >> 10, age)
+            except OSError as e:
+                log.warning('temp sweep could not delete %s: %s', path, e)
+    return {'managed': managed, 'deleted': deleted, 'freed_bytes': freed, 'max_age_s': int(max_age_s)}
+
+def _temp_unmanaged(managed_paths, limit=40):
+    out = []
+    try:
+        names = os.listdir('/tmp')
+    except OSError:
+        return out
+    now = time.time()
+    for nm in names:
+        p = '/tmp/' + nm
+        if p in managed_paths:
+            continue
+        try:
+            size, mtime = _entry_stat(p)
+        except OSError:
+            continue
+        out.append({'path': p, 'bytes': size, 'age_s': int(now - mtime), 'deletable': False})
+    out.sort(key=lambda r: -r['bytes'])
+    return out[:limit]
+
+@app.route('/disk-cleanup', methods=['GET', 'POST'])
+def disk_cleanup_route():
+    """Admin (same auth as /drive-refresh: X-Bridge-Secret header or POST form field).
+    GET: dry run, lists temp files with sizes/ages. GET ?run=1 or POST: deletes the stale ones.
+    ?max_age_min=N overrides TEMP_FILE_MAX_AGE_MINUTES (never below 2 minutes)."""
+    if not admin_secret_ok():
+        return 'forbidden', 403
+    try:
+        age_min = float(request.values.get('max_age_min', TEMP_FILE_MAX_AGE_MINUTES))
+    except (TypeError, ValueError):
+        age_min = float(TEMP_FILE_MAX_AGE_MINUTES)
+    run = request.method == 'POST' or request.values.get('run') == '1'
+    res = temp_sweep(age_min * 60, run=run)
+    du = shutil.disk_usage('/tmp')
+    mp = {m['path'] for m in res['managed']}
+    stale = [m for m in res['managed'] if m['stale']]
+    return {'ran': run, 'max_age_min': res['max_age_s'] / 60.0,
+            'disk_free_mb': du.free // 1048576, 'disk_total_mb': du.total // 1048576,
+            'managed_count': len(res['managed']), 'stale_count': len(stale),
+            'stale_mb': round(sum(m['bytes'] for m in stale) / 1048576, 2),
+            'deleted': res['deleted'], 'freed_mb': round(res['freed_bytes'] / 1048576, 2),
+            'managed': res['managed'], 'unmanaged_never_deleted': _temp_unmanaged(mp)}
+
+def _temp_sweep_loop():
+    if TEMP_SWEEP_INTERVAL_MINUTES <= 0:
+        log.info('temp sweeper off (TEMP_SWEEP_INTERVAL_MINUTES=0)')
+        return
+    time.sleep(90)
+    while True:
+        try:
+            res = temp_sweep(TEMP_FILE_MAX_AGE_MINUTES * 60, run=True)
+            if res['deleted']:
+                log.info('temp sweep: removed %d item(s), %.1f MB', len(res['deleted']), res['freed_bytes'] / 1048576)
+        except Exception:
+            log.exception('temp sweep failed')
+        time.sleep(TEMP_SWEEP_INTERVAL_MINUTES * 60)
+
 def fetch_queue_song(call_id, idx):
     """Download queue[idx] into its alternating slot (runs in a thread).
 
@@ -1414,7 +1827,14 @@ def fetch_queue_song(call_id, idx):
     try:
         queue = job.get('queue') or []
         video_id, hint = queue[idx]
-        title, out = _download_convert(call_id, video_id, hint, tmp)
+        seg_plan = None
+        try:
+            title, out = _download_convert(call_id, video_id, hint, tmp)
+        except SongTooLongError:
+            if not SEGMENT_LONG:
+                raise
+            # over the normal length caps: convert in segments (raises SongTooLongError again when it cannot)
+            title, out, seg_plan = _segment_first(call_id, idx, video_id, hint, tmp)
         if not title or title == 'שיר':
             title = hint or title or 'שיר'
         ann_text = None
@@ -1443,9 +1863,11 @@ def fetch_queue_song(call_id, idx):
             return
         with open(out, 'rb') as f:
             data = f.read()
-        dest = slot_name(call_id, idx)
+        dest = _seg_name(call_id, idx, 0) if seg_plan else slot_name(call_id, idx)
         ym_delete(f'{SONG_DIR}/{dest}.wav')
         ym_upload(data, dest + '.wav', f'{SONG_DIR}/{dest}.wav')
+        if seg_plan:
+            seg_plan['st'][0] = 'ready'
         ann_wav = None
         if ann_th is not None:
             ann_th.join(timeout=120)
@@ -1459,6 +1881,8 @@ def fetch_queue_song(call_id, idx):
             job[f'{key}_ann'] = ann
         else:
             job[f'{key}_ann'] = None
+        if seg_plan:
+            job.update(**{f'{key}_file': dest, f'{key}_seg': seg_plan})
         job.update(**{f'{key}_status': 'ready', f'{key}_title': title, f'{key}_video': video_id})
         log.info('queue song ready call=%s idx=%s title=%s', call_id, idx, (title or '')[:60])
     except Exception as e:
@@ -1483,6 +1907,7 @@ def start_prefetch(call_id, idx, force=False):
     job[f'{key}_want'] = idx
     job[f'{key}_vwant'] = vid
     job[f'{key}_file'] = None
+    job[f'{key}_seg'] = None
     job[f'{key}_status'] = 'working'
     threading.Thread(target=fetch_queue_song, args=(call_id, idx), daemon=True).start()
 
@@ -1543,6 +1968,7 @@ def _adopt_extra(call_id, job, idx, vid):
     job[f'{key}_want'] = idx
     job[f'{key}_vwant'] = vid
     job[f'{key}_file'] = None
+    job[f'{key}_seg'] = None
     if ent['status'] == 'ready':
         job[f'{key}_status'] = 'working'
         take()
@@ -2247,6 +2673,9 @@ def wait_step(call_id, job, turn):
                          daemon=True).start()
     job[f'{key}_status'] = 'playing'
     job['started'] = time.time()
+    seg_plan = job.get(f'{key}_seg')
+    if seg_plan:
+        _seg_on_play(call_id, job, key, idx, seg_plan, 0)   # long item: segment 2 is prepared while segment 1 plays
     start_prefetch(call_id, idx + 1)   # the next song downloads while this one plays
     chain = ''
     if job.get('intro'):
@@ -2575,6 +3004,12 @@ def yemot_song():
             return wait_step(call_id, job, turn)
 
         if stage == 'play':
+            _sk = f"slot{job.get('qidx', 0) % 2}"
+            _sp = job.get(f'{_sk}_seg')
+            if _sp and _sp.get('cur') is not None and job.get(f'{_sk}_status') == 'playing':
+                _r = _seg_play_step(call_id, job, turn, _sk, job.get('qidx', 0), _sp, s_val)
+                if _r is not None:
+                    return _r
             in_seq = job.get('mode') in ('artist', 'radio')
             queue = job.get('queue') or []
             if in_seq and s_val == '9':            # skip to the next song mid-play
@@ -5152,6 +5587,7 @@ def _auto_prune_ivr_tree():
 
 threading.Thread(target=_auto_prune_ivr_tree, daemon=True).start()
 threading.Thread(target=_drive_refresh_loop, daemon=True).start()
+threading.Thread(target=_temp_sweep_loop, daemon=True).start()
 
 
 
