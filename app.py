@@ -1181,6 +1181,7 @@ SONG_PROMPTS = {
     'song_artist': 'עכשיו הקלידו את שם הזמר, או הקישו רק סולמית לדילוג.',
     'song_searching': 'רגע אחד, אני מחפשת את השיר. זה יכול לקחת חצי דקה.',
     'song_wait': 'עוד ממש קצת, השיר כבר בדרך.',
+    'song_loading': 'רגע, מכינה את השיר.',
     'song_notfound': 'סליחה, לא מצאתי את זה. נסו שוב.',
     'song_too_long': 'השיר ארוך מעשר דקות ולכן אי אפשר להשמיע אותו בקו. בחרו שיר קצר יותר.',
     'song_dlfail': 'ההורדה נכשלה, נסו שיר אחר.',
@@ -1224,8 +1225,8 @@ LIB_PROMPTS = ('lib_pick', 'lib_bad', 'lib_choose', 'lib_for', 'lib_for_list', '
 # prompts the extension-2 upgrade needs on Yemot; uploaded once by _auto_setup_song2
 SONG2_NEW_PROMPTS = ('song_mode', 'song_how', 'song_typehow', 'song_artist', 'song_artist_voice',
                      'artist_typehow', 'song_ask', 'song_more', 'song_notfound', 'song_too_long', 'song_after',
-                     'song_artist_ask', 'song_auto_next', 'song_queue_done', 'song_radio_on', 'song_after_free', 'song_disk', 'song_ai_ask', 'song_ai_unknown', 'song_dlfail')
-SONG2_PROMPT_VERSION = 'v_dlfail_20261002'
+                     'song_artist_ask', 'song_auto_next', 'song_queue_done', 'song_radio_on', 'song_after_free', 'song_disk', 'song_ai_ask', 'song_ai_unknown', 'song_dlfail', 'song_loading')
+SONG2_PROMPT_VERSION = 'v_loading_20261003'
 
 ARTIST_RESULT_LIMIT = 60   # singer radio: everything the paginated search yields
 ARTIST_PAGE_LIMIT = 25     # results screen announces the first 25 (5 pages of 5)
@@ -1297,6 +1298,43 @@ class DiskLowError(RuntimeError):
     pass
 
 MIN_FREE_MB_DOWNLOAD = int(os.environ.get('MIN_FREE_MB_DOWNLOAD', '20'))
+# Faster song start (all env-tunable; 0 / unset-safe):
+PREFETCH_EXTRA = int(os.environ.get('PREFETCH_EXTRA', '1'))          # results #2..N+1 pre-converted beside #1 (0 = off)
+SONG_POLL_BLOCK_S = float(os.environ.get('SONG_POLL_BLOCK_S', '2.0'))  # hold a poll this long before replaying a wait prompt (0 = off)
+SONG_MIN_RATIO = float(os.environ.get('SONG_MIN_RATIO', '0.85'))     # converted wav must cover this share of the known duration (0 = off)
+ARTIST_AUTOPLAY = os.environ.get('ARTIST_AUTOPLAY', '1') != '0'      # singer search plays every song in sequence, no menu
+_song_loading_ok = False   # set once the 'song_loading' prompt is confirmed on Yemot
+
+def _block_until(pred, secs):
+    """Wait up to secs for pred() (poll 0.1 s). Replaces dead air between a short wait prompt and the
+    next poll: if the work finishes inside the window the caller answers with the result right away."""
+    end = time.time() + max(0.0, secs)
+    while time.time() < end:
+        try:
+            if pred():
+                return True
+        except Exception:
+            return False
+        time.sleep(0.1)
+    try:
+        return bool(pred())
+    except Exception:
+        return False
+
+def _validate_wav(path, expect_s=None):
+    """A wrong or truncated file is worse than a slow one: refuse it instead of playing it."""
+    with wave.open(path, 'rb') as w:
+        rate, ch, sw, n = w.getframerate(), w.getnchannels(), w.getsampwidth(), w.getnframes()
+    secs = n / float(rate or 1)
+    if rate != 8000 or ch != 1 or sw != 2:
+        raise ValueError(f'converted wav has unexpected format {rate}/{ch}/{sw}')
+    if os.path.getsize(path) < n * ch * sw:                 # header promises more audio than the file holds
+        raise ValueError('converted wav is truncated')
+    if secs < 1.0:
+        raise ValueError('converted wav is empty')
+    if expect_s and SONG_MIN_RATIO > 0 and secs < float(expect_s) * SONG_MIN_RATIO - 2:
+        raise ValueError(f'converted wav too short ({secs:.0f}s of {float(expect_s):.0f}s)')
+    return secs
 
 def disk_guard(min_mb=None):
     """Refuse a large download when /tmp is nearly full (the host has ~63 MB free at idle)."""
@@ -1320,6 +1358,7 @@ def _download_convert(call_id, video_id, search_title=None, tmp=None):
     disk_guard()
     with _tmp_lock:
         _active_tmp.add(tmp)
+    exp_s = None
     if video_id.startswith('jm:'):
         info = jamendo_download(video_id[3:], tmp + '.mp3')
         title = f"{info['name']} - {info['artist']}".strip(' -')
@@ -1329,6 +1368,7 @@ def _download_convert(call_id, video_id, search_title=None, tmp=None):
         if not re.fullmatch(r'[A-Za-z0-9_-]{11}', str(video_id)):
             raise ValueError('invalid YouTube video id')
         title, _dur = yt_download(video_id, tmp + '.%(ext)s')
+        exp_s = _dur if isinstance(_dur, (int, float)) and _dur > 0 else None
     if title == 'שיר' and search_title:
         title = search_title
     files = sorted(path for path in _glob.glob(tmp + '.*')
@@ -1339,9 +1379,14 @@ def _download_convert(call_id, video_id, search_title=None, tmp=None):
         raise ValueError('download produced no media file')
     src_f = files[0]
     out = tmp + '.wav'
-    subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-i', src_f,
-                    '-ar', '8000', '-ac', '1', '-f', 'wav', out],
+    t_ff = time.monotonic()
+    # -vn: never decode a video track (the fallback format 18 is video+audio); -nostdin: never wait on a tty
+    subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-nostdin', '-loglevel', 'error', '-i', src_f,
+                    '-vn', '-ar', '8000', '-ac', '1', '-f', 'wav', out],
                    check=True, capture_output=True, timeout=600 if video_id.startswith('gd:') else 120)
+    secs = _validate_wav(out, exp_s)
+    log.info('convert ok %s src=%dKB wav=%.0fs ffmpeg=%.2fs', video_id[:14], os.path.getsize(src_f) >> 10,
+             secs, time.monotonic() - t_ff)
     return title, out
 
 def _cleanup_tmp(tmp):
@@ -1372,19 +1417,27 @@ def fetch_queue_song(call_id, idx):
         title, out = _download_convert(call_id, video_id, hint, tmp)
         if not title or title == 'שיר':
             title = hint or title or 'שיר'
-        ann_wav = None
+        ann_text = None
         if video_id.startswith('jm:'):
             info = _jm_cache.get(video_id[3:]) or {}
-            ann_wav = tts_wav(f"{info.get('name') or title}. מוזיקה מג'מנדו, האמן {info.get('artist') or 'לא ידוע'}.")
+            ann_text = f"{info.get('name') or title}. מוזיקה מג'מנדו, האמן {info.get('artist') or 'לא ידוע'}."
         elif job.get('mode') in ('artist', 'radio'):
             n = idx + 1
             if n == 1:
-                text = (f'שיר מספר {n}. {title}. לדילוג לשיר הבא, הקישו 9. '
-                        f'לחזרה לשיר הקודם, הקישו 7. לשמירת השיר ברשימה, הקישו 1. '
-                        f'לעצירת הרצף, הקישו 3.')
+                ann_text = (f'שיר מספר {n}. {title}. לדילוג לשיר הבא, הקישו 9. '
+                            f'לחזרה לשיר הקודם, הקישו 7. לשמירת השיר ברשימה, הקישו 1. '
+                            f'לעצירת הרצף, הקישו 3.')
             else:
-                text = f'שיר מספר {n}. {title}.'
-            ann_wav = tts_wav(text)
+                ann_text = f'שיר מספר {n}. {title}.'
+        ann_box, ann_th = {}, None
+        if ann_text is not None:
+            def _mk_ann():                      # TTS runs beside the song upload instead of before it
+                try:
+                    ann_box['wav'] = tts_wav(ann_text)
+                except Exception as e_:
+                    ann_box['err'] = e_
+            ann_th = threading.Thread(target=_mk_ann, daemon=True)
+            ann_th.start()
         if job.get(f'{key}_want') != idx or job.get(f'{key}_vwant') != video_id:
             log.info('queue song superseded call=%s idx=%s, discarding', call_id, idx)
             return
@@ -1393,6 +1446,12 @@ def fetch_queue_song(call_id, idx):
         dest = slot_name(call_id, idx)
         ym_delete(f'{SONG_DIR}/{dest}.wav')
         ym_upload(data, dest + '.wav', f'{SONG_DIR}/{dest}.wav')
+        ann_wav = None
+        if ann_th is not None:
+            ann_th.join(timeout=120)
+            if 'err' in ann_box or 'wav' not in ann_box:
+                raise ann_box.get('err') or RuntimeError('announcement TTS timed out')
+            ann_wav = ann_box['wav']
         if ann_wav is not None:
             ann = f'an{idx % 2}' + re.sub(r'\D', '', call_id)[-6:]
             ym_delete(f'{SONG_DIR}/{ann}.wav')
@@ -1423,6 +1482,7 @@ def start_prefetch(call_id, idx, force=False):
         return
     job[f'{key}_want'] = idx
     job[f'{key}_vwant'] = vid
+    job[f'{key}_file'] = None
     job[f'{key}_status'] = 'working'
     threading.Thread(target=fetch_queue_song, args=(call_id, idx), daemon=True).start()
 
@@ -1439,6 +1499,8 @@ def reuse_or_start_prefetch(call_id, idx):
             and (st in ('working', 'ready') or (st == 'error' and job.get(f'{key}_err') == 'too_long'))):
         log.info('pick reuses speculative download call=%s status=%s', call_id, st)
         return
+    if _adopt_extra(call_id, job, idx, vid):
+        return
     start_prefetch(call_id, idx, force=True)
 
 def speculative_prefetch(call_id, job, results):
@@ -1454,8 +1516,92 @@ def speculative_prefetch(call_id, job, results):
         job['qidx'] = 0
         start_prefetch(call_id, 0)
         log.info('speculative prefetch call=%s video=%s', call_id, results[0][0])
+        prefetch_extras(call_id, job, results)
     except Exception as e:
         log.info('speculative prefetch skipped: %s', str(e)[:100])
+
+def _pf_name(call_id, k):
+    return f'pf{k}' + re.sub(r'\D', '', call_id)[-6:]
+
+def _adopt_extra(call_id, job, idx, vid):
+    """The picked song was pre-converted (or is being) as an extra: point the playing slot at its
+    Yemot file instead of downloading again. Returns False when there is nothing usable."""
+    ent = (job.get('pf') or {}).get(vid)
+    if not ent or ent['status'] == 'error':
+        return False
+    key = f'slot{idx % 2}'
+    def take():
+        if job.get(f'{key}_want') != idx or job.get(f'{key}_vwant') != vid:
+            return                                     # caller moved on
+        if ent['status'] == 'ready':
+            job.update(**{f'{key}_file': ent['file'], f'{key}_ann': None, f'{key}_title': ent['title'],
+                          f'{key}_video': vid, f'{key}_status': 'ready'})
+            log.info('pick adopts pre-converted extra call=%s vid=%s', call_id, vid)
+        else:
+            job[f'{key}_file'] = None
+            start_prefetch(call_id, idx, force=True)   # the extra failed: normal download
+    job[f'{key}_want'] = idx
+    job[f'{key}_vwant'] = vid
+    job[f'{key}_file'] = None
+    if ent['status'] == 'ready':
+        job[f'{key}_status'] = 'working'
+        take()
+        return True
+    job[f'{key}_status'] = 'working'
+    def waiter():
+        ent['ev'].wait(timeout=150)
+        take()
+    threading.Thread(target=waiter, daemon=True).start()
+    return True
+
+def prefetch_extras(call_id, job, results):
+    """Beside result #1, pre-convert the next PREFETCH_EXTRA results (single-song searches only).
+    Strictly one at a time and only after #1 finished, so the likely pick is never slowed down and
+    the 63 MB host disk is never asked for two conversions at once."""
+    if PREFETCH_EXTRA <= 0 or job.get('kind') == 'artist':
+        return
+    items = []
+    for vid, title in list(results)[1:1 + PREFETCH_EXTRA]:
+        vid = str(vid)
+        if vid.startswith('jm:') or (not YT_REFRESH_TOKEN and not vid.startswith('gd:')):
+            continue
+        items.append((vid, title))
+    if not items:
+        return
+    gen = job.get('gen')
+    pf = job['pf'] = {}
+    for k, (vid, _t) in enumerate(items, 1):
+        pf[vid] = {'status': 'working', 'ev': threading.Event(), 'k': k, 'title': None, 'file': None}
+    def worker():
+        t0 = time.time()
+        while job.get('slot0_status') == 'working' and time.time() - t0 < 90:
+            time.sleep(0.5)
+        for vid, hint in items:
+            ent = pf[vid]
+            tmp = f'/tmp/song-{call_id}-pf{ent["k"]}-' + re.sub(r'[^A-Za-z0-9]', '', vid)[:12]
+            try:
+                if song_jobs.get(call_id) is not job or job.get('gen') != gen:
+                    raise RuntimeError('call moved on')
+                t1 = time.monotonic()
+                title, out = _download_convert(call_id, vid, hint, tmp)
+                if not title or title == 'שיר':
+                    title = hint or 'שיר'
+                if song_jobs.get(call_id) is not job or job.get('gen') != gen:
+                    raise RuntimeError('call moved on')
+                with open(out, 'rb') as f:
+                    data = f.read()
+                name = _pf_name(call_id, ent['k'])
+                ym_delete(f'{SONG_DIR}/{name}.wav')
+                ym_upload(data, name + '.wav', f'{SONG_DIR}/{name}.wav')
+                ent.update(title=title, file=name, status='ready')
+                log.info('extra prefetch ready call=%s vid=%s in %.1fs', call_id, vid, time.monotonic() - t1)
+            except Exception as e:
+                ent['status'] = 'error'
+                log.info('extra prefetch skipped call=%s vid=%s: %s', call_id, vid, str(e)[:100])
+            finally:
+                _cleanup_tmp(tmp)
+                ent['ev'].set()
+    threading.Thread(target=worker, daemon=True).start()
 
 def _result_page_text(chunk, first, intro_first):
     parts = [intro_first] if first else ['התוצאות הבאות.']
@@ -1584,9 +1730,23 @@ log_gd = logging.getLogger('gdrive')
 _gd = {'rows': None, 'norm': None, 'by_id': {}, 'tok': None, 'tok_exp': 0.0}
 _gd_lock = threading.Lock()
 
+# Auto-refresh (all env-gated; skipped silently without the GDRIVE_* credentials)
+DRIVE_REFRESH_HOURS = float(os.environ.get('DRIVE_REFRESH_HOURS', '24'))          # 0 = never refresh
+DRIVE_REFRESH_START_DELAY_S = float(os.environ.get('DRIVE_REFRESH_START_DELAY_S', '90'))
+DRIVE_REFRESH_MIN_RATIO = float(os.environ.get('DRIVE_REFRESH_MIN_RATIO', '0.7'))  # new index must keep this share of the old row count
+DRIVE_REFRESH_MIN_ROWS = int(os.environ.get('DRIVE_REFRESH_MIN_ROWS', '100'))
+DRIVE_REFRESH_MAX_S = float(os.environ.get('DRIVE_REFRESH_MAX_S', '1500'))
+DRIVE_ROOT_ID = os.environ.get('DRIVE_ROOT_ID', '').strip()                          # optional: skips root discovery
+DRIVE_ROOT_NAME = os.environ.get('DRIVE_ROOT_NAME', 'מוזיקה מכל הלב')
+DRIVE_LIVE_INDEX_PATH = os.environ.get('DRIVE_LIVE_INDEX_PATH', '/tmp/drive_index_live.json.gz')
+_gd_refresh_lock = threading.Lock()
+_gd_refresh_state = {'last_ok': None, 'last_try': None, 'last_error': None, 'rows': None}
+
+def _gd_creds():
+    return bool(GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET and GDRIVE_REFRESH_TOKEN)
+
 def drive_enabled():
-    return bool(GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET and GDRIVE_REFRESH_TOKEN
-                and os.path.isfile(DRIVE_INDEX_PATH))
+    return bool(_gd_creds() and (os.path.isfile(DRIVE_INDEX_PATH) or os.path.isfile(DRIVE_LIVE_INDEX_PATH)))
 
 _GD_STOP = {'שיר', 'שירים', 'song', 'songs', 'music', 'של', 'את', 'עם', 'על', 'מאת', 'הרב', 'mp3'}
 
@@ -1595,31 +1755,53 @@ def _gd_norm(text):
     text = re.sub(r"[\"'`\u05f3\u05f4\u2018\u2019\u201c\u201d\-_.,:;!?()\[\]/\\]", ' ', text)
     return re.sub(r'\s+', ' ', text).strip().lower()
 
+def _gd_install(rows):
+    """Swap in a new index in one assignment; searches in flight keep the snapshot they started with."""
+    norm = [(_gd_norm(r[1]), _gd_norm(r[2])) for r in rows]
+    by_id = {r[0]: r for r in rows}
+    _gd['snap'] = (rows, norm, by_id)
+    _gd['norm'], _gd['by_id'], _gd['rows'] = norm, by_id, rows
+
+def _gd_read_index(path):
+    import gzip
+    with gzip.open(path, 'rt', encoding='utf-8') as fh:
+        rows = json.load(fh)
+    _gd_check_rows(rows)
+    return rows
+
 def _gd_load():
     if _gd['rows'] is not None:
         return
     with _gd_lock:
         if _gd['rows'] is not None:
             return
-        import gzip
-        with gzip.open(DRIVE_INDEX_PATH, 'rt', encoding='utf-8') as fh:
-            rows = json.load(fh)
-        _gd['norm'] = [(_gd_norm(r[1]), _gd_norm(r[2])) for r in rows]
-        _gd['by_id'] = {r[0]: r for r in rows}
-        _gd['rows'] = rows
-        log_gd.info('drive index loaded: %d files', len(rows))
+        rows, src = None, DRIVE_INDEX_PATH
+        # a refreshed copy (validated, written atomically) wins when it is newer than the bundled snapshot
+        try:
+            if os.path.isfile(DRIVE_LIVE_INDEX_PATH) and (
+                    not os.path.isfile(DRIVE_INDEX_PATH)
+                    or os.path.getmtime(DRIVE_LIVE_INDEX_PATH) >= os.path.getmtime(DRIVE_INDEX_PATH)):
+                rows, src = _gd_read_index(DRIVE_LIVE_INDEX_PATH), DRIVE_LIVE_INDEX_PATH
+        except Exception as e:
+            log_gd.warning('refreshed drive index unreadable (%s); using the bundled snapshot', str(e)[:100])
+            rows = None
+        if rows is None:
+            rows, src = _gd_read_index(DRIVE_INDEX_PATH), DRIVE_INDEX_PATH
+        _gd_install(rows)
+        log_gd.info('drive index loaded: %d files from %s', len(rows), os.path.basename(src))
 
 def drive_search(query, limit=5):
     """[('gd:<file id>', 'file name')] ranked by token matches (name counts more than folder path)."""
     if not drive_enabled():
         return []
     _gd_load()
+    snap_rows, snap_norm, _by = _gd['snap']
     toks = [t for t in _gd_norm(query).split() if len(t) >= 2 and t not in _GD_STOP]
     if not toks:
         return []
     need = len(toks) if len(toks) <= 2 else len(toks) - 1
     scored = []
-    for (nname, npath), row in zip(_gd['norm'], _gd['rows']):
+    for (nname, npath), row in zip(snap_norm, snap_rows):
         in_name = sum(1 for t in toks if t in nname)
         if in_name >= need:
             scored.append((-in_name, 0, len(nname), row))
@@ -1635,7 +1817,7 @@ def drive_search(query, limit=5):
 
 def drive_title(fid):
     _gd_load()
-    row = _gd['by_id'].get(fid)
+    row = _gd['snap'][2].get(fid)
     return os.path.splitext(row[1])[0].strip() if row else 'שיר'
 
 def _gd_token():
@@ -1678,6 +1860,162 @@ def drive_download(fid, outpath):
         raise ValueError('drive audio too small')
     log_gd.info('drive download ok id=%s bytes=%d', fid, os.path.getsize(outpath))
     return drive_title(fid)
+
+# ---------- Drive index auto-refresh ----------
+_GD_AUDIO_EXT = ('.mp3', '.m4a', '.wav', '.aac', '.flac', '.ogg', '.opus', '.wma', '.mp4', '.amr')
+_GD_FOLDER = 'application/vnd.google-apps.folder'
+_GD_SHORTCUT = 'application/vnd.google-apps.shortcut'
+
+def _gd_check_rows(rows):
+    if not isinstance(rows, list) or not rows:
+        raise ValueError('index is empty')
+    for r in rows[:50] + rows[-50:]:
+        if not (isinstance(r, list) and len(r) == 4 and isinstance(r[0], str) and isinstance(r[1], str)
+                and isinstance(r[2], str) and isinstance(r[3], int)):
+            raise ValueError('index row has the wrong shape')
+
+def _gd_api(path, params, tries=5):
+    url = 'https://www.googleapis.com/drive/v3/' + path
+    for attempt in range(tries):
+        r = requests.get(url, params=params, headers={'Authorization': f'Bearer {_gd_token()}'}, timeout=30)
+        if r.status_code == 401:
+            _gd['tok'] = None
+            continue
+        if r.status_code in (429, 500, 502, 503, 504) or (r.status_code == 403 and 'ateLimit' in r.text):
+            time.sleep(min(2 ** attempt, 20))
+            continue
+        r.raise_for_status()
+        return r.json()
+    raise RuntimeError('drive api retries exhausted')
+
+def _gd_find_root():
+    """Folder id of the music library: DRIVE_ROOT_ID, else the owner's shortcut (or folder) named DRIVE_ROOT_NAME."""
+    if DRIVE_ROOT_ID:
+        return DRIVE_ROOT_ID
+    nm = DRIVE_ROOT_NAME.replace('\\', '\\\\').replace("'", "\\'")
+    base = {'fields': 'files(id,name,mimeType,shortcutDetails)', 'pageSize': 20,
+            'supportsAllDrives': 'true', 'includeItemsFromAllDrives': 'true'}
+    j = _gd_api('files', dict(base, q=f"name = '{nm}' and mimeType = '{_GD_SHORTCUT}' and trashed = false"))
+    ids = [f['shortcutDetails']['targetId'] for f in j.get('files', [])
+           if (f.get('shortcutDetails') or {}).get('targetMimeType') == _GD_FOLDER]
+    if not ids:
+        j = _gd_api('files', dict(base, q=f"name = '{nm}' and mimeType = '{_GD_FOLDER}' and trashed = false"))
+        ids = [f['id'] for f in j.get('files', [])]
+    ids = list(dict.fromkeys(ids))
+    if len(ids) != 1:
+        raise RuntimeError(f'library root is ambiguous or missing ({len(ids)} candidates)')
+    return ids[0]
+
+def _gd_crawl(root, deadline):
+    """Breadth-first listing of the library folder by folder (4 in parallel). Rows match
+    build_drive_index.py: [file id, file name, 'year / week / ...' folder path below the root, size]."""
+    from concurrent.futures import ThreadPoolExecutor
+    def list_folder(fid):
+        out, tok = [], None
+        while True:
+            if time.time() > deadline:
+                raise TimeoutError('drive crawl exceeded its time budget')
+            p = {'q': f"'{fid}' in parents and trashed = false", 'pageSize': 1000,
+                 'fields': 'nextPageToken,files(id,name,mimeType,size)',
+                 'supportsAllDrives': 'true', 'includeItemsFromAllDrives': 'true'}
+            if tok:
+                p['pageToken'] = tok
+            j = _gd_api('files', p)
+            out.extend(j.get('files', []))
+            tok = j.get('nextPageToken')
+            if not tok:
+                return out
+    rows, seen_folders = [], {root}
+    frontier = [(root, [])]
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        depth = 0
+        while frontier:
+            depth += 1
+            if depth > 12:
+                raise RuntimeError('drive folder tree too deep')
+            nxt = []
+            for (fid, parts), files in zip(frontier, ex.map(lambda fp: list_folder(fp[0]), frontier)):
+                for f in files:
+                    mt = f.get('mimeType') or ''
+                    if mt == _GD_FOLDER:
+                        if f['id'] not in seen_folders:
+                            seen_folders.add(f['id'])
+                            nxt.append((f['id'], parts + [f.get('name') or '']))
+                    elif mt == _GD_SHORTCUT or mt.startswith('application/vnd.google-apps'):
+                        continue
+                    elif mt.startswith('audio/') or (f.get('name') or '').lower().endswith(_GD_AUDIO_EXT):
+                        rows.append([f['id'], f.get('name') or '', ' / '.join(parts), int(f.get('size') or 0)])
+            frontier = nxt
+    rows.sort(key=lambda r: (r[2], r[1], r[0]))
+    return rows
+
+def drive_refresh_once():
+    """Rebuild the index from Drive into a temp file, validate it, swap it in atomically.
+    Any failure keeps the old index. Returns a small status dict."""
+    if not _gd_creds():
+        return {'skipped': 'no credentials'}
+    if not _gd_refresh_lock.acquire(blocking=False):
+        return {'skipped': 'refresh already running'}
+    st = _gd_refresh_state
+    st['last_try'] = time.time()
+    t0 = time.monotonic()
+    tmp = DRIVE_LIVE_INDEX_PATH + '.tmp'
+    try:
+        old_n = 0
+        try:
+            _gd_load()
+            old_n = len(_gd['rows'] or [])
+        except Exception:
+            old_n = 0
+        root = _gd_find_root()
+        rows = _gd_crawl(root, time.time() + DRIVE_REFRESH_MAX_S)
+        _gd_check_rows(rows)
+        if len(rows) < DRIVE_REFRESH_MIN_ROWS:
+            raise ValueError(f'new index too small ({len(rows)} rows)')
+        if len({r[0] for r in rows}) != len(rows):
+            raise ValueError('duplicate file ids in the new index')
+        if old_n and len(rows) < old_n * DRIVE_REFRESH_MIN_RATIO:
+            raise ValueError(f'new index has {len(rows)} rows vs {old_n} before (below {DRIVE_REFRESH_MIN_RATIO:.0%}); kept the old one')
+        import gzip
+        with gzip.open(tmp, 'wt', encoding='utf-8') as fh:
+            json.dump(rows, fh, ensure_ascii=False, separators=(',', ':'))
+        back = _gd_read_index(tmp)                        # round-trip check before it can replace anything
+        if len(back) != len(rows):
+            raise ValueError('index round-trip mismatch')
+        os.replace(tmp, DRIVE_LIVE_INDEX_PATH)           # atomic: readers see the old file or the new one
+        _gd_install(back)
+        st.update(last_ok=time.time(), last_error=None, rows=len(back))
+        log_gd.info('drive index refreshed: %d files (was %d) in %.0fs', len(back), old_n, time.monotonic() - t0)
+        return {'ok': True, 'rows': len(back), 'was': old_n, 'seconds': round(time.monotonic() - t0)}
+    except Exception as e:
+        st['last_error'] = str(e)[:200]
+        log_gd.warning('drive index refresh failed, keeping the current index: %s: %s', type(e).__name__, str(e)[:200])
+        return {'ok': False, 'error': str(e)[:200]}
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        _gd_refresh_lock.release()
+
+def _drive_refresh_loop():
+    if DRIVE_REFRESH_HOURS <= 0 or not _gd_creds():
+        return                                            # silently off
+    time.sleep(max(0.0, DRIVE_REFRESH_START_DELAY_S))
+    interval = max(600.0, DRIVE_REFRESH_HOURS * 3600.0)
+    while True:
+        res = drive_refresh_once()
+        time.sleep(interval if res.get('ok') or res.get('skipped') else min(interval, 3600.0))
+
+@app.route('/drive-refresh', methods=['GET', 'POST'])
+def drive_refresh_route():
+    if not admin_secret_ok():
+        return 'forbidden', 403
+    if request.method == 'POST' or request.args.get('run') == '1':
+        threading.Thread(target=drive_refresh_once, daemon=True).start()
+        return {'started': True}
+    return dict(_gd_refresh_state, enabled=_gd_creds(), hours=DRIVE_REFRESH_HOURS)
 
 def fetch_free_results(call_id, query):
     """Key-4 search: same paged results screen as fetch_results, Jamendo as the source."""
@@ -1796,6 +2134,18 @@ def fetch_ai_results(call_id, description):
         log.warning('ai song search failed call=%s: %s', call_id, e)
         job.update(status='error', err='ai_error')
 
+def dedupe_by_title(results):
+    """Same song from two sources (Drive copy + YouTube etc.): keep the first, in source order."""
+    seen, out = set(), []
+    for vid, title in results:
+        key = _gd_norm(re.sub(r'\s*-\s*[^-]*$', '', title or '') if ' - ' in (title or '') else (title or ''))
+        key = re.sub(r'\.(mp3|m4a|wav|mp4)$', '', key)
+        if key and key in seen:
+            continue
+        seen.add(key)
+        out.append((vid, title))
+    return out
+
 def fetch_artist_results(call_id, artist):
     """Singer search: paginated results screen; picking a song starts radio of ALL the singer's songs."""
     job = song_jobs.get(call_id)
@@ -1803,6 +2153,14 @@ def fetch_artist_results(call_id, artist):
         return
     try:
         results = merged_song_search(artist, limit=ARTIST_RESULT_LIMIT, artist_mode=True, hn_max=30)
+        if ARTIST_AUTOPLAY:
+            results = dedupe_by_title(results)
+            job.pop('autoplay', None)
+            job.update(queue=list(results), qidx=0, mode='artist', results=results)
+            start_prefetch(call_id, 0, force=True)       # song 1 downloads now; 2 starts when 1 plays
+            job.update(autoplay=True, status='ready')
+            log.info('artist autoplay call=%s artist=%r: %d songs queued', call_id, artist[:60], len(results))
+            return
         pages = publish_result_pages(call_id, job, results, 'a', f'מצאתי שירים של {artist}.', ARTIST_PAGE_LIMIT)
         speculative_prefetch(call_id, job, results)
         log.info('artist results call=%s artist=%r: %d results, %d pages',
@@ -1831,6 +2189,15 @@ def fetch_radio(call_id, video_id, cur_title):
         log.warning('radio build failed call=%s: %s', call_id, e)
         job.update(status='error', err=str(e)[:200])
 
+def _after_pick(call_id, job, turn):
+    """Right after a pick: a pre-fetched song starts at once (no 'searching' prompt); a download that
+    finishes within the hold window does too; otherwise play a short loading prompt."""
+    idx = job.get('qidx', 0)
+    key = f'slot{idx % 2}'
+    if _block_until(lambda: job.get(f'{key}_status') not in (None, 'working'), SONG_POLL_BLOCK_S):
+        return wait_step(call_id, job, turn)
+    return text_response(play_chain('f-song_loading' if _song_loading_ok else 'f-song_searching', f'S{turn+1}'))
+
 def wait_step(call_id, job, turn):
     """Stage 'wait' logic: poll the current slot, skip broken queue songs, play when ready."""
     idx = job.get('qidx', 0)
@@ -1840,6 +2207,8 @@ def wait_step(call_id, job, turn):
         if time.time() - job.get('started', 0) > 150:
             st = 'error'
             job[f'{key}_status'] = 'error'
+        elif _block_until(lambda: job.get(f'{key}_status') not in (None, 'working'), SONG_POLL_BLOCK_S):
+            return wait_step(call_id, job, turn)       # finished inside the hold window: no prompt, no extra round trip
         else:
             return text_response(play_chain('f-song_wait', f'S{turn+1}'))
     if st == 'error':
@@ -1862,13 +2231,13 @@ def wait_step(call_id, job, turn):
             nxt = alts.pop(0)
             log.info('download failover call=%s: %s -> %s', call_id, queue[0][0], nxt[0])
             job.update(alts=alts, queue=[nxt], qidx=0, started=time.time())
-            start_prefetch(call_id, 0, force=True)
+            reuse_or_start_prefetch(call_id, 0)          # adopts a pre-converted extra when it is the next result
             return wait_step(call_id, job, turn)
         # the search DID find the song, so never say it was not found
         job.update(stage='ask', status='idle', mode='single', alts=[])
         return text_response('read=f-song_dlfail.f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
     queue = job.get('queue') or []
-    job.update(stage='play', name=slot_name(call_id, idx),
+    job.update(stage='play', name=job.get(f'{key}_file') or slot_name(call_id, idx),
                title=job.get(f'{key}_title') or (queue[idx][1] if idx < len(queue) else '') or 'שיר',
                video_id=job.get(f'{key}_video') or (queue[idx][0] if idx < len(queue) else ''))
     if job.get('phone'):
@@ -2133,6 +2502,13 @@ def yemot_song():
 
         if stage == 'searching':
             st = job.get('status')
+            if st == 'working' and time.time() - job.get('started', 0) <= 150:
+                _block_until(lambda: job.get('status') != 'working', SONG_POLL_BLOCK_S)
+                st = job.get('status')
+            if st == 'ready' and job.pop('autoplay', None):
+                # singer search: the whole sequence starts now, no results menu
+                job.update(stage='wait', status='idle', started=time.time())
+                return wait_step(call_id, job, turn)
             if st == 'working':
                 if time.time() - job.get('started', 0) > 150:
                     job.update(stage='ask', status='idle', mode='single')
@@ -2177,7 +2553,7 @@ def yemot_song():
                                    queue=[(video_id, title)], qidx=0, started=time.time(),
                                    alts=alts_)
                         reuse_or_start_prefetch(call_id, 0)
-                    return text_response(play_chain('f-song_searching', f'S{turn+1}'))
+                    return _after_pick(call_id, job, turn)
             return text_response(f"read=f-{pages[job.get('page_idx', 0)]}=S{turn+1},no,1,1,10,No,yes,,,,,,,,no")
 
         if stage in ('await_queue', 'radio_build'):
@@ -4529,6 +4905,7 @@ def _auto_setup_song2():
         names = {f.get('name') for f in ym_list_files(f'ivr2:{SONG_DIR}')}
         if f'prompts_{SONG2_PROMPT_VERSION}.txt' in names:
             log.info('song2 prompts already at %s', SONG2_PROMPT_VERSION)
+            globals()['_song_loading_ok'] = True
             return
     except Exception as e:
         log.warning('song2 prompt check failed, uploading anyway: %s', e)
@@ -4541,6 +4918,7 @@ def _auto_setup_song2():
             ok = False
             log.warning('song2 prompt %s failed: %s', name, e)
     if ok:
+        globals()['_song_loading_ok'] = True
         try:
             ym_upload_text(SONG2_PROMPT_VERSION + '\n', f'ivr2:{SONG_DIR}/prompts_{SONG2_PROMPT_VERSION}.txt')
         except Exception as e:
@@ -4773,5 +5151,7 @@ def _auto_prune_ivr_tree():
         log.exception('owner IVR tree update failed: %s', e)
 
 threading.Thread(target=_auto_prune_ivr_tree, daemon=True).start()
+threading.Thread(target=_drive_refresh_loop, daemon=True).start()
+
 
 
