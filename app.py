@@ -1326,7 +1326,17 @@ def _block_until(pred, secs):
 # before "data" (70-byte header instead of the canonical 44), which telephony wav parsers can treat as audio.
 # bitexact + no metadata = canonical header, same samples.
 WAV_OUT_OPTS = ['-vn', '-map_metadata', '-1', '-fflags', '+bitexact', '-flags:a', '+bitexact',
+                '-af', 'aformat=channel_layouts=mono,alimiter=limit=0.89:level=disabled',
                 '-ar', '8000', '-ac', '1', '-c:a', 'pcm_s16le', '-f', 'wav']
+
+def _run_ff(cmd, timeout):
+    # like subprocess.run(check=True, capture_output=True) but the error carries ffmpeg's stderr tail
+    r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    if r.returncode != 0:
+        tail = (r.stderr or b'').decode('utf-8', 'replace').strip()[-300:]
+        raise RuntimeError('ffmpeg rc=%s: %s' % (r.returncode, tail))
+    return r
+
 
 def _wav_stats(path):
     """Cheap audio sanity numbers for a converted wav (header size, peak, clipping, big sample jumps)."""
@@ -1407,9 +1417,8 @@ def _download_convert(call_id, video_id, search_title=None, tmp=None):
     out = tmp + '.wav'
     t_ff = time.monotonic()
     # -vn: never decode a video track (the fallback format 18 is video+audio); -nostdin: never wait on a tty
-    subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-nostdin', '-loglevel', 'error', '-i', src_f,
-                    *WAV_OUT_OPTS, out],
-                   check=True, capture_output=True, timeout=600 if video_id.startswith('gd:') else 120)
+    _run_ff([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-nostdin', '-loglevel', 'error', '-i', src_f,
+             *WAV_OUT_OPTS, out], 600 if video_id.startswith('gd:') else 120)
     secs = _validate_wav(out, exp_s)
     log.info('convert ok %s src=%dKB wav=%.0fs ffmpeg=%.2fs', video_id[:14], os.path.getsize(src_f) >> 10,
              secs, time.monotonic() - t_ff)
@@ -1557,10 +1566,9 @@ def _seg_make(plan, k, out):
     for attempt in (1, 2):
         try:
             src = _seg_src(plan, refresh=(attempt == 2))
-            subprocess.run([_ff_exe(), '-y', '-nostdin', '-loglevel', 'error'] + _ff_input_opts(src) +
-                           ['-ss', f'{start:.3f}', '-i', src['url'], '-t', f'{dur:.3f}',
-                            *WAV_OUT_OPTS, out],
-                           check=True, capture_output=True, timeout=SEGMENT_FFMPEG_TIMEOUT)
+            _run_ff([_ff_exe(), '-y', '-nostdin', '-loglevel', 'error'] + _ff_input_opts(src) +
+                    ['-ss', f'{start:.3f}', '-i', src['url'], '-t', f'{dur:.3f}',
+                     *WAV_OUT_OPTS, out], SEGMENT_FFMPEG_TIMEOUT)
             # YouTube durations are exact; Drive durations are estimated from the file header, so only check them for non-empty
             secs = _validate_wav(out, dur if plan['kind'] == 'yt' else None)
             return secs
