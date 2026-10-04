@@ -1885,6 +1885,32 @@ def _temp_unmanaged(managed_paths, limit=40):
     out.sort(key=lambda r: -r['bytes'])
     return out[:limit]
 
+@app.route('/meminfo', methods=['GET'])
+def meminfo_route():
+    """Admin only (X-Bridge-Secret). Container memory limit/usage from cgroup + /proc/meminfo; no secrets."""
+    if not admin_secret_ok():
+        return 'forbidden', 403
+    def rd(p):
+        try:
+            return open(p).read().strip()
+        except Exception:
+            return None
+    mi = {}
+    for line in (rd('/proc/meminfo') or '').splitlines():
+        k, _, v = line.partition(':')
+        if k in ('MemTotal', 'MemAvailable', 'MemFree', 'SwapTotal'):
+            mi[k] = v.strip()
+    stat = {}
+    for line in (rd('/sys/fs/cgroup/memory.stat') or '').splitlines()[:40]:
+        k, _, v = line.partition(' ')
+        if k in ('anon', 'file', 'shmem'):
+            stat[k] = int(v)
+    return jsonify({'cgroup_v2': {'max': rd('/sys/fs/cgroup/memory.max'), 'current': rd('/sys/fs/cgroup/memory.current'),
+                                  'peak': rd('/sys/fs/cgroup/memory.peak'), 'events': rd('/sys/fs/cgroup/memory.events'), 'stat': stat},
+                    'cgroup_v1': {'limit': rd('/sys/fs/cgroup/memory/memory.limit_in_bytes'),
+                                  'usage': rd('/sys/fs/cgroup/memory/memory.usage_in_bytes')},
+                    'proc_meminfo': mi})
+
 @app.route('/disk-cleanup', methods=['GET', 'POST'])
 def disk_cleanup_route():
     """Admin (same auth as /drive-refresh: X-Bridge-Secret header or POST form field).
