@@ -1326,8 +1326,13 @@ def _block_until(pred, secs):
 # before "data" (70-byte header instead of the canonical 44), which telephony wav parsers can treat as audio.
 # bitexact + no metadata = canonical header, same samples.
 WAV_OUT_OPTS = ['-vn', '-map_metadata', '-1', '-fflags', '+bitexact', '-flags:a', '+bitexact',
-                '-af', 'aformat=channel_layouts=mono,alimiter=limit=0.89:level=disabled',
                 '-ar', '8000', '-ac', '1', '-c:a', 'pcm_s16le', '-f', 'wav']
+# telephone-band shaping: mono first, then 100 Hz high-pass / 3.6 kHz low-pass (what an 8 kHz call carries anyway)
+_AF_BAND = 'aformat=channel_layouts=mono,highpass=f=100,lowpass=f=3600'
+_AF_LIM = 'alimiter=limit=0.89:level=disabled'
+# whole-song path: loudness normalised to about -16 LUFS; segments only get band+limiter so levels do not jump at joins
+AF_SONG = ','.join([_AF_BAND, 'loudnorm=I=-16:TP=-1.5:LRA=11', _AF_LIM])
+AF_SEG = ','.join([_AF_BAND, _AF_LIM])
 
 def _run_ff(cmd, timeout):
     # like subprocess.run(check=True, capture_output=True) but the error carries ffmpeg's stderr tail
@@ -1418,7 +1423,7 @@ def _download_convert(call_id, video_id, search_title=None, tmp=None):
     t_ff = time.monotonic()
     # -vn: never decode a video track (the fallback format 18 is video+audio); -nostdin: never wait on a tty
     _run_ff([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-nostdin', '-loglevel', 'error', '-i', src_f,
-             *WAV_OUT_OPTS, out], 600 if video_id.startswith('gd:') else 120)
+             '-af', AF_SONG, *WAV_OUT_OPTS, out], 600 if video_id.startswith('gd:') else 120)
     secs = _validate_wav(out, exp_s)
     log.info('convert ok %s src=%dKB wav=%.0fs ffmpeg=%.2fs', video_id[:14], os.path.getsize(src_f) >> 10,
              secs, time.monotonic() - t_ff)
@@ -1568,7 +1573,7 @@ def _seg_make(plan, k, out):
             src = _seg_src(plan, refresh=(attempt == 2))
             _run_ff([_ff_exe(), '-y', '-nostdin', '-loglevel', 'error'] + _ff_input_opts(src) +
                     ['-ss', f'{start:.3f}', '-i', src['url'], '-t', f'{dur:.3f}',
-                     *WAV_OUT_OPTS, out], SEGMENT_FFMPEG_TIMEOUT)
+                     '-af', AF_SEG, *WAV_OUT_OPTS, out], SEGMENT_FFMPEG_TIMEOUT)
             # YouTube durations are exact; Drive durations are estimated from the file header, so only check them for non-empty
             secs = _validate_wav(out, dur if plan['kind'] == 'yt' else None)
             return secs
