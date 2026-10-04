@@ -1905,11 +1905,12 @@ def meminfo_route():
         k, _, v = line.partition(' ')
         if k in ('anon', 'file', 'shmem'):
             stat[k] = int(v)
-    return jsonify({'cgroup_v2': {'max': rd('/sys/fs/cgroup/memory.max'), 'current': rd('/sys/fs/cgroup/memory.current'),
+    import json as _J
+    return Response(_J.dumps({'cgroup_v2': {'max': rd('/sys/fs/cgroup/memory.max'), 'current': rd('/sys/fs/cgroup/memory.current'),
                                   'peak': rd('/sys/fs/cgroup/memory.peak'), 'events': rd('/sys/fs/cgroup/memory.events'), 'stat': stat},
                     'cgroup_v1': {'limit': rd('/sys/fs/cgroup/memory/memory.limit_in_bytes'),
                                   'usage': rd('/sys/fs/cgroup/memory/memory.usage_in_bytes')},
-                    'proc_meminfo': mi})
+                    'proc_meminfo': mi}), mimetype='application/json')
 
 @app.route('/disk-cleanup', methods=['GET', 'POST'])
 def disk_cleanup_route():
