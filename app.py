@@ -619,16 +619,51 @@ def _song_duration_filter(info, **kwargs):
 
 _yt_dl_lock = threading.Lock()   # one yt-dlp/deno solver run at a time: parallel runs got the solver SIGKILLed on the small host
 
+_yt_active = {}   # video id -> {'ev': Event, 'running': bool}; lets a different pick abort a speculative download
+
+class YtCancelled(Exception):
+    pass
+
+def _kill_deno():
+    # SIGKILL any running deno solver (only the lock holder can have one), so the lock frees at once
+    for pid in os.listdir('/proc'):
+        if pid.isdigit():
+            try:
+                if open('/proc/%s/comm' % pid).read().strip() == 'deno':
+                    os.kill(int(pid), 9)
+            except Exception:
+                pass
+
+def cancel_yt_except(keep_video_id):
+    """The caller picked keep_video_id: abort every other in-flight/queued YouTube download."""
+    for v, st in list(_yt_active.items()):
+        if v != keep_video_id and not st['ev'].is_set():
+            st['ev'].set()
+            log.info('cancel speculative YouTube download %s (picked %s)', v, str(keep_video_id)[:14])
+            if st['running']:
+                _kill_deno()
+
 def _ytdlp_serial(yt_dlp, opts, video_id):
-    for attempt in (1,):
-        try:
-            with _yt_dl_lock:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    return ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=True)
-        except SongTooLongError:
-            raise
-        except Exception as e:
-            raise
+    st = {'ev': threading.Event(), 'running': False}
+    _yt_active[video_id] = st
+    def hook(d):
+        if st['ev'].is_set():
+            raise YtCancelled('cancelled')
+    opts = dict(opts, progress_hooks=list(opts.get('progress_hooks') or []) + [hook])
+    try:
+        with _yt_dl_lock:
+            if st['ev'].is_set():
+                raise YtCancelled('cancelled')
+            st['running'] = True
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=True)
+    except Exception as e:
+        if st['ev'].is_set():
+            raise YtCancelled('cancelled') from None
+        raise
+    finally:
+        if _yt_active.get(video_id) is st:
+            _yt_active.pop(video_id, None)
 
 def yt_download(video_id, outtmpl):
     """Use the official mweb PO-token route; retain the old TV path as fallback."""
@@ -664,7 +699,7 @@ def yt_download(video_id, outtmpl):
             log.warning('YouTube download returned metadata but produced no media file')
             raise ValueError('download produced no media file')
         return info.get('title') or 'שיר', info.get('duration')
-    except SongTooLongError:
+    except (SongTooLongError, YtCancelled):
         raise
     except Exception as e:
         authed = bool(_COOKIE_BOOT['configured'] or os.environ.get('YT_COOKIES_FILE'))
@@ -2058,6 +2093,7 @@ def reuse_or_start_prefetch(call_id, idx):
         return
     key = f'slot{idx % 2}'
     vid = job['queue'][idx][0]
+    cancel_yt_except(str(vid))                    # a different pick aborts the speculative download at once
     st = job.get(f'{key}_status')
     if (job.get(f'{key}_want') == idx and job.get(f'{key}_vwant') == vid
             and (st in ('working', 'ready') or (st == 'error' and job.get(f'{key}_err') == 'too_long'))):
@@ -2072,7 +2108,7 @@ def speculative_prefetch(call_id, job, results):
     Same pipeline (disk guard, too-long check); a different pick simply supersedes it."""
     try:
         first_id = str(results[0][0]) if results else ''
-        if not results or not first_id.startswith('gd:'):
+        if not results or first_id.startswith('jm:') or (not YT_REFRESH_TOKEN and not first_id.startswith('gd:')):
             return
         if song_jobs.get(call_id) is not job or job.get('stage') not in ('searching', 'pick'):
             return                              # caller already picked or left
