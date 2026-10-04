@@ -146,9 +146,9 @@ class _CookieSafeYDLLogger:
     def debug(self, msg):
         pass
     def warning(self, msg):
-        log.warning('YouTube extractor warning (details suppressed)')
+        log.warning('YouTube extractor warning: %s', re.sub(r'[A-Za-z0-9_%./=+-]{32,}', '<r>', str(msg))[:220])
     def error(self, msg):
-        log.warning('YouTube extractor error (details suppressed)')
+        log.warning('YouTube extractor error: %s', re.sub(r'[A-Za-z0-9_%./=+-]{32,}', '<r>', str(msg))[:220])
 
 from youtube_solver_check import check as _youtube_solver_check
 _YT_SOLVER_READY = _youtube_solver_check()
@@ -1321,6 +1321,32 @@ def _block_until(pred, secs):
     except Exception:
         return False
 
+
+# Yemot plays plain 8 kHz / 16-bit / mono PCM wav. ffmpeg's default wav muxer adds a LIST/INFO ("Lavf") chunk
+# before "data" (70-byte header instead of the canonical 44), which telephony wav parsers can treat as audio.
+# bitexact + no metadata = canonical header, same samples.
+WAV_OUT_OPTS = ['-vn', '-map_metadata', '-1', '-fflags', '+bitexact', '-flags:a', '+bitexact',
+                '-ar', '8000', '-ac', '1', '-c:a', 'pcm_s16le', '-f', 'wav']
+
+def _wav_stats(path):
+    """Cheap audio sanity numbers for a converted wav (header size, peak, clipping, big sample jumps)."""
+    import array
+    with open(path, 'rb') as f:
+        head = f.read(4096)
+    di = head.find(b'data')
+    with wave.open(path, 'rb') as w:
+        n = w.getnframes(); rate = w.getframerate()
+        raw = w.readframes(min(n, 8000 * 600))
+    a = array.array('h'); a.frombytes(raw[:len(raw) - len(raw) % 2])
+    if not len(a):
+        return {'samples': 0}
+    pk = max(max(a), -min(a))
+    clipped = sum(1 for v in a if v >= 32700 or v <= -32700)
+    jumps = sum(1 for i in range(1, len(a)) if abs(a[i] - a[i - 1]) > 24000)
+    return {'header_bytes': di + 8 if di >= 0 else None, 'list_chunk': b'LIST' in head[:di if di > 0 else 0],
+            'rate': rate, 'secs': round(n / float(rate or 1), 1), 'peak': pk, 'clipped': clipped,
+            'big_jumps': jumps, 'dc': round(sum(a) / len(a), 1)}
+
 def _validate_wav(path, expect_s=None):
     """A wrong or truncated file is worse than a slow one: refuse it instead of playing it."""
     with wave.open(path, 'rb') as w:
@@ -1382,7 +1408,7 @@ def _download_convert(call_id, video_id, search_title=None, tmp=None):
     t_ff = time.monotonic()
     # -vn: never decode a video track (the fallback format 18 is video+audio); -nostdin: never wait on a tty
     subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-nostdin', '-loglevel', 'error', '-i', src_f,
-                    '-vn', '-ar', '8000', '-ac', '1', '-f', 'wav', out],
+                    *WAV_OUT_OPTS, out],
                    check=True, capture_output=True, timeout=600 if video_id.startswith('gd:') else 120)
     secs = _validate_wav(out, exp_s)
     log.info('convert ok %s src=%dKB wav=%.0fs ffmpeg=%.2fs', video_id[:14], os.path.getsize(src_f) >> 10,
@@ -1532,8 +1558,8 @@ def _seg_make(plan, k, out):
         try:
             src = _seg_src(plan, refresh=(attempt == 2))
             subprocess.run([_ff_exe(), '-y', '-nostdin', '-loglevel', 'error'] + _ff_input_opts(src) +
-                           ['-ss', f'{start:.3f}', '-i', src['url'], '-t', f'{dur:.3f}', '-vn',
-                            '-ar', '8000', '-ac', '1', '-f', 'wav', out],
+                           ['-ss', f'{start:.3f}', '-i', src['url'], '-t', f'{dur:.3f}',
+                            *WAV_OUT_OPTS, out],
                            check=True, capture_output=True, timeout=SEGMENT_FFMPEG_TIMEOUT)
             # YouTube durations are exact; Drive durations are estimated from the file header, so only check them for non-empty
             secs = _validate_wav(out, dur if plan['kind'] == 'yt' else None)
@@ -5093,9 +5119,18 @@ def yemot_translate():
 def song_test():
     if not admin_secret_ok():
         return 'forbidden', 403
-    q = request.args.get('q', 'שלום עליכם')
+    q = request.values.get('q', 'שלום עליכם')
     t0 = time.time()
     tmp = f'/tmp/stest-{time.time_ns()}'
+    if re.match(r'^(gd|jm):', q):
+        try:
+            title, out = _download_convert('stest', q, tmp=tmp)
+            st = _wav_stats(out)
+            return {'ok': True, 'title': title, 'stats': st, 'elapsed_s': round(time.time() - t0, 1)}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)[:300], 'elapsed_s': round(time.time() - t0, 1)}
+        finally:
+            _cleanup_tmp(tmp)
     try:
         import imageio_ffmpeg, glob as _glob
         if not YT_REFRESH_TOKEN:
