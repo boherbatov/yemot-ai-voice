@@ -198,6 +198,37 @@ def _yt_result_title(value):
     return str(value.get('content') or value.get('simpleText') or
                ''.join(str(run.get('text') or '') for run in value.get('runs', []) if isinstance(run, dict))).strip()
 
+_YT_META = {}   # video id -> {'chan': [channel-ish strings], 'official': bool}, filled while parsing search rows
+
+def _yt_texts(node, out, depth=0):
+    # collect plain text strings ('content' / 'text' / run text) from a renderer subtree
+    if depth > 8 or len(out) > 30:
+        return
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in ('content', 'text', 'simpleText') and isinstance(v, str):
+                out.append(v)
+            else:
+                _yt_texts(v, out, depth + 1)
+    elif isinstance(node, list):
+        for v in node:
+            _yt_texts(v, out, depth + 1)
+
+def _yt_note_meta(ident, node, title):
+    try:
+        import json as J
+        texts = []
+        _yt_texts(node.get('ownerText') or node.get('longBylineText') or node.get('shortBylineText')
+                  or ((node.get('metadata') or {}).get('lockupMetadataViewModel') or {}).get('metadata') or {}, texts)
+        raw = J.dumps(node, ensure_ascii=False)[:20000]
+        official = ('VERIFIED_ARTIST' in raw) or ('OFFICIAL_ARTIST' in raw)
+        chan = [t for t in texts if t and t != title][:8]
+        if len(_YT_META) > 2000:
+            _YT_META.clear()
+        _YT_META[str(ident)] = {'chan': chan, 'official': official}
+    except Exception:
+        pass
+
 def _yt_result_rows(data):
     """Only search contents/continuations, never account/overlay/watch recommendations.
     TV lockup contentType is not reliably a string; video IDs are exactly 11 chars.
@@ -225,9 +256,11 @@ def _yt_result_rows(data):
             if isinstance(lv, dict):
                 metadata = (lv.get('metadata') or {}).get('lockupMetadataViewModel') or {}
                 add(lv.get('contentId'), metadata.get('title'))
+                _yt_note_meta(lv.get('contentId'), lv, _yt_result_title(metadata.get('title')))
             vr = obj.get('videoRenderer')
             if isinstance(vr, dict):
                 add(vr.get('videoId'), vr.get('title'), vr.get('lengthText'))
+                _yt_note_meta(vr.get('videoId'), vr, _yt_result_title(vr.get('title')))
             cc = obj.get('continuationCommand')
             if isinstance(cc, dict) and cc.get('token'):
                 tokens.append(cc['token'])
@@ -470,13 +503,26 @@ def merged_song_search(query, limit=15, artist_mode=False, hn_max=5, artist=''):
         qw = _word_set(query)
         aw = _word_set(artist) if artist else set()
         # artist match is a boost (+2), not a filter: other results stay in the list, just lower
-        score = lambda it: len(qw & _word_set(it[1])) + (2 if aw and aw & _word_set(it[1]) else 0)
+        def score(it):
+            sc = len(qw & _word_set(it[1]))
+            if aw and aw & _word_set(it[1]):
+                sc += 2
+            meta = _YT_META.get(str(it[0]))
+            if meta and aw:
+                # official artist channel: channel name carries the typed artist's words (+3), or YouTube's artist badge (+1)
+                if any(aw & _word_set(c) for c in meta['chan']):
+                    sc += 3
+                if meta['official']:
+                    sc += 1
+            return sc
         out.sort(key=lambda it: -score(it))
         hn_ids = {v for v, _t in (box.get('hn') or [])}
         gd_ids = {v for v, _t in gd}
-        log.info('top results: %s', ' | '.join('%s:%s' % ('hngn' if v in hn_ids else 'drive' if v in gd_ids
-                                                         else 'jm' if str(v).startswith('jm:') else 'yt',
-                                                         str(t)[:40]) for v, t in out[:6]))
+        def _tag(v):
+            src = 'hngn' if v in hn_ids else 'drive' if v in gd_ids else 'jm' if str(v).startswith('jm:') else 'yt'
+            m = _YT_META.get(str(v))
+            return src + ((':ch=' + (m['chan'][0] if m['chan'] else '?')[:20] + ('+official' if m['official'] else '')) if m else '')
+        log.info('top results: %s', ' | '.join('%s:%s' % (_tag(v), str(t)[:40]) for v, t in out[:6]))
     log.info('merged search: hngn=%d drive=%d youtube=%d jamendo=%d total=%d', len(box.get('hn') or []),
              len(gd), len(yt), len(jm), len(out))
     return out[:limit]
