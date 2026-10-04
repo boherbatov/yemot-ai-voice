@@ -466,15 +466,12 @@ def merged_song_search(query, limit=15, artist_mode=False, hn_max=5, artist=''):
     if not out:
         raise yt_err or ValueError('no video results')
     if not artist_mode:
-        # rank by how many query words (artist included) the label matches; ties keep source order
+        # rank by query-word matches (artist included) plus an artist boost; ties keep source order
         qw = _word_set(query)
-        score = lambda it: len(qw & _word_set(it[1]))
-        out.sort(key=lambda it: -score(it))
         aw = _word_set(artist) if artist else set()
-        if aw:
-            with_artist = [it for it in out if aw & _word_set(it[1])]
-            if with_artist:
-                out = with_artist
+        # artist match is a boost (+2), not a filter: other results stay in the list, just lower
+        score = lambda it: len(qw & _word_set(it[1])) + (2 if aw and aw & _word_set(it[1]) else 0)
+        out.sort(key=lambda it: -score(it))
         hn_ids = {v for v, _t in (box.get('hn') or [])}
         gd_ids = {v for v, _t in gd}
         log.info('top results: %s', ' | '.join('%s:%s' % ('hngn' if v in hn_ids else 'drive' if v in gd_ids
