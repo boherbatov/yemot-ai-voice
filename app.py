@@ -241,7 +241,7 @@ def _yt_result_rows(data):
         walk(root)
     return rows, (tokens[-1] if tokens else None)
 
-def _yt_title_relevant(query, title):
+def _word_set(text):
     import unicodedata
     def words(text):
         text = ''.join(c for c in unicodedata.normalize('NFKD', str(text).casefold())
@@ -255,7 +255,11 @@ def _yt_title_relevant(query, title):
             if len(word) >= 2 and word not in ('שיר', 'שירים', 'song', 'songs', 'music'):
                 result.append(word)
         return set(result)
-    wanted, present = words(query), words(title)
+    return words(text)
+
+
+def _yt_title_relevant(query, title):
+    wanted, present = _word_set(query), _word_set(title)
     if not wanted:
         return False
     matches = len(wanted & present)
@@ -417,7 +421,7 @@ def hngn_results(query, relevant, limit=5, artist_mode=False):
 hngn_source = types.SimpleNamespace(
     hngn_results=hngn_results, HNGN_TIMEOUT=HNGN_TIMEOUT, parse_songs=parse_songs)
 
-def merged_song_search(query, limit=15, artist_mode=False, hn_max=5):
+def merged_song_search(query, limit=15, artist_mode=False, hn_max=5, artist=''):
     """Four sources: hngn (accurate Hebrew titles), the owner's Drive library (local index),
     YouTube and Jamendo, deduped by id. hngn/Jamendo/Drive failures are silent; YouTube failure
     alone does not hide the other hits. Drive and Jamendo run beside the YouTube request, so they
@@ -461,6 +465,21 @@ def merged_song_search(query, limit=15, artist_mode=False, hn_max=5):
             seen.add(vid); out.append((vid, title))
     if not out:
         raise yt_err or ValueError('no video results')
+    if not artist_mode:
+        # rank by how many query words (artist included) the label matches; ties keep source order
+        qw = _word_set(query)
+        score = lambda it: len(qw & _word_set(it[1]))
+        out.sort(key=lambda it: -score(it))
+        aw = _word_set(artist) if artist else set()
+        if aw:
+            with_artist = [it for it in out if aw & _word_set(it[1])]
+            if with_artist:
+                out = with_artist
+        hn_ids = {v for v, _t in (box.get('hn') or [])}
+        gd_ids = {v for v, _t in gd}
+        log.info('top results: %s', ' | '.join('%s:%s' % ('hngn' if v in hn_ids else 'drive' if v in gd_ids
+                                                         else 'jm' if str(v).startswith('jm:') else 'yt',
+                                                         str(t)[:40]) for v, t in out[:6]))
     log.info('merged search: hngn=%d drive=%d youtube=%d jamendo=%d total=%d', len(box.get('hn') or []),
              len(gd), len(yt), len(jm), len(out))
     return out[:limit]
@@ -556,6 +575,23 @@ def _song_duration_filter(info, **kwargs):
         raise SongTooLongError('song exceeds 10-minute limit')
     return None
 
+_yt_dl_lock = threading.Lock()   # one yt-dlp/deno solver run at a time: parallel runs got the solver SIGKILLed on the small host
+
+def _ytdlp_serial(yt_dlp, opts, video_id):
+    for attempt in (1, 2):
+        try:
+            with _yt_dl_lock:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=True)
+        except SongTooLongError:
+            raise
+        except Exception as e:
+            if attempt == 1 and 'Requested format is not available' in str(e):
+                log.info('yt-dlp format missing for %s, retrying once', video_id)
+                time.sleep(2)
+                continue
+            raise
+
 def yt_download(video_id, outtmpl):
     """Use the official mweb PO-token route; retain the old TV path as fallback."""
     import yt_dlp
@@ -578,8 +614,7 @@ def yt_download(video_id, outtmpl):
         if cookie_file:
             opts['cookiefile'] = cookie_file
             opts['logger'] = _CookieSafeYDLLogger()
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=True)
+        info = _ytdlp_serial(yt_dlp, opts, video_id)
         if not info:
             log.warning('YouTube download refused: duration limit or no downloadable media')
             raise ValueError('song too long or no downloadable media')
@@ -2523,7 +2558,7 @@ def fetch_results(call_id, query):
         return
     try:
         search_started = time.monotonic()
-        results = merged_song_search(query, limit=15)
+        results = merged_song_search(query, limit=15, artist=job.get('song_artist', ''))
         log.info('song search phase elapsed=%.2fs count=%d', time.monotonic()-search_started, len(results))
         menu_started = time.monotonic()
         pages = publish_result_pages(call_id, job, results, 'p', 'מצאתי את השירים האלה.')
@@ -2933,6 +2968,7 @@ def yemot_song():
                 threading.Thread(target=fetch_artist_results, args=(call_id, artist), daemon=True).start()
                 return text_response(play_chain('f-song_searching', f'S{turn+1}'))
             q = clean_song_query((song + ' ' + artist).strip())
+            job['song_artist'] = artist
             job.update(stage='searching', status='working', kind=_query_kind(job), query=q, started=time.time())
             threading.Thread(target=_results_fn(job), args=(call_id, q), daemon=True).start()
             return text_response(play_chain('f-song_searching', f'S{turn+1}'))
