@@ -620,7 +620,7 @@ def _song_duration_filter(info, **kwargs):
 _yt_dl_lock = threading.Lock()   # one yt-dlp/deno solver run at a time: parallel runs got the solver SIGKILLed on the small host
 
 def _ytdlp_serial(yt_dlp, opts, video_id):
-    for attempt in (1, 2):
+    for attempt in (1,):
         try:
             with _yt_dl_lock:
                 with yt_dlp.YoutubeDL(opts) as ydl:
@@ -628,10 +628,6 @@ def _ytdlp_serial(yt_dlp, opts, video_id):
         except SongTooLongError:
             raise
         except Exception as e:
-            if attempt == 1 and 'Requested format is not available' in str(e):
-                log.info('yt-dlp format missing for %s, retrying once', video_id)
-                time.sleep(2)
-                continue
             raise
 
 def yt_download(video_id, outtmpl):
@@ -2049,7 +2045,7 @@ def speculative_prefetch(call_id, job, results):
     Same pipeline (disk guard, too-long check); a different pick simply supersedes it."""
     try:
         first_id = str(results[0][0]) if results else ''
-        if not results or first_id.startswith('jm:') or (not YT_REFRESH_TOKEN and not first_id.startswith('gd:')):
+        if not results or not first_id.startswith('gd:'):
             return
         if song_jobs.get(call_id) is not job or job.get('stage') not in ('searching', 'pick'):
             return                              # caller already picked or left
@@ -2105,7 +2101,7 @@ def prefetch_extras(call_id, job, results):
     items = []
     for vid, title in list(results)[1:1 + PREFETCH_EXTRA]:
         vid = str(vid)
-        if vid.startswith('jm:') or (not YT_REFRESH_TOKEN and not vid.startswith('gd:')):
+        if not vid.startswith('gd:'):
             continue
         items.append((vid, title))
     if not items:
@@ -2179,12 +2175,11 @@ def publish_result_pages(call_id, job, results, tag, intro_first, page_limit=Non
         except Exception as e:
             log.warning('result page %d failed call=%s: %s', k, call_id, str(e)[:100])
             failed.add(k)
-    threads = [threading.Thread(target=bg, args=(k,), daemon=True) for k in range(1, len(starts))]
-    for t in threads:
-        t.start()                              # pages 2.. build in parallel while page 1 is made
     build(0)                                   # an exception here fails the whole search, as before
     ready.add(0)
-    job.update(status='ready', results=results)
+    job.update(status='ready', results=results)    # page 1 first: it no longer competes with pages 2.. for CPU/TTS
+    for k in range(1, len(starts)):
+        threading.Thread(target=bg, args=(k,), daemon=True).start()
     return names
 
 def next_result_page(job, wait=12.0):
@@ -2768,7 +2763,9 @@ def wait_step(call_id, job, turn):
             job.update(stage='ask', status='idle', mode='single')
             return text_response('read=f-song_too_long.f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
         alts = job.get('alts') or []
-        if job.get('mode') == 'single' and alts and queue:
+        log.info('pick failed call=%s idx=%s err=%s failovers=%s', call_id, idx, str(job.get(f'{key}_err'))[:80], job.get('failovers', 0))
+        if job.get('mode') == 'single' and alts and queue and job.get('failovers', 0) < 1:
+            job['failovers'] = job.get('failovers', 0) + 1
             # the chosen result could not be downloaded: try the next search result instead
             nxt = alts.pop(0)
             log.info('download failover call=%s: %s -> %s', call_id, queue[0][0], nxt[0])
@@ -2776,7 +2773,9 @@ def wait_step(call_id, job, turn):
             reuse_or_start_prefetch(call_id, 0)          # adopts a pre-converted extra when it is the next result
             return wait_step(call_id, job, turn)
         # the search DID find the song, so never say it was not found
-        job.update(stage='ask', status='idle', mode='single', alts=[])
+        log.info('job reset after failed pick call=%s -> stage=ask', call_id)
+        job.update(stage='ask', status='idle', mode='single', alts=[], failovers=0, queue=[], qidx=0,
+                   slot0_status=None, slot1_status=None)
         return text_response('read=f-song_dlfail.f-song_mode=MODE,no,1,1,10,No,yes,,,,,,,,no')
     queue = job.get('queue') or []
     job.update(stage='play', name=job.get(f'{key}_file') or slot_name(call_id, idx),
