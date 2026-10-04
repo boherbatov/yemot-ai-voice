@@ -507,15 +507,14 @@ def merged_song_search(query, limit=15, artist_mode=False, hn_max=5, artist=''):
             sc = len(qw & _word_set(it[1]))
             if aw and aw & _word_set(it[1]):
                 sc += 2
-            meta = _YT_META.get(str(it[0]))
-            if meta and aw:
-                # official artist channel: channel name carries the typed artist's words (+3), or YouTube's artist badge (+1)
-                if any(aw & _word_set(c) for c in meta['chan']):
-                    sc += 3
-                if meta['official']:
-                    sc += 1
             return sc
-        out.sort(key=lambda it: -score(it))
+        def official_tb(it):
+            # tiebreak ONLY: between equal scores, the artist's own/official YouTube channel goes first
+            meta = _YT_META.get(str(it[0]))
+            if not (meta and aw):
+                return 0
+            return (2 if any(aw & _word_set(c) for c in meta['chan']) else 0) + (1 if meta['official'] else 0)
+        out.sort(key=lambda it: (-score(it), -official_tb(it)))
         hn_ids = {v for v, _t in (box.get('hn') or [])}
         gd_ids = {v for v, _t in gd}
         def _tag(v):
