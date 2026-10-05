@@ -20,6 +20,10 @@ ADD https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknow
 RUN python3 -c "import zipfile; zipfile.ZipFile('/tmp/deno.zip').extract('deno', '/usr/local/bin')" \
     && chmod +x /usr/local/bin/deno && rm /tmp/deno.zip
 
+# QuickJS: lighter JS runtime for the YouTube solver (deno stays as fallback)
+ADD https://github.com/quickjs-ng/quickjs/releases/download/v0.17.0/qjs-linux-x86_64 /usr/local/bin/qjs
+RUN chmod 755 /usr/local/bin/qjs && /usr/local/bin/qjs --help >/dev/null
+
 WORKDIR /srv
 COPY app.py start.sh ./
 RUN chmod +x start.sh

@@ -150,6 +150,87 @@ class _CookieSafeYDLLogger:
     def error(self, msg):
         log.warning('YouTube extractor error: %s', re.sub(r'[A-Za-z0-9_%./=+-]{32,}', '<r>', str(msg))[:220])
 
+
+# ---- YouTube solver memory control (512 MB host) ----
+YT_CACHE_DIR = os.environ.get('YT_CACHE_DIR', '/tmp/ytcache')
+QJS_PATH = next((p for p in (os.environ.get('YT_QJS_PATH', ''), '/usr/local/bin/qjs', '/app/bin/qjs') if p and os.path.exists(p)), '/usr/local/bin/qjs')
+try:
+    # keep yt-dlp's preprocessed player on disk: later solves skip parsing the whole player script
+    # (measured: solver peak RSS 247 MB first run -> 123 MB afterwards, same speed)
+    from yt_dlp.extractor.youtube.jsc._builtin import ejs as _ejs_mod
+    _ejs_mod.EJSBaseJCP._ENABLE_PREPROCESSED_PLAYER_CACHE = True
+except Exception as _e:
+    log.info('preprocessed player cache switch unavailable: %s', str(_e)[:80])
+
+def _qjs_ok():
+    try:
+        return os.path.exists(QJS_PATH) and subprocess.run([QJS_PATH, '--help'], capture_output=True, timeout=5).returncode == 0
+    except Exception:
+        return False
+_QJS_OK = _qjs_ok()
+log.info('quickjs solver runtime: %s', 'available' if _QJS_OK else 'missing (deno only)')
+
+def _yt_runtime_choices():
+    # first try: QuickJS (smaller, same speed). If the solver fails or is killed, retry once with deno.
+    return ['quickjs', 'deno'] if _QJS_OK else ['deno', 'deno']
+
+def _yt_runtime_opts(rt):
+    if rt == 'quickjs':
+        rts = {'quickjs': {'path': QJS_PATH}}
+    else:
+        rts = {'deno': {'path': os.environ.get('YT_DENO_PATH', '/opt/venv/bin/deno')}}
+    return {'js_runtimes': rts, 'cachedir': YT_CACHE_DIR}
+
+def _yt_cache_prune():
+    """Keep only the newest preprocessed player (about 9 MB each) so /tmp never fills up."""
+    try:
+        d = os.path.join(YT_CACHE_DIR, 'challenge-solver')
+        files = sorted((os.path.join(d, f) for f in os.listdir(d)), key=os.path.getmtime, reverse=True)
+        for f in files[1:]:
+            if os.path.basename(f).startswith('player'):
+                os.remove(f)
+    except Exception:
+        pass
+
+def _cg_mb(name):
+    try:
+        v = open('/sys/fs/cgroup/' + name).read().strip()
+        return None if v == 'max' else int(v) / 1048576
+    except Exception:
+        return None
+
+def _yt_wait_headroom(need_mb=None, max_wait=8.0):
+    """Wait (briefly) until the container has room for the solver, instead of starting it into an OOM kill."""
+    lim = _cg_mb('memory.max')
+    if lim is None:
+        return
+    if need_mb is None:
+        warm = os.path.isdir(os.path.join(YT_CACHE_DIR, 'challenge-solver')) and bool(os.listdir(os.path.join(YT_CACHE_DIR, 'challenge-solver')))
+        need_mb = 150 if warm else 270
+    t0 = time.time()
+    while time.time() - t0 < max_wait:
+        cur = _cg_mb('memory.current')
+        if cur is None or lim - cur >= need_mb:
+            return
+        time.sleep(0.5)
+    log.info('solver headroom wait expired: %.0f MB free of %.0f', lim - (_cg_mb('memory.current') or 0), lim)
+
+class _SolverLogger:
+    """Forwards yt-dlp messages (secrets redacted) and notes when the JS solver failed or was killed."""
+    def __init__(self):
+        self.solver_failed = False
+    def debug(self, msg):
+        pass
+    def info(self, msg):
+        pass
+    def warning(self, msg):
+        m = str(msg)
+        if 'challenge' in m and ('failed' in m or 'Error' in m) or 'returncode' in m:
+            self.solver_failed = True
+        log.warning('YouTube extractor warning: %s', re.sub(r'[A-Za-z0-9_%./=+-]{32,}', '<r>', m)[:220])
+    def error(self, msg):
+        log.warning('YouTube extractor error: %s', re.sub(r'[A-Za-z0-9_%./=+-]{32,}', '<r>', str(msg))[:220])
+
 from youtube_solver_check import check as _youtube_solver_check
 _YT_SOLVER_READY = _youtube_solver_check()
 log.info('YouTube solver readiness: %s', json.dumps(_YT_SOLVER_READY, sort_keys=True))
@@ -629,7 +710,7 @@ def _kill_deno():
     for pid in os.listdir('/proc'):
         if pid.isdigit():
             try:
-                if open('/proc/%s/comm' % pid).read().strip() == 'deno':
+                if open('/proc/%s/comm' % pid).read().strip() in ('deno', 'qjs'):
                     os.kill(int(pid), 9)
             except Exception:
                 pass
@@ -676,18 +757,32 @@ def yt_download(video_id, outtmpl):
         opts = {
             'format': 'bestaudio/best', 'outtmpl': outtmpl,
             'quiet': True, 'no_warnings': False, 'noplaylist': True,
-            'js_runtimes': {'deno': {'path': os.environ.get('YT_DENO_PATH', '/opt/venv/bin/deno')}},
             'extractor_args': {'youtube': {'player_client': ['mweb']},
                                'youtubepot-bgutilhttp': {'base_url': ['http://127.0.0.1:4416']}},
             'match_filter': _song_duration_filter,
-            'cachedir': False,
             'socket_timeout': 20, 'retries': 1,
         }
         cookie_file = _active_cookie_file()
         if cookie_file:
             opts['cookiefile'] = cookie_file
-            opts['logger'] = _CookieSafeYDLLogger()
-        info = _ytdlp_serial(yt_dlp, opts, video_id)
+        info = None
+        for _attempt, _rt in enumerate(_yt_runtime_choices()):
+            _lg = _SolverLogger()
+            opts.update(_yt_runtime_opts(_rt))
+            opts['logger'] = _lg
+            _yt_cache_prune()
+            _yt_wait_headroom()
+            try:
+                info = _ytdlp_serial(yt_dlp, opts, video_id)
+                break
+            except (SongTooLongError, YtCancelled):
+                raise
+            except Exception:
+                if _attempt == 0 and _lg.solver_failed:
+                    log.info('solver failed with %s for %s, retrying once', _rt, video_id)
+                    time.sleep(1.0)
+                    continue
+                raise
         if not info:
             log.warning('YouTube download refused: duration limit or no downloadable media')
             raise ValueError('song too long or no downloadable media')
@@ -1620,17 +1715,30 @@ def yt_stream_info(video_id):
         raise RuntimeError('YouTube solver unavailable')
     opts = {
         'format': 'bestaudio[ext=m4a]/bestaudio', 'quiet': True, 'no_warnings': False, 'noplaylist': True,
-        'js_runtimes': {'deno': {'path': os.environ.get('YT_DENO_PATH', '/opt/venv/bin/deno')}},
         'extractor_args': {'youtube': {'player_client': ['mweb']},
                            'youtubepot-bgutilhttp': {'base_url': ['http://127.0.0.1:4416']}},
-        'cachedir': False, 'socket_timeout': 20, 'retries': 1,
+        'socket_timeout': 20, 'retries': 1,
     }
     cookie_file = _active_cookie_file()
     if cookie_file:
         opts['cookiefile'] = cookie_file
-        opts['logger'] = _CookieSafeYDLLogger()
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
+    info = None
+    for _attempt, _rt in enumerate(_yt_runtime_choices()):
+        _lg = _SolverLogger()
+        opts.update(_yt_runtime_opts(_rt))
+        opts['logger'] = _lg
+        _yt_cache_prune()
+        _yt_wait_headroom()
+        try:
+            with _yt_dl_lock:      # same one-solver-at-a-time rule as downloads
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
+            break
+        except Exception:
+            if _attempt == 0 and _lg.solver_failed:
+                time.sleep(1.0)
+                continue
+            raise
     if not info:
         raise ValueError('no stream info')
     if info.get('is_live') or info.get('live_status') in ('is_live', 'is_upcoming'):
@@ -1940,8 +2048,19 @@ def meminfo_route():
         k, _, v = line.partition(' ')
         if k in ('anon', 'file', 'shmem'):
             stat[k] = int(v)
+    procs = []
+    for pid in os.listdir('/proc'):
+        if pid.isdigit():
+            try:
+                nm = rd(f'/proc/{pid}/comm')
+                kb = [int(l.split()[1]) for l in (rd(f'/proc/{pid}/status') or '').splitlines() if l.startswith('VmRSS')]
+                if kb:
+                    procs.append({'pid': int(pid), 'name': nm, 'rss_mb': round(kb[0] / 1024)})
+            except Exception:
+                pass
+    procs.sort(key=lambda x: -x['rss_mb'])
     import json as _J
-    return Response(_J.dumps({'cgroup_v2': {'max': rd('/sys/fs/cgroup/memory.max'), 'current': rd('/sys/fs/cgroup/memory.current'),
+    return Response(_J.dumps({'processes': procs[:12], 'cgroup_v2': {'max': rd('/sys/fs/cgroup/memory.max'), 'current': rd('/sys/fs/cgroup/memory.current'),
                                   'peak': rd('/sys/fs/cgroup/memory.peak'), 'events': rd('/sys/fs/cgroup/memory.events'), 'stat': stat},
                     'cgroup_v1': {'limit': rd('/sys/fs/cgroup/memory/memory.limit_in_bytes'),
                                   'usage': rd('/sys/fs/cgroup/memory/memory.usage_in_bytes')},
@@ -5804,6 +5923,18 @@ def _auto_setup_library():
         log.exception('library setup failed')
 
 threading.Thread(target=_auto_setup_library, daemon=True).start()
+
+def _yt_prewarm():
+    """Once, shortly after boot while the line is idle: solve one known video so the preprocessed player is cached."""
+    try:
+        time.sleep(75)
+        if _YT_SOLVER_READY.get('ok'):
+            t0 = time.time()
+            yt_stream_info('8hdDD3caMuQ')
+            log.info('youtube solver prewarm ok in %.1fs', time.time() - t0)
+    except Exception as e:
+        log.info('youtube solver prewarm skipped: %s', str(e)[:100])
+threading.Thread(target=_yt_prewarm, daemon=True).start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))

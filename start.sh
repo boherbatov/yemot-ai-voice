@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+export MALLOC_ARENA_MAX=2   # fewer glibc arenas: noticeably less RSS in threaded python and node
 POT_HOME="${POT_HOME:-/app/pot}"
 if [ ! -f "$POT_HOME/server/build/main.js" ]; then POT_HOME=/pot; fi
 NODE="$POT_HOME/server/node_modules/node/bin/node"
