@@ -569,8 +569,8 @@ def merged_song_search(query, limit=15, artist_mode=False, hn_max=5, artist=''):
         yt = yt_search_results(query, limit=limit)
     except Exception as e:
         yt_err = e
-    th.join(timeout=hngn_source.HNGN_TIMEOUT + 2)
-    tj.join(timeout=3)
+    th.join(timeout=2.0)       # both ran beside YouTube; never wait long for the slower extras
+    tj.join(timeout=1.0)
     jm = list(box.get('jm') or [])
     jm_n = 10 if artist_mode else 3
     out, seen = [], set()
@@ -1055,7 +1055,29 @@ def groq_chat(messages, max_tokens=180, temperature=0.7):
 
 # ---------- TTS ----------
 
-def tts_wav(text, rate=None, voice=None):
+def tts_wav(text, rate=None, voice=None, hedge_after=3.0):
+    """Edge TTS sometimes stalls for ~10s on one request while the next takes ~1s.
+    Start a second identical request if the first has not finished in hedge_after seconds;
+    the first one to finish wins."""
+    box, done = {}, threading.Event()
+    def run(tag):
+        try:
+            box.setdefault('wav', _tts_wav_once(text, rate, voice))
+        except Exception as e:
+            box.setdefault('err_' + tag, e)
+        finally:
+            if 'wav' in box or ('err_a' in box and 'err_b' in box):
+                done.set()
+    threading.Thread(target=run, args=('a',), daemon=True).start()
+    if not done.wait(hedge_after):
+        threading.Thread(target=run, args=('b',), daemon=True).start()
+        log.info('tts hedge started after %.1fs', hedge_after)
+        done.wait(60)
+    if 'wav' in box:
+        return box['wav']
+    raise box.get('err_a') or box.get('err_b') or RuntimeError('tts timeout')
+
+def _tts_wav_once(text, rate=None, voice=None):
     import edge_tts
     text = re.sub(r'\s+', ' ', (text or '')).strip()
     text = re.sub(r' ?[–—] ?', ', ', text)          # dashes read badly in TTS
@@ -2344,11 +2366,14 @@ def publish_result_pages(call_id, job, results, tag, intro_first, page_limit=Non
     def build(k):
         p = starts[k]
         text = _result_page_text(results[p:p + 5], k == 0, intro_first)
+        t_a = time.monotonic()
         wav = tts_wav(text)
+        t_b = time.monotonic()
         if job.get('gen') != gen or song_jobs.get(call_id) is not job:
             return False                      # a newer search replaced this one
         ym_delete(f'{SONG_DIR}/{names[k]}.wav')
         ym_upload(wav, names[k] + '.wav', f'{SONG_DIR}/{names[k]}.wav')
+        log.info('result page %d tts=%.2fs delete+upload=%.2fs', k, t_b - t_a, time.monotonic() - t_b)
         return job.get('gen') == gen
     def bg(k):
         try:
