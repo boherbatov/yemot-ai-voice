@@ -24,6 +24,13 @@ def install(ns):
                     return {'responseStatus':'OK','success':True,'skipped':True}
             return fn(*args,**kwargs)
         return guarded
+    original_start=ns['threading'].Thread.start
+    def managed_start(thread,*args,**kwargs):
+        name=getattr(getattr(thread,'_target',None),'__name__','')
+        if name in ('_auto_prune_ivr_tree','_auto_setup_library','_auto_setup_newscenter','_auto_setup_pniot','_auto_setup_chulin'):
+            ns['log'].info('retired automatic installer skipped: %s',name);return
+        return original_start(thread,*args,**kwargs)
+    ns['threading'].Thread.start=managed_start
     for key in ('ym_upload','ym_upload_text','ym_delete'):
         if key in ns:ns[key]=guard_startup(ns[key])
     # Owner retired extensions 6, 7 and 8, including their old write endpoints.
