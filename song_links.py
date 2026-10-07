@@ -62,7 +62,26 @@ def install(ns):
                 scan(data.get('contents',{}))
                 return jsonify(ok=True,playlists=playlists[:20])
             if mode == 'artist':
-                rows=ns['yt_search_results'](query,limit=200)
+                ns['_yt_cfg']()
+                body={'context':ns['_yt_tv_context'](),'query':query,'params':'EgIQAg=='}
+                data=json.load(urllib.request.urlopen(urllib.request.Request(
+                    'https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key='+ns['_YT']['key'],
+                    data=json.dumps(body).encode(),headers=ns['_yt_headers']()),timeout=30))
+                channels=[];seen=set()
+                def scan_channels(x):
+                    if isinstance(x,dict):
+                        r=x.get('channelRenderer')
+                        if r and re.fullmatch(r'UC[A-Za-z0-9_-]{22}',str(r.get('channelId',''))) and r['channelId'] not in seen:
+                            ident=r['channelId'];seen.add(ident)
+                            channels.append({'title':ns['_yt_result_title'](r.get('title')) or query,
+                                'url':'https://www.youtube.com/channel/'+ident,
+                                'description':ns['_yt_result_title'](r.get('descriptionSnippet'))[:240],
+                                'verified':any('VERIFIED' in str(b) for b in r.get('ownerBadges',[]))})
+                        for v in x.values():scan_channels(v)
+                    elif isinstance(x,list):
+                        for v in x:scan_channels(v)
+                scan_channels(data.get('contents',{}))
+                return jsonify(ok=True,channels=channels[:10])
             elif mode == 'import':
                 u = urlparse(query)
                 if u.scheme != 'https' or u.hostname not in ('youtube.com','www.youtube.com','m.youtube.com','music.youtube.com'): raise ValueError('נדרש קישור לערוץ או לפלייליסט יוטיוב')
@@ -70,19 +89,20 @@ def install(ns):
                 if u.path.startswith(('/@', '/channel/', '/c/', '/user/')) and not u.path.rstrip('/').endswith(('/videos','/shorts','/streams')):
                     query = query.rstrip('/') + '/videos'
                 import yt_dlp
-                with yt_dlp.YoutubeDL({'quiet':True,'skip_download':True,'extract_flat':True,'playlistend':200,'socket_timeout':15,'ignoreerrors':True,'retries':1}) as y:
+                with yt_dlp.YoutubeDL({'quiet':True,'skip_download':True,'extract_flat':True,'playlistend':10001,'socket_timeout':15,'ignoreerrors':True,'retries':1}) as y:
                     info = y.extract_info(query, download=False)
                 rows = []
                 def walk(info):
                     if not isinstance(info,dict): return
                     if 'entries' in info:
                         for entry in info.get('entries') or []:
-                            if len(rows)>=200: break
+                            if len(rows)>=10001: break
                             walk(entry)
                     elif re.fullmatch(r'[A-Za-z0-9_-]{11}', str(info.get('id',''))): rows.append((info['id'],info.get('title') or info['id']))
                 walk(info)
             elif query.startswith(('https://','http://')): rows=[(vid(query),'')]
             else: rows=ns['yt_search_results'](query, limit=15)
+            if len(rows)>10000: raise ValueError('הערוץ מכיל יותר מ-10000 פריטים; בחר פלייליסט מצומצם יותר')
             songs=[];seen=set()
             for v,title in rows:
                 if re.fullmatch(r'[A-Za-z0-9_-]{11}',str(v)) and v not in seen:
@@ -109,7 +129,7 @@ def install(ns):
             try:
                 manifest=json.loads(ns['ym_download'](config).decode('utf-8'))
                 songs=manifest['songs']
-                if not isinstance(songs,list) or not 1<=len(songs)<=200: raise ValueError('empty list')
+                if not isinstance(songs,list) or not 1<=len(songs)<=10000: raise ValueError('empty list')
                 queue=[(vid(s['url']),str(s.get('title',''))[:180]) for s in songs]
                 job={'stage':'wait','status':'idle','mode':'artist','queue':queue,'qidx':0,'started':ns['time'].time(), 'link_list':True}
                 if p.get('ApiPhone'):job['phone']=p['ApiPhone']
