@@ -6,6 +6,14 @@ from flask import request, jsonify
 
 def install(ns):
     app = ns['app']
+    # The first-song announcement had retained obsolete save instructions.
+    original_tts=ns.get('tts_wav')
+    if original_tts:
+        def brief_tts(text):
+            if text.startswith('שיר מספר ') and 'לדילוג לשיר הבא' in text:
+                text=text.split('לדילוג לשיר הבא')[0].strip()
+            return original_tts(text)
+        ns['tts_wav']=brief_tts
     enabled = os.environ.get('ENABLE_ADMIN_SONG_LINKS', '0') == '1'
     def finish(call):
         with ns['lock']: job=ns['song_jobs'].pop(call,None)
@@ -89,7 +97,7 @@ def install(ns):
                 if u.path.startswith(('/@', '/channel/', '/c/', '/user/')) and not u.path.rstrip('/').endswith(('/videos','/shorts','/streams')):
                     query = query.rstrip('/') + '/videos'
                 import yt_dlp
-                with yt_dlp.YoutubeDL({'quiet':True,'skip_download':True,'extract_flat':True,'playlistend':10001,'socket_timeout':15,'ignoreerrors':True,'retries':1}) as y:
+                with yt_dlp.YoutubeDL({'quiet':True,'skip_download':True,'extract_flat':True,'playlistend':10001,'socket_timeout':15,'ignoreerrors':False,'retries':1}) as y:
                     info = y.extract_info(query, download=False)
                 rows = []
                 def walk(info):
