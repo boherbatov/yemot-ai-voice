@@ -1886,6 +1886,8 @@ def _seg_worker(call_id, job, key, idx, plan, k):
         try: os.remove(out)                         # local segment gone before the (slow) upload
         except OSError: pass
         name = _seg_name(call_id, idx, k)
+        if job.get('link_list'):
+            job.setdefault('link_files', set()).add(name)
         ym_delete(f'{SONG_DIR}/{name}.wav')
         ym_upload(data, name + '.wav', f'{SONG_DIR}/{name}.wav')
         del data
@@ -2160,8 +2162,9 @@ def fetch_queue_song(call_id, idx):
             n = idx + 1
             if n == 1:
                 ann_text = (f'שיר מספר {n}. {title}. לדילוג לשיר הבא, הקישו 9. '
-                            f'לחזרה לשיר הקודם, הקישו 7. לשמירת השיר ברשימה, הקישו 1. '
-                            f'לעצירת הרצף, הקישו 3.')
+                            f'לחזרה לשיר הקודם, הקישו 7. '
+                            + ('' if job.get('link_list') else 'לשמירת השיר ברשימה, הקישו 1. ')
+                            + 'לעצירת הרצף, הקישו 3.')
             else:
                 ann_text = f'שיר מספר {n}. {title}.'
         ann_box, ann_th = {}, None
@@ -2179,6 +2182,10 @@ def fetch_queue_song(call_id, idx):
         with open(out, 'rb') as f:
             data = f.read()
         dest = _seg_name(call_id, idx, 0) if seg_plan else slot_name(call_id, idx)
+        if job.get('link_list') and song_jobs.get(call_id) is not job:
+            return
+        if job.get('link_list'):
+            job.setdefault('link_files', set()).add(dest)
         ym_delete(f'{SONG_DIR}/{dest}.wav')
         ym_upload(data, dest + '.wav', f'{SONG_DIR}/{dest}.wav')
         if seg_plan:
@@ -2191,6 +2198,8 @@ def fetch_queue_song(call_id, idx):
             ann_wav = ann_box['wav']
         if ann_wav is not None:
             ann = f'an{idx % 2}' + re.sub(r'\D', '', call_id)[-6:]
+            if job.get('link_list'):
+                job.setdefault('link_files', set()).add(ann)
             ym_delete(f'{SONG_DIR}/{ann}.wav')
             ym_upload(ann_wav, ann + '.wav', f'{SONG_DIR}/{ann}.wav')
             job[f'{key}_ann'] = ann
@@ -2206,6 +2215,10 @@ def fetch_queue_song(call_id, idx):
             job.update(**{f'{key}_status': 'error', f'{key}_err': 'disk' if isinstance(e, DiskLowError) else 'too_long' if isinstance(e, SongTooLongError) else str(e)[:200]})
     finally:
         _cleanup_tmp(tmp)
+        if job.get('link_list') and song_jobs.get(call_id) is not job:
+            for name in job.get('link_files', set()):
+                try: ym_delete(f'{SONG_DIR}/{name}.wav')
+                except Exception: pass
 
 def start_prefetch(call_id, idx, force=False):
     """Kick off the background download of queue[idx]; at most one runs per slot.
@@ -5961,6 +5974,11 @@ def _yt_prewarm():
         log.info('youtube solver prewarm skipped: %s', str(e)[:100])
 threading.Thread(target=_yt_prewarm, daemon=True).start()
 
+from song_links import install as install_song_links
+install_song_links(globals())
+if os.environ.get('ENABLE_ADMIN_SONG_LINKS', '0') == '1':
+    ROOT_MENU_TEXT += ' לניהול רשימות השירים החדשות, הקישו 5.'
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
 
@@ -5972,7 +5990,16 @@ def _auto_prune_ivr_tree():
         return
     time.sleep(6)
     try:
+        admin_published = False
+        try:
+            admin_cfg = ym_download('/5/_admin_config.ini').decode('utf-8')
+            admin_published = bool(json.loads(admin_cfg).get('published'))
+        except Exception:
+            # /5 may be user-managed even when its backup cannot be read: preserve it.
+            admin_published = True
         for ext in ('5', '6', '7', '8', '9'):
+            if ext == '5' and admin_published:
+                continue
             ym_upload_text('type=go_to_folder\ngo_to_folder=/\n', f'ivr2:/{ext}/ext.ini')
         # Keep the resume shortcut even though the former news installer is disabled.
         link = f'{PUBLIC_BASE_URL}/yemot-resume?secret={urllib.parse.quote(BRIDGE_SECRET)}'
@@ -5988,6 +6015,7 @@ def _auto_prune_ivr_tree():
     except Exception as e:
         log.exception('owner IVR tree update failed: %s', e)
 
+# Admin owns /5 after its first durable publish. Never replace its menu on a line restart.
 threading.Thread(target=_auto_prune_ivr_tree, daemon=True).start()
 threading.Thread(target=_drive_refresh_loop, daemon=True).start()
 threading.Thread(target=_temp_sweep_loop, daemon=True).start()

@@ -25,6 +25,6 @@ ADD https://github.com/quickjs-ng/quickjs/releases/download/v0.17.0/qjs-linux-x8
 RUN chmod 755 /usr/local/bin/qjs && /usr/local/bin/qjs --help >/dev/null
 
 WORKDIR /srv
-COPY app.py start.sh ./
+COPY app.py song_links.py start.sh ./
 RUN chmod +x start.sh
 CMD ["./start.sh"]
