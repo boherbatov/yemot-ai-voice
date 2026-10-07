@@ -6,11 +6,31 @@ from flask import request, jsonify
 
 def install(ns):
     app = ns['app']
+    # Startup writes are restricted to owned prompt folders, never user menus or retired extensions.
+    startup_allowed={'/1','/2','/3'}
+    def startup_path_allowed(path):
+        path=str(path).removeprefix('ivr2:')
+        if not path.startswith('/'):path='/'+path
+        folder='/'+path.strip('/').split('/')[0]
+        return folder in startup_allowed and path.rsplit('/',1)[-1] != 'ext.ini'
+    def guard_startup(fn):
+        def guarded(*args,**kwargs):
+            target=getattr(ns['threading'].current_thread(),'_target',None)
+            name=getattr(target,'__name__','')
+            if name.startswith('_auto_'):
+                path=kwargs.get('ym_path',args[-1] if args else '')
+                if not startup_path_allowed(path):
+                    ns['log'].info('startup write skipped outside managed prompt folders')
+                    return {'responseStatus':'OK','success':True,'skipped':True}
+            return fn(*args,**kwargs)
+        return guarded
+    for key in ('ym_upload','ym_upload_text','ym_delete'):
+        if key in ns:ns[key]=guard_startup(ns[key])
     # Owner retired extensions 6, 7 and 8, including their old write endpoints.
-    for key in ('TR_PROMPTS','NEWS_PROMPTS','NED_PROMPTS'):
+    for key in ('TR_PROMPTS','NEWS_PROMPTS','NED_PROMPTS','CHULIN_PROMPTS'):
         ns[key]={}
     ns['_auto_setup_newscenter']=lambda:None
-    retired_routes={'/yemot-translate','/yemot-ned','/yemot-news','/yemot-jump7'}
+    retired_routes={'/yemot-translate','/yemot-ned','/yemot-news','/yemot-jump7','/yemot-chulin','/yemot-chulin-groq','/yemot-chulin-gemini'}
     def retired():
         return 'retired',410
     for rule in list(app.url_map.iter_rules()):
@@ -114,9 +134,11 @@ def install(ns):
                 import yt_dlp
                 with yt_dlp.YoutubeDL({'quiet':True,'skip_download':True,'extract_flat':True,'playlistend':10001,'socket_timeout':15,'ignoreerrors':False,'retries':1}) as y:
                     info = y.extract_info(query, download=False)
-                rows = []
+                rows = []; unavailable_entries=0
                 def walk(info):
-                    if not isinstance(info,dict): return
+                    nonlocal unavailable_entries
+                    if not isinstance(info,dict):
+                        unavailable_entries+=1;return
                     if 'entries' in info:
                         for entry in info.get('entries') or []:
                             if len(rows)>=10001: break
@@ -126,11 +148,13 @@ def install(ns):
             elif query.startswith(('https://','http://')): rows=[(vid(query),'')]
             else: rows=ns['yt_search_results'](query, limit=15)
             if len(rows)>10000: raise ValueError('הערוץ מכיל יותר מ-10000 פריטים; בחר פלייליסט מצומצם יותר')
-            songs=[];seen=set()
+            songs=[];seen=set();duplicates=0;unavailable=locals().get('unavailable_entries',0)
             for v,title in rows:
+                if v in seen:duplicates+=1
+                elif not re.fullmatch(r'[A-Za-z0-9_-]{11}',str(v)):unavailable+=1
                 if re.fullmatch(r'[A-Za-z0-9_-]{11}',str(v)) and v not in seen:
                     seen.add(v);songs.append({'url':'https://www.youtube.com/watch?v='+v,'title':title or v})
-            return jsonify(ok=True,songs=songs)
+            return jsonify(ok=True,songs=songs,import_summary={"returned":len(rows),"unique":len(songs),"duplicates":duplicates,"unavailable_observed":unavailable,"availability_complete":False})
         except Exception as e: return jsonify(ok=False,error=str(e)[:180]),502
 
     @app.route('/admin-ai-plan', methods=['POST'])
