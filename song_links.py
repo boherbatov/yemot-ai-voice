@@ -7,6 +7,9 @@ from flask import request, jsonify
 def install(ns):
     app = ns['app']
     # Owner retired extensions 6, 7 and 8, including their old write endpoints.
+    for key in ('TR_PROMPTS','NEWS_PROMPTS','NED_PROMPTS'):
+        ns[key]={}
+    ns['_auto_setup_newscenter']=lambda:None
     retired_routes={'/yemot-translate','/yemot-ned','/yemot-news','/yemot-jump7'}
     def retired():
         return 'retired',410
