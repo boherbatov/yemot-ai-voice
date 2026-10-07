@@ -1,11 +1,18 @@
 """Link-only catalog and opt-in IVR adapter. No audio downloaded here."""
 import json, re, os
 import urllib.request
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 from flask import request, jsonify
 
 def install(ns):
     app = ns['app']
+    # Owner retired extensions 6, 7 and 8, including their old write endpoints.
+    retired_routes={'/yemot-translate','/yemot-ned','/yemot-news','/yemot-jump7'}
+    def retired():
+        return 'retired',410
+    for rule in list(app.url_map.iter_rules()):
+        if rule.rule in retired_routes:
+            app.view_functions[rule.endpoint]=retired
     # The first-song announcement had retained obsolete save instructions.
     original_tts=ns.get('tts_wav')
     if original_tts:
@@ -89,6 +96,11 @@ def install(ns):
                     elif isinstance(x,list):
                         for v in x:scan_channels(v)
                 scan_channels(data.get('contents',{}))
+                if not channels:
+                    url='https://www.youtube.com/results?'+urlencode({'search_query':query,'sp':'EgIQAg=='})
+                    html=urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'}),timeout=30).read().decode('utf-8','ignore')
+                    match=re.search(r'var ytInitialData = (.*?);</script>',html)
+                    if match:scan_channels(json.loads(match.group(1)).get('contents',{}))
                 return jsonify(ok=True,channels=channels[:10])
             elif mode == 'import':
                 u = urlparse(query)
