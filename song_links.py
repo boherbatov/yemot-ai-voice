@@ -1,5 +1,6 @@
 """Link-only catalog and opt-in IVR adapter. No audio downloaded here."""
 import json, re, os
+import urllib.request
 from urllib.parse import urlparse, parse_qs
 from flask import request, jsonify
 
@@ -36,7 +37,33 @@ def install(ns):
             j = request.get_json(force=True)
             query = str(j.get('query', '')).strip()[:300]
             if not query: raise ValueError('הזן חיפוש או קישור')
-            if j.get('mode') == 'import':
+            mode=j.get('mode','search')
+            if mode == 'playlists':
+                ns['_yt_cfg']()
+                body={'context': ns['_yt_tv_context'](), 'query':query,'params':'EgIQAw=='}
+                data=json.load(urllib.request.urlopen(urllib.request.Request(
+                    'https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key='+ns['_YT']['key'],
+                    data=json.dumps(body).encode(),headers=ns['_yt_headers']()),timeout=30))
+                playlists=[];seen=set()
+                def scan(x):
+                    if isinstance(x,dict):
+                        r=x.get('playlistRenderer')
+                        if r and r.get('playlistId') not in seen:
+                            seen.add(r['playlistId']);playlists.append({'title':ns['_yt_result_title'](r.get('title')) or 'פלייליסט', 'url':'https://www.youtube.com/playlist?list='+r['playlistId']})
+                        lv=x.get('lockupViewModel')
+                        if lv and lv.get('contentId') and not re.fullmatch(r'[A-Za-z0-9_-]{11}',lv['contentId']):
+                            ident=lv['contentId']
+                            if ident.startswith(('PL','OL','RD','UU')) and ident not in seen:
+                                seen.add(ident);title=ns['_yt_result_title'](((lv.get('metadata') or {}).get('lockupMetadataViewModel') or {}).get('title'))
+                                playlists.append({'title':title or 'פלייליסט','url':'https://www.youtube.com/playlist?list='+ident})
+                        for v in x.values():scan(v)
+                    elif isinstance(x,list):
+                        for v in x:scan(v)
+                scan(data.get('contents',{}))
+                return jsonify(ok=True,playlists=playlists[:20])
+            if mode == 'artist':
+                rows=ns['yt_search_results'](query,limit=200)
+            elif mode == 'import':
                 u = urlparse(query)
                 if u.scheme != 'https' or u.hostname not in ('youtube.com','www.youtube.com','m.youtube.com','music.youtube.com'): raise ValueError('נדרש קישור לערוץ או לפלייליסט יוטיוב')
                 if u.path not in ('/playlist', '/watch') and not u.path.startswith(('/@', '/channel/', '/c/', '/user/')): raise ValueError('קישור ערוץ או פלייליסט בלבד')
