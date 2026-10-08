@@ -43,6 +43,22 @@ def install(ns):
     for rule in list(app.url_map.iter_rules()):
         if rule.rule in retired_routes:
             app.view_functions[rule.endpoint]=retired
+    original_song_view=app.view_functions.get('yemot_song')
+    if original_song_view:
+        def continuous_song_view():
+            result=original_song_view()
+            body=result.get_data(as_text=True) if hasattr(result,'get_data') else ''
+            if 'read=f-song_auto_next=' in body:
+                call=request.values.get('ApiCallId')
+                with ns['lock']:job=ns['song_jobs'].get(call)
+                if job and job.get('mode') in ('artist','radio') and job.get('qidx',0)+1<len(job.get('queue') or []):
+                    match=re.search(r'=S(\d+),',body)
+                    turn=int(match.group(1))-1 if match else 0
+                    job['qidx']+=1;job['stage']='wait';job['started']=ns['time'].time()
+                    return ns['wait_step'](call,job,turn)
+            return result
+        app.view_functions['yemot_song']=continuous_song_view
+        ns['yemot_song']=continuous_song_view
     # The first-song announcement had retained obsolete save instructions.
     original_tts=ns.get('tts_wav')
     if original_tts:
