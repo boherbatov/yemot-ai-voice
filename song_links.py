@@ -59,6 +59,47 @@ def install(ns):
             return result
         app.view_functions['yemot_song']=continuous_song_view
         ns['yemot_song']=continuous_song_view
+    # Each menu callback has a fresh name: old accumulated S/MODE/HOW cannot answer a new question.
+    song_inputs={}
+    continuous_view=app.view_functions.get('yemot_song')
+    def isolated_song_view():
+        if request.values.get('secret')!=ns['BRIDGE_SECRET']:return continuous_view()
+        call=request.values.get('ApiCallId')
+        params=request.values.to_dict()
+        nav=song_inputs.setdefault(call,{'serial':0,'entries':{}})
+        aliases=[(int(k[2:]),k,v) for k,v in params.items() if re.fullmatch(r'NM\d+',k)]
+        if nav.get('record') and any(re.fullmatch(r'S\d+',k) for k in params):
+            record_base=nav.pop('record');params={**record_base,**{k:v for k,v in params.items() if re.fullmatch(r'S\d+',k)}}
+            with app.test_request_context(request.path,method='POST',data=params):result=continuous_view()
+        elif aliases:
+            _,key,value=max(aliases)
+            entry=nav['entries'].get(key)
+            if entry:
+                params={k:v for k,v in params.items() if not re.fullmatch(r'(?:S|NM)\d+',k) and k not in ('MODE','HOW')}
+                params.update(entry['base']);params[entry['var']]=value
+                with app.test_request_context(request.path,method='POST',data=params):result=continuous_view()
+            else:result=continuous_view()
+        else:result=continuous_view()
+        body=result.get_data(as_text=True) if hasattr(result,'get_data') else ''
+        match=re.search(r'(read=[^=&]+)=(MODE|HOW|S\d+),',body)
+        if match:
+            var=match.group(2);nav['serial']+=1;key='NM'+str(nav['serial'])
+            base={k:v for k,v in params.items() if not re.fullmatch(r'(?:S|NM)\d+',k) and k not in ('MODE','HOW')}
+            job=ns['song_jobs'].get(call)
+            if var=='HOW':base['MODE']=params.get('MODE','1')
+            elif var.startswith('S'):
+                for option in ('MODE','HOW'):
+                    if option in params:base[option]=params[option]
+            elif job:
+                job.update(stage='ask',status='idle',mode='single');job.pop('query',None);job.pop('song_artist',None)
+            nav['entries'][key]={'var':var,'base':base}
+            body=body[:match.start(2)]+key+body[match.end(2):]
+            result=ns['text_response'](body)
+        if ',record,' in body:nav['record']={k:v for k,v in params.items() if not re.fullmatch(r'(?:S|NM|BK)\d+',k)}
+        if params.get('hangup')=='yes':song_inputs.pop(call,None)
+        return result
+    app.view_functions['yemot_song']=isolated_song_view
+    ns['yemot_song']=isolated_song_view
     # The first-song announcement had retained obsolete save instructions.
     original_tts=ns.get('tts_wav')
     if original_tts:
@@ -303,3 +344,68 @@ def install(ns):
                 finish(call)
                 return ns['text_response']('go_to_folder=/5')
         return ns['yemot_song']()
+
+    # Call-local previous-menu history. Recording screens remain unchanged by owner instruction.
+    navigation={}
+    nav_endpoints={'yemot_song':'song_jobs','yemot':'sessions','yemot_pod':'pod_jobs','yemot_wiki':'wiki_jobs','yemot_lib':'lib_jobs','yemot_link_list':'song_jobs'}
+    for nav_endpoint,store_name in nav_endpoints.items():
+        if nav_endpoint not in app.view_functions:continue
+        original=app.view_functions[nav_endpoint]
+        def make_navigation(original,store_name,endpoint):
+            def navigate():
+                params=request.values.to_dict()
+                if params.get('secret')!=ns['BRIDGE_SECRET']:return original()
+                call=params.get('ApiCallId');key=(call,endpoint)
+                nav=navigation.setdefault(key,{'serial':0,'entries':{},'menus':[],'current_menu':False})
+                store=ns.get(store_name,{})
+                def emit(body,base,state,remember,result=None):
+                    nonlocal nav
+                    # read contains one prompt chain, variable then comma-separated fields.
+                    match=re.search(r'read=([^=&]+)=([A-Za-z][A-Za-z0-9_]*),([^&\n]*)',body)
+                    if not match:return result if result is not None else ns['text_response'](body)
+                    fields=match.group(3).split(',')
+                    if len(fields)<3 or fields[1] in ('record','voice'):
+                        nav['recording']=True
+                        return result if result is not None else ns['text_response'](body)
+                    while len(fields)<7:fields.append('')
+                    fields[5]='no'  # Yemot field7 (variable is field1): yes blocks *, no allows it.
+                    prompt=match.group(1);is_menu=len(fields)>3 and fields[3] not in ('0','0.1')
+                    nav=navigation.setdefault(key,{'serial':0,'entries':{},'menus':[],'current_menu':False})
+                    clean={k:v for k,v in base.items() if not re.fullmatch(r'(?:BK|S)\d+',k)}
+                    target={'body':body,'base':clean,'state':state}
+                    if remember and is_menu:
+                        if not nav['menus'] or nav['menus'][-1]['body'].split('=')[1]!=prompt:nav['menus'].append(target)
+                        else:nav['menus'][-1]=target
+                    nav['current_menu']=is_menu;nav['serial']+=1;alias='BK'+str(nav['serial'])
+                    nav['entries'][alias]={'var':match.group(2),'base':clean}
+                    # Bound memory for a long call while retaining its previous menu stack.
+                    if len(nav['entries'])>120:
+                        oldest=sorted(nav['entries'],key=lambda x:int(x[2:]))[:60]
+                        for old in oldest:nav['entries'].pop(old,None)
+                    replacement='read='+prompt+'='+alias+','+','.join(fields)
+                    return ns['text_response'](body[:match.start()]+replacement+body[match.end():])
+                aliases=[(int(k[2:]),k,v) for k,v in params.items() if re.fullmatch(r'BK\d+',k)]
+                active=nav['entries'].get(max(aliases)[1]) if aliases else None
+                value=max(aliases)[2] if aliases else None
+                if nav.pop('recording',False):active=None
+                if active and value=='*':
+                    if nav['current_menu'] and nav['menus']:nav['menus'].pop()
+                    if nav['menus']:
+                        target=nav['menus'][-1]
+                        if target['state'] is not None:store[call]=dict(target['state'])
+                        return emit(target['body'],target['base'],target['state'],False)
+                    store.pop(call,None);navigation.pop(key,None)
+                    parent='/' + '/'.join(str(params.get('ApiExtension','')).strip('/').split('/')[:-1])
+                    return ns['text_response']('go_to_folder='+parent)
+                if active:
+                    clean={k:v for k,v in params.items() if not re.fullmatch(r'(?:BK|S|NM)\d+',k)}
+                    clean.update(active['base']);clean[active['var']]=value
+                    with app.test_request_context(request.path,method='POST',data=clean):result=original()
+                else:result=original()
+                if params.get('hangup')=='yes':navigation.pop(key,None);return result
+                body=result.get_data(as_text=True) if hasattr(result,'get_data') else ''
+                state=dict(store[call]) if call in store else None
+                return emit(body,params,state,True,result)
+            return navigate
+        # emit needs the current call state, so keep it inside the request wrapper.
+        app.view_functions[nav_endpoint]=make_navigation(original,store_name,nav_endpoint)
