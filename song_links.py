@@ -82,7 +82,7 @@ def install(ns):
         else:result=continuous_view()
         body=result.get_data(as_text=True) if hasattr(result,'get_data') else ''
         match=re.search(r'(read=[^=&]+)=(MODE|HOW|S\d+),',body)
-        if match:
+        if match and ',record,' not in body and ',voice,' not in body:
             var=match.group(2);nav['serial']+=1;key='NM'+str(nav['serial'])
             base={k:v for k,v in params.items() if not re.fullmatch(r'(?:S|NM)\d+',k) and k not in ('MODE','HOW')}
             job=ns['song_jobs'].get(call)
