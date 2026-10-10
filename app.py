@@ -328,7 +328,7 @@ def _yt_result_rows(data):
             seconds = 0
             for part in duration_text.split(':'):
                 seconds = seconds * 60 + int(part)
-            if seconds > 600:
+            if seconds > 10800:
                 return
         seen.add(ident); rows.append((ident, title))
     def walk(obj):
@@ -418,7 +418,7 @@ HNGN_BASE = 'https://hngn.co.il'
 HNGN_UA = 'yemot-ai-voice phone line (hngn.co.il, permitted by site manager)'
 HNGN_TIMEOUT = 4          # seconds; hngn failure must never slow the caller
 HNGN_MIN_GAP = 1.0        # seconds between any two requests from this server
-MAX_SECONDS = 600         # same song-length cap as the YouTube path
+MAX_SECONDS = 10800       # hngn rows up to 3 h; items over 10 min go through the segmented path
 
 _lock = threading.Lock()
 _last_request = 0.0
