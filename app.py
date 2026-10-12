@@ -4805,15 +4805,91 @@ def itunes_podcast_search(term):
         log.info('itunes pod search failed: %s', e)
     return None
 
+POD_UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) '
+          'Chrome/126.0 Safari/537.36')
+POD_HEADERS = {'User-Agent': POD_UA, 'Accept': 'application/rss+xml, application/xml, text/xml, audio/*, */*'}
+POD_CHUNK_SEC = 1200          # long episodes are cut into 20-minute WAV parts (about 19 MB each in memory)
+POD_MAX_SEC = 3 * 3600        # same ceiling as long songs
+POD_SMALL_BYTES = 40 * 1048576
+
 def feed_enclosures(feed_url):
     import xml.etree.ElementTree as ET
-    r = requests.get(feed_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=25)
+    r = requests.get(feed_url, headers=POD_HEADERS, timeout=25)
     r.raise_for_status()
     # XML parsing decodes &amp; in signed media URLs; regex left it literal,
     # causing Omny to reject otherwise valid episodes with HTTP 400.
     root = ET.fromstring(r.content)
     return [el.attrib['url'] for el in root.iter()
             if el.tag.split('}')[-1] == 'enclosure' and el.attrib.get('url')]
+
+def _pod_size(url):
+    """Episode size in bytes from a 1-byte range request, or None when the host does not say."""
+    try:
+        with requests.get(url, headers=dict(POD_HEADERS, Range='bytes=0-0'), stream=True, timeout=(15, 20)) as r:
+            cr = r.headers.get('content-range', '')
+            if '/' in cr and cr.rsplit('/', 1)[1].isdigit():
+                return int(cr.rsplit('/', 1)[1])
+            cl = r.headers.get('content-length', '')
+            return int(cl) if cl.isdigit() and r.status_code == 200 else None
+    except Exception:
+        return None
+
+def _pod_stream_parts(url, base):
+    """Stream download -> ffmpeg -> 8 kHz mono WAV parts, uploaded one by one. Never holds the whole
+    episode: peak memory is one part. Returns the uploaded part names in order."""
+    import imageio_ffmpeg, io, wave
+    proc = subprocess.Popen([imageio_ffmpeg.get_ffmpeg_exe(), '-v', 'error', '-i', 'pipe:0', '-vn',
+                             '-ar', '8000', '-ac', '1', '-f', 's16le', 'pipe:1'],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    errs = []
+    def feed():
+        try:
+            with requests.get(url, headers=POD_HEADERS, stream=True, timeout=(20, 45)) as r:
+                r.raise_for_status()
+                for c in r.iter_content(65536):
+                    proc.stdin.write(c)
+        except Exception as e:
+            errs.append(e)
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+    threading.Thread(target=feed, daemon=True).start()
+    names, buf, total, per = [], bytearray(), 0, POD_CHUNK_SEC * 16000
+    def flush():
+        if len(buf) < 16000:
+            return
+        bio = io.BytesIO()
+        with wave.open(bio, 'wb') as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+            w.writeframes(bytes(buf))
+        name = f'{base}c{len(names) + 1}'
+        ym_upload(bio.getvalue(), name + '.wav', f'/3/{name}.wav')
+        names.append(name)
+        buf.clear()
+    try:
+        while True:
+            d = proc.stdout.read(65536)
+            if not d:
+                break
+            buf.extend(d)
+            total += len(d)
+            if len(buf) >= per:
+                flush()
+            if total >= POD_MAX_SEC * 16000:
+                proc.kill()
+                break
+        flush()
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        proc.wait()
+    if not names:
+        raise RuntimeError('podcast stream gave no audio' + (f' ({errs[0]})' if errs else ''))
+    return names
 
 def fetch_pod(call_id, pod_idx, ep_idx, pod=None):
     job = pod_jobs.get(call_id)
@@ -4832,6 +4908,19 @@ def fetch_pod(call_id, pod_idx, ep_idx, pod=None):
         url = encs[ep_idx]
         log.info('pod %s ep %d: %s', pod['title'], ep_idx, url[:80])
         out = tmp + '.wav'
+        size = _pod_size(url)
+        if size is None or size > POD_SMALL_BYTES:
+            base = 'pod' + safe_name(call_id)[-14:]
+            try:
+                with _media_slots:
+                    names = _pod_stream_parts(url, base)
+                job.update(status='ready', name=names[0], names=names, ep=ep_idx)
+                log.info('pod ready (stream) call=%s %s ep %d parts=%d', call_id, pod['title'], ep_idx, len(names))
+                return
+            except Exception as e:
+                log.warning('pod stream path failed call=%s: %s', call_id, e)
+                if size is not None and size > 64 * 1048576:
+                    raise
         # Stream the download to a file. The bundled ffmpeg does not support
         # HTTPS on every host, so only requests handles the network input.
         with _media_slots:
@@ -4842,7 +4931,7 @@ def fetch_pod(call_id, pod_idx, ep_idx, pod=None):
             # Sources live only in memory, not beside a decoded WAV on disk.
             # This free host has only ~63 MB free immediately after boot.
             source = bytearray()
-            with requests.get(url, headers={'User-Agent': 'Mozilla/5.0'},
+            with requests.get(url, headers=POD_HEADERS,
                               stream=True, timeout=(20, 45)) as r:
                 r.raise_for_status()
                 for chunk in r.iter_content(65536):
@@ -4884,7 +4973,7 @@ def fetch_pod(call_id, pod_idx, ep_idx, pod=None):
             del source
             name = 'pod' + safe_name(call_id)[-16:]
             ym_upload(data, name + '.wav', f'/3/{name}.wav')
-        job.update(status='ready', name=name, ep=ep_idx)
+        job.update(status='ready', name=name, names=[name], ep=ep_idx)
         log.info('pod ready call=%s %s ep %d', call_id, pod['title'], ep_idx)
     except Exception as e:
         log.warning('pod fetch failed call=%s: %s', call_id, e)
@@ -5109,7 +5198,7 @@ def yemot_pod():
                                                            'ep': job.get('ep', 0),
                                                            'custom': job.get('custom')}),
                                  daemon=True).start()
-            return text_response(play_chain('f-' + job['name'], f'S{turn+1}'))
+            return text_response(play_chain('.'.join('f-' + n for n in (job.get('names') or [job['name']])), f'S{turn+1}'))
 
         if stage == 'pod_play':
             job['stage'] = 'pod_after'
