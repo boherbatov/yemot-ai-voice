@@ -4899,11 +4899,26 @@ POD_SMALL_BYTES = 40 * 1048576
 
 def feed_enclosures(feed_url):
     import xml.etree.ElementTree as ET
-    r = requests.get(feed_url, headers=POD_HEADERS, timeout=25)
+    r = requests.get(feed_url, headers=POD_HEADERS, timeout=25, stream=True)
     r.raise_for_status()
+    cl = int(r.headers.get('content-length') or 0)
+    if cl == 0 or cl > 8_000_000:
+        # oversized or chunked feeds (GLZ is ~44 MB, served chunked): newest
+        # episodes sit at the top,
+        # so the first chunk carries what a caller will ever pick.
+        buf = b''
+        for c in r.iter_content(1_048_576):
+            buf += c
+            if len(buf) >= 8_000_000:
+                break
+        r.close()
+        return [html.unescape(u) for u in
+                re.findall(r'<enclosure[^>]*url="([^"]+)"', buf.decode('utf-8', 'ignore'))]
     # XML parsing decodes &amp; in signed media URLs; regex left it literal,
     # causing Omny to reject otherwise valid episodes with HTTP 400.
-    root = ET.fromstring(r.content)
+    data = r.content
+    r.close()
+    root = ET.fromstring(data)
     return [el.attrib['url'] for el in root.iter()
             if el.tag.split('}')[-1] == 'enclosure' and el.attrib.get('url')]
 
@@ -5112,6 +5127,10 @@ def refresh_podcasts():
         log.info('podcast refresh: list updated (%d podcasts) + menus regenerated', len(new))
     except Exception as e:
         log.warning('podcast refresh failed: %s', e)
+    try:
+        validate_curated()
+    except Exception as e:
+        log.warning('curated validation failed: %s', e)
 
 def podcast_refresh_loop():
     time.sleep(3 * 24 * 3600)
@@ -5130,6 +5149,86 @@ POD_CATEGORIES = [
     ('כסף כלכלה פודקאסט', 'כסף וכלכלה'),
     ('פשע אמיתי פודקאסט', 'פשע אמיתי'),
 ]
+
+# Curated official feeds per category (approved by the line owner via Instinct, 20.10.2026).
+# Category browse
+# serves these instead of a single-result iTunes phrase search; a weekly job and
+# each boot validate the feeds and drop dead ones until the next check.
+POD_CURATED = {
+    'חדשות ואקטואליה': [
+        {'title': 'כאן רשת ב - מהדורת השעה', 'feed': 'https://www.spreaker.com/show/6095076/episodes/feed'},
+        {'title': 'גל"צ - קטעים משידור', 'feed': 'https://www.omnycontent.com/d/playlist/6dcbc33f-1fb6-49de-9ae2-ad8a00c01523/031bb697-72dd-44a4-92f3-ae52009bdf05/2bc413ef-617e-4d79-b74c-ae5200a2096a/podcast.rss'},
+        {'title': 'ynet - בדרך הביתה', 'feed': 'https://www.omnycontent.com/d/playlist/de0f04c1-f777-4661-b029-af6d01426cad/1df22e80-27bf-4427-b257-b4bf00c689c7/dc4a71a8-0be2-4c2d-a708-b4bf00c68dd0/podcast.rss'},
+        {'title': 'הפודקאסטים של ערוץ 7', 'feed': 'https://media.rss.com/arutzsheva/feed.xml'},
+    ],
+    'קומדיה ובידור': [
+        {'title': 'אחד ביום', 'feed': 'https://www.omnycontent.com/d/playlist/2ee97a4e-8795-4260-9648-accf00a38c6a/ac2da21e-2193-4683-bcb5-accf011076ad/409bad89-c4c2-46cb-b69b-accf01152781/podcast.rss'},
+        {'title': 'תרגעו', 'feed': 'https://feeds.megaphone.fm/POLTD1402661471'},
+        {'title': 'קיקטוק', 'feed': 'https://anchor.fm/s/10ea649d8/podcast/rss'},
+        {'title': 'בגג של יצחקי', 'feed': 'https://feeds.transistor.fm/7491e803-4380-4b16-af05-0e30d031de2e'},
+    ],
+    'טכנולוגיה': [
+        {'title': 'גיקונומי', 'feed': 'https://feed.podbean.com/geekonomy/feed.xml'},
+        {'title': 'ציון 3', 'feed': 'http://tziun3.co.il/?feed=podcast'},
+        {'title': 'Codecast', 'feed': 'https://anchor.fm/s/f5a936ac/podcast/rss'},
+    ],
+    'ספורט': [
+        {'title': 'פודקאסט ספורט - הארץ', 'feed': 'https://www.omnycontent.com/d/playlist/397b9456-4f75-4509-acff-ac0600b4a6a4/cb8548b2-5517-4788-aeed-ac0800928167/c44e3423-8661-4f82-9834-ac080092816b/podcast.rss'},
+        {'title': 'שוט', 'feed': 'https://feeds.megaphone.fm/POLTD5343938075'},
+    ],
+    'כסף וכלכלה': [
+        {'title': 'מנועי הכסף', 'feed': 'https://www.omnycontent.com/d/playlist/178d72a7-a889-4132-8008-a5cc014ed109/c39a4cf6-7e84-43fa-bfa4-b31b00e05cfc/8a5aa674-a749-43c7-86c3-b31b00e06274/podcast.rss'},
+        {'title': 'כסף בקיר', 'feed': 'https://www.omnycontent.com/d/playlist/2b205f04-5ead-4e7a-9f30-a8d9007aa8c1/c30f8010-1131-4555-88e4-a9df00eb91ea/c474592a-e388-472d-b060-a9df00ed3f57/podcast.rss'},
+        {'title': 'האינטרסנטים', 'feed': 'https://www.omnycontent.com/d/playlist/397b9456-4f75-4509-acff-ac0600b4a6a4/161f6359-650a-4e72-9090-ac07017cc8e0/f4c15dc2-8e2b-4391-b534-ac07017cc8f8/podcast.rss'},
+        {'title': 'השקעות לעצלנים', 'feed': 'https://anchor.fm/s/ef1f5500/podcast/rss'},
+    ],
+    'פשע אמיתי': [
+        {'title': 'הבלש', 'feed': 'https://anchor.fm/s/e5e3c458/podcast/rss'},
+        {'title': 'במעגל סגור', 'feed': 'https://anchor.fm/s/f3e7e034/podcast/rss'},
+        {'title': 'פודקאסט רצח', 'feed': 'https://anchor.fm/s/96515a90/podcast/rss'},
+    ],
+}
+CURATED_PODS = {k: list(v) for k, v in POD_CURATED.items()}
+
+def validate_curated():
+    """Drop curated feeds that stopped serving enclosures (weekly + at boot)."""
+    global CURATED_PODS
+    from concurrent.futures import ThreadPoolExecutor
+    def check(p):
+        try:
+            r = requests.get(p['feed'], headers=POD_HEADERS, timeout=15, stream=True)
+            chunk = next(r.iter_content(2_000_000), b'')
+            r.close()
+            return p if b'enclosure' in chunk else None
+        except Exception:
+            return None
+    flat = [(k, p) for k, v in CURATED_PODS.items() for p in v]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        res = list(ex.map(lambda kp: (kp[0], check(kp[1])), flat))
+    out = {}
+    dropped = []
+    for k, p in res:
+        if p:
+            out.setdefault(k, []).append(p)
+        else:
+            dropped.append(k)
+    if out:
+        CURATED_PODS = out
+    if dropped:
+        log.warning('curated podcasts: dropped dead feeds in %s', sorted(set(dropped)))
+    log.info('curated podcasts validated: %s', {k: len(v) for k, v in CURATED_PODS.items()})
+
+def curated_category(cat_name):
+    return CURATED_PODS.get(cat_name) or []
+
+def curated_boot_check():
+    time.sleep(90)
+    try:
+        validate_curated()
+    except Exception as e:
+        log.warning('curated boot validation failed: %s', e)
+
+threading.Thread(target=curated_boot_check, daemon=True).start()
 
 def pod_pick_chain(call_id, found):
     """Upload per-option TTS prompts for a podcast results screen; return the f- chain."""
@@ -5214,7 +5313,7 @@ def yemot_pod():
             if v.isdigit() and 1 <= int(v) <= len(POD_CATEGORIES):
                 term, cat_name = POD_CATEGORIES[int(v) - 1]
                 log.info('pod cat call=%s: %s (%s)', call_id, cat_name, term)
-                found = itunes_podcast_search_fallback(term, 5)
+                found = curated_category(cat_name) or itunes_podcast_search_fallback(term, 5)
                 if not found:
                     job['stage'] = 'entry'
                     return text_response(f'read=f-pod_notfound.f-pod_entry=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
