@@ -1806,10 +1806,13 @@ def _seg_make(plan, k, out):
     start, dur = _seg_bounds(plan, k)
     disk_guard(max(MIN_FREE_MB_DOWNLOAD, int(dur * 16000 / 1048576) + 8))
     last = None
-    for attempt in (1, 2):
+    for attempt in (1, 2, 3):
         try:
             src = _seg_src(plan, refresh=(attempt == 2))
-            _run_ff([_ff_exe(), '-y', '-nostdin', '-loglevel', 'error'] + _ff_input_opts(src) +
+            # attempt 3 drops the reconnect/header input options: the bundled static ffmpeg can
+            # crash (SIGSEGV) on those while the same binary converts local files fine
+            opts = [] if attempt == 3 else _ff_input_opts(src)
+            _run_ff([_ff_exe(), '-y', '-nostdin', '-loglevel', 'error'] + opts +
                     ['-ss', f'{start:.3f}', '-i', src['url'], '-t', f'{dur:.3f}',
                      '-af', AF_SEG, *WAV_OUT_OPTS, out], SEGMENT_FFMPEG_TIMEOUT)
             # YouTube durations are exact; Drive durations are estimated from the file header, so only check them for non-empty
@@ -1824,7 +1827,8 @@ def _seg_make(plan, k, out):
                         else f"exit {e.returncode}")
             try: os.remove(out)
             except OSError: pass
-    raise last
+    # only over-cap items reach segmenting, so a total failure here is honestly "too long for the line"
+    raise SongTooLongError(f'segmenting failed: {type(last).__name__} {last}'[:150])
 
 def _segment_first(call_id, idx, video_id, hint, tmp):
     """Called when a normal conversion refused the item as too long. Builds the segment plan and the
