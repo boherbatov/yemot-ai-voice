@@ -4412,7 +4412,12 @@ def yemot_chulin():
         msgs.append({'role': 'user', 'content': text})
         reply = gemini_chat(msgs) if provider == 'gemini' else groq_chat(msgs)
         is_bye = reply.upper().startswith('BYE')
-        reply_text = re.sub(r'^BYE:?\s*', '', reply, flags=re.I).strip() or 'להתראות!'
+        if is_bye and not BYE_RE.match(text.strip()):
+            log.info('chulin call=%s model-initiated BYE suppressed (user did not say goodbye)', call_id)
+            is_bye = False
+        reply_text = re.sub(r'^BYE:?\s*', '', reply, flags=re.I).strip()
+        if not reply_text:
+            reply_text = 'להתראות!' if is_bye else 'מצטער, אני לא יכול לענות על זה. אפשר לשאול אותי משהו אחר.'
         log.info('chulin reply call=%s bye=%s: %s', call_id, is_bye, reply_text[:80])
         job['hist'].append(('u', text))
         job['hist'].append(('a', reply_text))
@@ -5162,11 +5167,6 @@ def yemot_pod():
                 job['stage'] = 'entry'
                 return text_response(f'read=f-pod_notfound.f-pod_entry=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
             log.info('pod search call=%s: %r -> %d results', call_id, term, len(found))
-            if len(found) == 1:
-                sel = found[0]
-                job.update(stage='pod_wait', status='working', custom=sel, idx=0, ep=0, started=time.time())
-                threading.Thread(target=fetch_pod, args=(call_id, 0, 0, sel), daemon=True).start()
-                return text_response(play_chain('f-pod_searching', f'S{turn+1}'))
             job.update(stage='cat_pick', cat_results=found, back_stage='entry')
             return text_response(f'read={pod_pick_chain(call_id, found)}=S{turn+1},no,1,1,7,No,yes,,,,,,,,no')
 
@@ -5795,6 +5795,11 @@ def yemot():
             return text_response('id_list_message=f-hub_err_' + assist['model'])
         t_llm_done = time.time()
         is_bye, reply_text = split_bye(reply)
+        if is_bye and not BYE_RE.match(norm):
+            log.info('call=%s turn=%d model-initiated BYE suppressed (user did not say goodbye)', call_id, turn)
+            is_bye = False
+            if not reply_text:
+                reply_text = 'מצטער, אני לא יכול לענות על זה. אפשר לשאול אותי משהו אחר.'
         reply_text = reply_text or 'להתראות!'
         log.info('call=%s turn=%d llm(%.1fs) bye=%s: %s', call_id, turn, time.time()-t0, is_bye, reply_text[:80])
 
