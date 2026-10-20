@@ -661,14 +661,14 @@ def yt_player(video_id):
     vd = r.get('videoDetails') or {}
     return vd.get('title') or 'שיר', vd.get('lengthSeconds'), ps.get('status')
 
-def yt_download_tv(video_id, outtmpl):
+def yt_download_tv(video_id, outtmpl, allow_long=False):
     """yt-dlp download through the authenticated TV client (PS4 UA) with deno decipher."""
     import yt_dlp
     from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS
     title, duration, status = yt_player(video_id)
     if status != 'OK':
         raise ValueError(f'player status {status}')
-    if duration and int(duration) > 600:
+    if duration and int(duration) > 600 and not allow_long:
         raise ValueError('song too long')
     tv = INNERTUBE_CLIENTS['tv']
     tv['INNERTUBE_CONTEXT']['client']['userAgent'] = PS4_UA
@@ -746,8 +746,9 @@ def _ytdlp_serial(yt_dlp, opts, video_id):
         if _yt_active.get(video_id) is st:
             _yt_active.pop(video_id, None)
 
-def yt_download(video_id, outtmpl):
-    """Use the official mweb PO-token route; retain the old TV path as fallback."""
+def yt_download(video_id, outtmpl, allow_long=False):
+    """Use the official mweb PO-token route; retain the old TV path as fallback.
+    allow_long skips the 10-minute cap (segmented playback downloads its source whole)."""
     import yt_dlp
     if not re.fullmatch(r'[A-Za-z0-9_-]{11}', str(video_id)):
         raise ValueError('invalid YouTube video id')
@@ -759,9 +760,10 @@ def yt_download(video_id, outtmpl):
             'quiet': True, 'no_warnings': False, 'noplaylist': True,
             'extractor_args': {'youtube': {'player_client': ['mweb']},
                                'youtubepot-bgutilhttp': {'base_url': ['http://127.0.0.1:4416']}},
-            'match_filter': _song_duration_filter,
             'socket_timeout': 20, 'retries': 1,
         }
+        if not allow_long:
+            opts['match_filter'] = _song_duration_filter
         cookie_file = _active_cookie_file()
         if cookie_file:
             opts['cookiefile'] = cookie_file
@@ -806,14 +808,14 @@ def yt_download(video_id, outtmpl):
                 raise RuntimeError('YouTube download unavailable') from None
             log.info('trying TV-client fallback for %s', video_id)
             try:
-                return yt_download_tv(video_id, outtmpl)
+                return yt_download_tv(video_id, outtmpl, allow_long=allow_long)
             except SongTooLongError:
                 raise
             except Exception as e2:
                 log.warning('TV-client fallback failed for %s: %s', video_id, type(e2).__name__)
                 raise RuntimeError('YouTube download unavailable') from None
         log.warning('mweb PO-token download failed for %s: %s; trying existing TV route', video_id, e)
-        return yt_download_tv(video_id, outtmpl)
+        return yt_download_tv(video_id, outtmpl, allow_long=allow_long)
 
 EDGE_VOICE = os.environ.get('EDGE_VOICE', 'he-IL-HilaNeural')
 EDGE_RATE = os.environ.get('EDGE_RATE', '+25%')
@@ -1801,6 +1803,42 @@ def _seg_bounds(plan, k):
     dur = plan['seg_s'] if k < plan['n'] - 1 else plan['total'] - start
     return start, dur
 
+def _seg_local(plan):
+    """Full audio of a yt plan as a local file, downloaded once per queued item.
+    Root cause of the rc=-11 crashes: the bundled static ffmpeg (imageio-ffmpeg, 0.5.1 and 0.6.0
+    alike) segfaults on ANY remote https input in this container family - verified on Belmo and a
+    dev box - while local conversion is the proven path (every normal song uses it).
+    The file is a transient stage for this playback only: utime-touched per segment so the temp
+    sweeper leaves it alone mid-play, dropped when the plan is replaced, swept if leaked."""
+    if plan.get('local'):
+        return plan['local']
+    with plan['lock']:
+        if plan.get('local'):
+            return plan['local']
+        prefix = f"/tmp/song-{plan['call_id']}-s{plan['idx']}-full"
+        disk_guard(max(MIN_FREE_MB_DOWNLOAD, int(plan['total'] * 16000 / 1048576) + 8))
+        with _tmp_lock:
+            _active_tmp.add(prefix)
+        try:
+            yt_download(plan['vid'], prefix + '.%(ext)s', allow_long=True)
+            import glob as _g
+            hits = [p for p in _g.glob(prefix + '.*') if os.path.isfile(p)
+                    and not p.endswith(('.part', '.ytdl', '.json', '.jpg', '.webp', '.png'))]
+            if not hits:
+                raise ValueError('download produced no media file')
+            plan['local'] = hits[0]
+            log.info('segmenting local copy %s: %.1f MB', plan['vid'][:14], os.path.getsize(hits[0]) / 1048576)
+            return plan['local']
+        finally:
+            with _tmp_lock:
+                _active_tmp.discard(prefix)
+
+def _seg_local_drop(plan):
+    path, prefix = plan.pop('local', None), plan.pop('local_prefix', None)
+    if path:
+        try: os.remove(path)
+        except OSError: pass
+
 def _seg_make(plan, k, out):
     """ffmpeg time-range read -> 8 kHz mono wav at `out`, validated like every normal song."""
     start, dur = _seg_bounds(plan, k)
@@ -1808,12 +1846,17 @@ def _seg_make(plan, k, out):
     last = None
     for attempt in (1, 2, 3):
         try:
-            src = _seg_src(plan, refresh=(attempt == 2))
-            # attempt 3 drops the reconnect/header input options: the bundled static ffmpeg can
-            # crash (SIGSEGV) on those while the same binary converts local files fine
-            opts = [] if attempt == 3 else _ff_input_opts(src)
+            if plan['kind'] == 'yt' and attempt < 3:
+                src_url, opts = _seg_local(plan), []
+            else:
+                src = _seg_src(plan, refresh=(attempt == 2))
+                # attempt 3 drops the reconnect/header input options (last resort)
+                opts = [] if attempt == 3 else _ff_input_opts(src)
+                src_url = src['url']
+            if plan.get('local'):
+                os.utime(plan['local'])          # keep the sweeper from reaping it mid-playback
             _run_ff([_ff_exe(), '-y', '-nostdin', '-loglevel', 'error'] + opts +
-                    ['-ss', f'{start:.3f}', '-i', src['url'], '-t', f'{dur:.3f}',
+                    ['-ss', f'{start:.3f}', '-i', src_url, '-t', f'{dur:.3f}',
                      '-af', AF_SEG, *WAV_OUT_OPTS, out], SEGMENT_FFMPEG_TIMEOUT)
             # YouTube durations are exact; Drive durations are estimated from the file header, so only check them for non-empty
             secs = _validate_wav(out, dur if plan['kind'] == 'yt' else None)
@@ -1862,7 +1905,7 @@ def _segment_first(call_id, idx, video_id, hint, tmp):
     if total - n * seg_s >= 5:
         n += 1                                    # a tail under 5 s is folded into the last segment
     plan.update(vid=video_id, title=title, total=float(total), seg_s=seg_s, n=n, st={}, cur=None, want=None,
-                wait_since=None, err=None, lock=threading.Lock())
+                wait_since=None, err=None, lock=threading.Lock(), call_id=call_id, idx=idx)
     if title == 'שיר' and hint:
         plan['title'] = title = hint
     log.info('segmenting %s: %.0fs in %d segment(s) of %ds', video_id[:14], total, n, seg_s)
@@ -2239,6 +2282,9 @@ def start_prefetch(call_id, idx, force=False):
     job[f'{key}_want'] = idx
     job[f'{key}_vwant'] = vid
     job[f'{key}_file'] = None
+    old_plan = job.get(f'{key}_seg')
+    if old_plan:
+        _seg_local_drop(old_plan)
     job[f'{key}_seg'] = None
     job[f'{key}_status'] = 'working'
     threading.Thread(target=fetch_queue_song, args=(call_id, idx), daemon=True).start()
@@ -2301,6 +2347,9 @@ def _adopt_extra(call_id, job, idx, vid):
     job[f'{key}_want'] = idx
     job[f'{key}_vwant'] = vid
     job[f'{key}_file'] = None
+    old_plan = job.get(f'{key}_seg')
+    if old_plan:
+        _seg_local_drop(old_plan)
     job[f'{key}_seg'] = None
     if ent['status'] == 'ready':
         job[f'{key}_status'] = 'working'
