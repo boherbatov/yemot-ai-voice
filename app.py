@@ -4379,6 +4379,28 @@ def yemot_jump7():
 
 # ---------- Contact the management (extension 5) ----------
 
+def tg_send_admin(wav, caption, text=None):
+    """Deliver an admin notification via the Bot API (no personal session).
+    Needs TG_BOT_TOKEN + TG_ADMIN_CHAT_ID env. Returns True on success."""
+    token = os.environ.get('TG_BOT_TOKEN')
+    chat = os.environ.get('TG_ADMIN_CHAT_ID')
+    if not (token and chat):
+        log.warning('tg_send_admin: TG_BOT_TOKEN/TG_ADMIN_CHAT_ID not set')
+        return False
+    base = f'https://api.telegram.org/bot{token}'
+    r = requests.post(f'{base}/sendVoice',
+                      data={'chat_id': chat, 'caption': (caption or '')[:1000]},
+                      files={'voice': ('message.wav', wav, 'audio/wav')}, timeout=45)
+    if not r.ok:
+        log.warning('tg_send_admin sendVoice failed: %s %s', r.status_code, r.text[:200])
+        return False
+    if text:
+        r2 = requests.post(f'{base}/sendMessage',
+                           json={'chat_id': chat, 'text': text[:4000]}, timeout=30)
+        if not r2.ok:
+            log.warning('tg_send_admin sendMessage failed: %s %s', r2.status_code, r2.text[:200])
+    return True
+
 PNIOT_DIR = os.environ.get('YM_PNIOT_EXT', '/5')
 PNIOT_PROMPTS = {
     'pniot_paused': 'פניות להנהלה זמנית לא זמינות. נסו שוב בעתיד. להתראות!',
@@ -4402,7 +4424,8 @@ def yemot_pniot():
         if re.fullmatch(r'S\d+', k):
             s_val, turn = v, int(k[1:])
 
-    if TG_PAUSED:
+    bot_ready = bool(os.environ.get('TG_BOT_TOKEN') and os.environ.get('TG_ADMIN_CHAT_ID'))
+    if TG_PAUSED and not bot_ready:
         return text_response('id_list_message=f-pniot_paused')
     if s_val is None:
         return text_response(f'read=f-pniot_intro=S1,no,record,{PNIOT_DIR}/in,,no')
@@ -4414,14 +4437,25 @@ def yemot_pniot():
         # keep the recording on Yemot as backup (file stays in /5/in)
         ts = time.strftime('%d/%m/%Y %H:%M', time.localtime())
         caption = f'פנייה חדשה מהקו\nמספר: {phone or "לא ידוע"}\nזמן: {ts} (שעון ישראל)'
+        try:
+            text = groq_stt(wav)
+        except Exception as e:
+            log.warning('pniot stt failed call=%s: %s', call_id, e)
+            text = ''
 
-        async def _send():
-            c = tg_client()
-            await c.connect()
-            await c.send_file('me', wav, caption=caption, file_name='פנייה_מהקו.wav')
-            await c.disconnect()
-        asyncio.run(_send())
-        log.info('pniot call=%s phone=%s sent to telegram (%d bytes)', call_id, phone, len(wav))
+        if bot_ready:
+            body = caption + ('\n\nתמלול:\n' + text if text else '\n\n(לא הצלחתי לתמלל)')
+            if not tg_send_admin(wav, caption, text=body):
+                raise RuntimeError('bot delivery failed')
+        else:
+            async def _send():
+                c = tg_client()
+                await c.connect()
+                await c.send_file('me', wav, caption=caption, file_name='פנייה_מהקו.wav')
+                await c.disconnect()
+            asyncio.run(_send())
+        log.info('pniot call=%s phone=%s sent to telegram (%d bytes, stt=%d chars)',
+                 call_id, phone, len(wav), len(text or ''))
         return text_response('id_list_message=f-pniot_ok')
     except Exception as e:
         log.exception('pniot call=%s error: %s', call_id, e)
