@@ -2358,13 +2358,40 @@ def prefetch_extras(call_id, job, results):
                 ent['ev'].set()
     threading.Thread(target=worker, daemon=True).start()
 
-def _result_page_text(chunk, first, intro_first):
+def _result_page_parts(chunk, first, intro_first):
     parts = [intro_first] if first else ['התוצאות הבאות.']
     for i, (_vid, t) in enumerate(chunk, 1):
         t = re.sub(r'\s+', ' ', (t or '')).strip()[:70]
         parts.append(f'{i}. {t}.')
     parts.append('הקישו את מספר השיר. לתוצאות נוספות, הקישו 0.')
-    return ' '.join(parts)
+    return parts
+
+def _result_page_text(chunk, first, intro_first):
+    return ' '.join(_result_page_parts(chunk, first, intro_first))
+
+def _tts_parts_wav(parts):
+    """Page text as parallel short TTS requests (short texts finish in ~1-2s even when a long
+    single request stalls for 10s+); concat the 8 kHz wav frames. Any failure falls back to one
+    tts_wav of the joined text, so this can never do worse than the old path."""
+    parts = [p for p in (re.sub(r'\s+', ' ', (x or '')).strip() for x in parts) if p]
+    if len(parts) < 2:
+        return tts_wav(' '.join(parts))
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            got = sorted(ex.map(lambda ip: (ip[0], _tts_wav_once(ip[1])), enumerate(parts)))
+        out = io.BytesIO()
+        w = wave.open(out, 'wb')
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+        for _, wv in got:
+            r = wave.open(io.BytesIO(wv), 'rb')
+            w.writeframes(r.readframes(r.getnframes()))
+            r.close()
+        w.close()
+        return out.getvalue()
+    except Exception:
+        log.info('parallel page tts failed, falling back to one request', exc_info=True)
+        return tts_wav(' '.join(parts))
 
 def publish_result_pages(call_id, job, results, tag, intro_first, page_limit=None):
     """Page 1 is spoken as soon as it is uploaded (job ready); the other pages are built
@@ -2378,9 +2405,9 @@ def publish_result_pages(call_id, job, results, tag, intro_first, page_limit=Non
     job.update(pages=names, pages_ready=ready, pages_failed=failed, page_idx=0)
     def build(k):
         p = starts[k]
-        text = _result_page_text(results[p:p + 5], k == 0, intro_first)
+        parts = _result_page_parts(results[p:p + 5], k == 0, intro_first)
         t_a = time.monotonic()
-        wav = tts_wav(text)
+        wav = _tts_parts_wav(parts)
         t_b = time.monotonic()
         if job.get('gen') != gen or song_jobs.get(call_id) is not job:
             return False                      # a newer search replaced this one
