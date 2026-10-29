@@ -6068,8 +6068,15 @@ def yemot():
         want_web = assist['web'] == 'always' or (assist['web'] == 'factualish' and hub_wants_search(user_text))
         n_src = 0
         if want_web:
+            # Follow-up questions ("ומה איתו?", "ולמה?") search badly on their own:
+            # fold in the caller's previous question so the search keeps the topic.
+            search_query = user_text
+            prev_u = next((txt for who, txt in reversed(h.get('turns', [])) if who == 'u'), '')
+            if prev_u and len(_content_tokens(user_text)) <= 2:
+                search_query = (prev_u + ' ' + user_text).strip()
+                log.info('call=%s turn=%d follow-up search query: %s', call_id, turn, search_query[:80])
             try:
-                ctx, n_src = hub_sources(user_text)
+                ctx, n_src = hub_sources(search_query)
                 if ctx:
                     msgs.append({'role': 'system', 'content': HUB_SOURCE_RULES + '\n' + ctx})
                 else:
