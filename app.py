@@ -833,11 +833,12 @@ SYSTEM_PROMPT = (
     'את עוזרת קולית חמה וחברותית בשם "אוזן", שמדברת עם מתקשרים בקו טלפוני. '
     'כללים קשיחים: '
     '1) עני תמיד בעברית בלבד, בשפה מדוברת וטבעית. '
-    '2) תשובות קצרות: משפט אחד עד שלושה משפטים. לעולם לא רשימות, מספור, אימוג׳י, כוכביות או סימנים מיוחדים - הטקסט מוקרא בקול. '
+    '2) התאימי את אורך התשובה לשאלה: על שיחת חולין או שאלה פשוטה - משפט אחד עד שניים. על שאלה עובדתית, חדשותית או בקשה להסבר - פרטי היטב, עד שבעה משפטים, כי המתקשר רוצה ללמוד. לעולם לא רשימות, מספור, אימוג׳י, כוכביות או סימנים מיוחדים - הטקסט מוקרא בקול. '
     '3) אם המשתמש נפרד או מבקש לסיים (ביי, להתראות, די, תודה זהו) - התחילי את התשובה במילה BYE: ולאחריה משפט פרידה אחד קצר. את המילה BYE כותבים רק בתחילת התשובה, לעולם לא באמצע או בסוף, ולא בשיחה רגילה. '
     '4) אם הבקשה לא ברורה, בקשי שיחזור בשאלה קצרה. '
     '5) את בקו אישי וחברותי - שיחה קלה, לא רשמית. '
-    '6) לעולם אל תאמרי שהמידע עדכני או מהאינטרנט אלא אם צורף לך מקור עם תאריך. אל תמציאי מקורות, מספרים או תאריכים.'
+    '6) כנות מעל הכל: לעולם אל תמציאי עובדות, מקורות, מספרים, ציטוטים או תאריכים. אם לא צורף לך מקור עדכני ואת לא בטוחה בתשובה, אמרי בפירוש שאת לא בטוחה או שהמידע עלול להיות לא מעודכן. עדיף "אני לא יודעת" על פני תשובה מומצאת. '
+    '7) התאריך והשעה הנוכחיים מצורפים לך בכל שאלה. אל תאמרי שהמידע עדכני או מהאינטרנט אלא אם צורף לך מקור עם תאריך.'
 )
 
 sessions = {}
@@ -1041,12 +1042,14 @@ def groq_stt(wav_bytes, language='he', min_dur=1.2):
     r = requests.post(f'{GROQ}/audio/transcriptions',
                       headers={'Authorization': f'Bearer {GROQ_API_KEY}'},
                       files={'file': ('audio.wav', wav_bytes, 'audio/wav')},
-                      data={'model': GROQ_STT_MODEL, 'response_format': 'json', **({'language': language} if language else {})},
+                      data={'model': GROQ_STT_MODEL, 'response_format': 'json',
+                            'prompt': 'שיחה טלפונית בעברית תקינה עם עוזרת קולית בשם אוזן.',
+                            **({'language': language} if language else {})},
                       timeout=40)
     r.raise_for_status()
     return (r.json().get('text') or '').strip()
 
-def groq_chat(messages, max_tokens=180, temperature=0.7):
+def groq_chat(messages, max_tokens=640, temperature=0.7):
     r = requests.post(f'{GROQ}/chat/completions',
                       headers={'Authorization': f'Bearer {GROQ_API_KEY}', 'Content-Type': 'application/json'},
                       json={'model': GROQ_CHAT_MODEL, 'messages': messages, 'reasoning_effort': 'low',
@@ -4565,16 +4568,16 @@ HUB_ASSISTANTS = {
 
 HUB_PROMPTS = {
     'hub_menu': 'בחרו מודל לשיחה. לג׳מיני הקישו 1. לגרוק הקישו 2. לחזרה לתפריט הראשי, הקישו 0.',
-    'hub_gemini_intro': 'בחרתם ג׳מיני. דברו אחרי הצליל, ולסיום הקישו סולמית.',
+    'hub_gemini_intro': 'בחרתם ג׳מיני. דברו אחרי הצליל, ולסיום הקישו סולמית. לדילוג על תשובה באמצע ולמעבר לשאלה הבאה, הקישו מקש כלשהו בזמן שהיא מושמעת.',
     'hub_err_gemini': 'ג׳מיני לא זמין כרגע. אפשר לנסות שוב בעוד כמה דקות, או לבחור בגרוק. להתראות.',
     'hub_err_groq': 'גרוק לא זמין כרגע. אפשר לנסות שוב בעוד כמה דקות, או לבחור בג׳מיני. להתראות.',
     'hub_err_speech': 'לא הצלחתי לעבד את ההקלטה. אפשר לנסות שוב בעוד רגע. להתראות.',
     'didnt_hear': 'סליחה, לא שמעתי טוב. אפשר לחזור על זה? דברו אחרי הצליל, ולסיום הקישו סולמית.',
     'error': 'סליחה, הייתה תקלה טכנית. נסו שוב קצת מאוחר יותר. להתראות!',
     'tired': 'וואו, דיברנו היום המון! נגמרו לי הכוחות להיום. נדבר מחר, בסדר? להתראות!',
-    'hub_groq_intro': 'בחרתם גרוק. דברו אחרי הצליל, ולסיום הקישו סולמית.',
+    'hub_groq_intro': 'בחרתם גרוק. דברו אחרי הצליל, ולסיום הקישו סולמית. לדילוג על תשובה באמצע ולמעבר לשאלה הבאה, הקישו מקש כלשהו בזמן שהיא מושמעת.',
 }
-HUB_PROMPT_VERSION = 'v5voice' 
+HUB_PROMPT_VERSION = 'v6voice' 
 
 CHULIN_SYSTEM = (
     'את "חולין", צ׳אטבוט קולי שובב וחכם בקו טלפוני. '
@@ -4650,33 +4653,85 @@ def israel_today():
     except Exception:
         return time.strftime('%Y-%m-%d')
 
+HEB_WEEKDAYS = ['יום שני', 'יום שלישי', 'יום רביעי', 'יום חמישי', 'יום שישי', 'שבת', 'יום ראשון']
+
+def israel_now_text():
+    """'יום שישי, 30 באוקטובר 2026, השעה 01:46' in Asia/Jerusalem time."""
+    try:
+        from zoneinfo import ZoneInfo
+        import datetime
+        now = datetime.datetime.now(ZoneInfo('Asia/Jerusalem'))
+    except Exception:
+        import datetime
+        now = datetime.datetime.now()
+    return f'{HEB_WEEKDAYS[now.weekday()]}, {now.day} ב{HEB_MONTHS[now.month - 1]} {now.year}, השעה {now:%H:%M}'
+
+
+def _gnews_items(query, limit=5):
+    """Current Hebrew Google News RSS items matching the query: [(title, Hebrew pub date)]."""
+    import urllib.parse
+    import xml.etree.ElementTree as ET
+    import email.utils
+    url = 'https://news.google.com/rss/search?q=' + urllib.parse.quote(query) + '&hl=he&gl=IL&ceid=IL:he'
+    r = requests.get(url, headers=WIKI_HEADERS, timeout=10)
+    root = ET.fromstring(r.content)
+    out = []
+    for item in root.iter('item'):
+        title = re.sub(r'\s+', ' ', (item.findtext('title') or '').strip())
+        pub = (item.findtext('pubDate') or '').strip()
+        d = ''
+        try:
+            d = hebrew_date(email.utils.parsedate_to_datetime(pub).strftime('%Y-%m-%d'))
+        except Exception:
+            pass
+        if title and len(title) > 8:
+            out.append((title, d))
+        if len(out) >= limit:
+            break
+    return out
+
 def hub_sources(query):
-    """Return (context_text, sources). Only relevant hits, each with source name and date."""
+    """Return (context_text, sources). Only relevant hits, each with source name and date.
+    Timely questions: query-matched Hebrew Google News + ynet headlines, fetched in parallel.
+    Non-timely: Hebrew Wikipedia. All fetches run concurrently to cut answer latency."""
     import html
     toks = _content_tokens(query)
-    lines = []
     timely = bool(TIMELY.search(query))
-    try:
-        if timely:
-            raise StopIteration   # Wikipedia is not a source for time-sensitive questions
-        r = requests.get('https://he.wikipedia.org/w/api.php',
-                         params={'action': 'query', 'list': 'search', 'srsearch': query, 'utf8': 1, 'format': 'json',
-                                 'srlimit': 3, 'srprop': 'snippet|timestamp'}, headers=WIKI_HEADERS, timeout=12)
-        for hit in r.json().get('query', {}).get('search', []):
-            snip = html.unescape(re.sub(r'<[^>]+>', '', hit.get('snippet', ''))).strip()
-            hay = (hit.get('title', '') + ' ' + snip)
-            if not snip or not (toks and any(w in hay for w in toks)):
-                continue
-            d = hebrew_date(hit.get('timestamp') or '')
-            when = f'ב-{d}' if d else 'בתאריך לא ידוע'
-            lines.append(f"מקור: ויקיפדיה העברית, ערך {hit['title']}, ערך עודכן לאחרונה {when}: {snip}")
-            if len(lines) >= 2:
-                break
-    except StopIteration:
-        pass
-    except Exception as e:
-        log.info('hub wiki ctx failed: %s', e)
-    if timely:
+    found = {}
+
+    def fetch_wiki():
+        lines = []
+        try:
+            r = requests.get('https://he.wikipedia.org/w/api.php',
+                             params={'action': 'query', 'list': 'search', 'srsearch': query, 'utf8': 1, 'format': 'json',
+                                     'srlimit': 3, 'srprop': 'snippet|timestamp'}, headers=WIKI_HEADERS, timeout=10)
+            for hit in r.json().get('query', {}).get('search', []):
+                snip = html.unescape(re.sub(r'<[^>]+>', '', hit.get('snippet', ''))).strip()
+                hay = (hit.get('title', '') + ' ' + snip)
+                if not snip or not (toks and any(w in hay for w in toks)):
+                    continue
+                d = hebrew_date(hit.get('timestamp') or '')
+                when = f'ב-{d}' if d else 'בתאריך לא ידוע'
+                lines.append(f"מקור: ויקיפדיה העברית, ערך {hit['title']}, ערך עודכן לאחרונה {when}: {snip}")
+                if len(lines) >= 2:
+                    break
+        except Exception as e:
+            log.info('hub wiki ctx failed: %s', e)
+        found['wiki'] = lines
+
+    def fetch_gnews():
+        lines = []
+        try:
+            items = _gnews_items(query, 5)
+            if items:
+                body = ' | '.join(f'{t} ({d})' if d else t for t, d in items)
+                lines.append(f"מקור: חדשות גוגל בעברית, כותרות בלבד על נושא השאלה, נשלפו בזמן השיחה ({hebrew_date(israel_today())}): " + body)
+        except Exception as e:
+            log.info('hub gnews ctx failed: %s', e)
+        found['gnews'] = lines
+
+    def fetch_ynet():
+        lines = []
         try:
             heads = news_headlines(5)
             if heads:
@@ -4684,9 +4739,24 @@ def hub_sources(query):
                 lines.append(f"מקור: כותרות ynet, נשלפו בזמן השיחה ({hebrew_date(israel_today())}){hedge}: " + ' | '.join(heads))
         except Exception as e:
             log.info('hub news ctx failed: %s', e)
+        found['ynet'] = lines
+
+    plain_news = bool(PLAIN_NEWS.search(query))
+    if plain_news:
+        fetches = (fetch_ynet,)          # 'what's in the news' wants top headlines, not a keyword search
+    elif timely:
+        fetches = (fetch_gnews, fetch_ynet)
+    else:
+        fetches = (fetch_wiki,)
+    threads = [threading.Thread(target=f, daemon=True) for f in fetches]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(12)
+    lines = found.get('wiki', []) + found.get('gnews', []) + found.get('ynet', [])
     return '\n'.join(lines), len(lines)
 
-HUB_SOURCE_RULES = ('להלן מקורות שנשלפו עבור השאלה, עם שם המקור ותאריך. אם את משתמשת בהם, צייני בקצרה את שם המקור ואת התאריך כפי שכתוב. '
+HUB_SOURCE_RULES = ('להלן מקורות שנשלפו עבור השאלה, עם שם המקור ותאריך. שים לב: כותרות חדשות הן כותרות בלבד, לא גוף הידיעה - אם הן לא עונות במדויק על השאלה (למשל מזג אוויר, שער מטבע, תוצאת משחק מסוימת), אמרי בכנות שאין לך את הנתון העדכני המדויק ואל תסיקי מכותרת קרובה. אם את משתמשת במקור, צייני בקצרה את שם המקור ואת התאריך כפי שכתוב. '
                     'תאריכים נכתבים כאן בצורה מדוברת (למשל 2 באוקטובר 2026): אמרי אותם בדיוק כפי שהם כתובים, בלי להמיר למספרים או לשנות. תאריך השליפה הוא רק זה שבסוגריים אחרי שם המקור; מספרים או תאריכים בתוך טקסט של כותרת שייכים לכותרת ואינם תאריך השליפה. אל תאמרי שהמידע עדכני אלא אם התאריך שבמקור באמת עדכני. אם המקורות לא עונים על השאלה, אמרי בכנות שלא מצאת מידע מהימן ואל תמציאי.')
 
 CHULIN_PROMPTS = {
@@ -5903,6 +5973,13 @@ def yemot():
     sess.setdefault('assistant', '2')
     assist = HUB_ASSISTANTS.get(sess['assistant'], HUB_ASSISTANTS['2'])
 
+    # --- answer-playback callback: any keypress during the answer skips it ---
+    if sess.get('await_skip') == turn and not s_val.endswith('.wav'):
+        sess['await_skip'] = None
+        skipped = bool((s_val or '').strip())
+        log.info('call=%s turn=%d answer %s', call_id, turn, 'skipped by keypress' if skipped else 'played in full')
+        return text_response(f'read=f-silence=S{turn+1},no,record,{IN_DIR},,no')
+
     t0 = time.time()
     try:
         # --- resolve + transcribe recording ---
@@ -5916,6 +5993,7 @@ def yemot():
         with lock:
             claimed_recordings.add(rec_path)
         wav = ym_download('ivr2:' + rec_path if not rec_path.startswith('ivr2:') else rec_path)
+        t_dl = time.time()
         try:
             rms = audio_rms(wav)
             if rms is not None and rms < SILENCE_RMS:
@@ -5937,6 +6015,7 @@ def yemot():
         with lock:
             claimed_recordings.discard(rec_path)
         log.info('call=%s turn=%d stt(%.1fs): %s', call_id, turn, time.time()-t0, user_text[:80])
+        t_stt = time.time()
 
         if not user_text:
             sess['empty'] += 1
@@ -5983,6 +6062,7 @@ def yemot():
         sys_prompt = {'ozen': SYSTEM_PROMPT, 'chulin': CHULIN_SYSTEM,
                       'newsy': HUB_NEWSY_SYSTEM}[assist['system']]
         msgs = [{'role': 'system', 'content': sys_prompt}]
+        msgs.append({'role': 'system', 'content': 'התאריך והשעה כרגע בישראל: ' + israel_now_text() + '.'})
         if h.get('summary') and assist['system'] == 'ozen':
             msgs.append({'role': 'system', 'content': 'רקע משיחות קודמות עם המתקשר הזה: ' + h['summary']})
         want_web = assist['web'] == 'always' or (assist['web'] == 'factualish' and hub_wants_search(user_text))
@@ -5997,6 +6077,7 @@ def yemot():
             except Exception as e:
                 log.info('chat web ctx failed: %s', e)
         log.info('call=%s turn=%d search=%s sources=%d', call_id, turn, want_web, n_src)
+        t_src = time.time()
         for who, txt in h.get('turns', [])[-8:]:
             msgs.append({'role': 'user' if who == 'u' else 'assistant', 'content': txt})
         msgs.append({'role': 'user', 'content': user_text})
@@ -6026,14 +6107,16 @@ def yemot():
         # --- synthesize + upload reply ---
         t_tts0 = time.time()
         name, ym_path = upload_reply(reply_text, call_id, turn)
-        log.info('TIMING call=%s turn=%d total=%.1fs stt_to_llm_done=%.1fs tts+upload=%.1fs search=%s', call_id, turn, time.time()-t0, t_llm_done-t0, time.time()-t_tts0, want_web)
+        log.info('TIMING call=%s turn=%d total=%.1fs dl=%.1fs stt=%.1fs src=%.1fs llm=%.1fs tts_up=%.1fs search=%s',
+                 call_id, turn, time.time()-t0, t_dl-t0, t_stt-t_dl, t_src-t_stt, t_llm_done-t_src, time.time()-t_tts0, want_web)
         stats['turns'] += 1
 
         if is_bye:
             with lock:
                 sessions.pop(call_id, None)
             return text_response(f'id_list_message=f-{name[:-4]}')
-        return text_response(f'read=f-{name[:-4]}=S{turn+1},no,record,{IN_DIR},,no')
+        sess['await_skip'] = turn + 1
+        return text_response(play_chain(f'f-{name[:-4]}', f'S{turn+1}'))
 
     except Exception as e:
         stats['errors'] += 1
@@ -6100,6 +6183,18 @@ def _auto_setup_hub():
         except Exception as e:
             ok = False
             log.warning('hub prompt %s failed: %s', name, e)
+    try:
+        n = int(8000 * 0.25)
+        buf = io.BytesIO()
+        w = wave.open(buf, 'wb')
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+        w.writeframes(b'\x00\x00' * n)
+        w.close()
+        ym_upload(buf.getvalue(), 'silence.wav', f'{EXT_DIR}/silence.wav')
+        log.info('hub silence.wav uploaded')
+    except Exception as e:
+        ok = False
+        log.warning('hub silence upload failed: %s', e)
     if ok:
         try:
             ym_upload_text(HUB_PROMPT_VERSION + '\n', f'ivr2:{EXT_DIR}/prompts_hub_{HUB_PROMPT_VERSION}.txt')
@@ -6336,6 +6431,7 @@ def _auto_prune_ivr_tree():
 threading.Thread(target=_auto_prune_ivr_tree, daemon=True).start()
 threading.Thread(target=_drive_refresh_loop, daemon=True).start()
 threading.Thread(target=_temp_sweep_loop, daemon=True).start()
+
 
 
 
