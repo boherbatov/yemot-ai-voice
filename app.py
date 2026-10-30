@@ -2665,9 +2665,19 @@ def drive_title(fid):
 def _gd_token():
     if _gd['tok'] and time.time() < _gd['tok_exp'] - 60:
         return _gd['tok']
-    r = requests.post('https://oauth2.googleapis.com/token', data={
-        'client_id': GDRIVE_CLIENT_ID, 'client_secret': GDRIVE_CLIENT_SECRET,
-        'refresh_token': GDRIVE_REFRESH_TOKEN, 'grant_type': 'refresh_token'}, timeout=20)
+    last_exc = None
+    for _attempt in range(3):
+        try:
+            r = requests.post('https://oauth2.googleapis.com/token', data={
+                'client_id': GDRIVE_CLIENT_ID, 'client_secret': GDRIVE_CLIENT_SECRET,
+                'refresh_token': GDRIVE_REFRESH_TOKEN, 'grant_type': 'refresh_token'},
+                headers={'Connection': 'close'}, timeout=20)
+            break
+        except requests.ConnectionError as e:
+            last_exc = e
+            time.sleep(2)
+    else:
+        raise last_exc
     r.raise_for_status()
     j = r.json()
     _gd['tok'] = j['access_token']
@@ -2719,7 +2729,14 @@ def _gd_check_rows(rows):
 def _gd_api(path, params, tries=5):
     url = 'https://www.googleapis.com/drive/v3/' + path
     for attempt in range(tries):
-        r = requests.get(url, params=params, headers={'Authorization': f'Bearer {_gd_token()}'}, timeout=30)
+        try:
+            r = requests.get(url, params=params,
+                             headers={'Authorization': f'Bearer {_gd_token()}', 'Connection': 'close'},
+                             timeout=30)
+        except requests.ConnectionError:
+            # transient transport reset (e.g. a reused connection killed mid-crawl): retry fresh
+            time.sleep(min(2 ** attempt, 10))
+            continue
         if r.status_code == 401:
             _gd['tok'] = None
             continue
@@ -2809,8 +2826,18 @@ def drive_refresh_once():
             old_n = len(_gd['rows'] or [])
         except Exception:
             old_n = 0
-        root = _gd_find_root()
-        rows = _gd_crawl(root, time.time() + DRIVE_REFRESH_MAX_S)
+        try:
+            _gd_token()
+        except Exception as e:
+            raise RuntimeError(f'token stage: {type(e).__name__}: {str(e)[:150]}') from e
+        try:
+            root = _gd_find_root()
+        except Exception as e:
+            raise RuntimeError(f'find_root stage: {type(e).__name__}: {str(e)[:150]}') from e
+        try:
+            rows = _gd_crawl(root, time.time() + DRIVE_REFRESH_MAX_S)
+        except Exception as e:
+            raise RuntimeError(f'crawl stage: {type(e).__name__}: {str(e)[:150]}') from e
         _gd_check_rows(rows)
         if len(rows) < DRIVE_REFRESH_MIN_ROWS:
             raise ValueError(f'new index too small ({len(rows)} rows)')
