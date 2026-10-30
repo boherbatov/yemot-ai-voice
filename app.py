@@ -379,7 +379,7 @@ def _yt_title_relevant(query, title):
     matches = len(wanted & present)
     return matches >= max(1, (len(wanted) + 1) // 2)
 
-def yt_search_results(query, limit=15):
+def yt_search_results(query, limit=15, relevant=True):
     """TV search videos with titles only; reject channel/album IDs and empty rows."""
     import json as J, urllib.request as U
     _yt_cfg()
@@ -393,7 +393,7 @@ def yt_search_results(query, limit=15):
                                 'params': 'EgIQAfABAQ=='})
     for page in range(4):
         for ident, title in rows:
-            if ident not in seen and _yt_title_relevant(query, title):
+            if ident not in seen and (not relevant or _yt_title_relevant(query, title)):
                 found.append((ident, title)); seen.add(ident)
         if not token or len(found) >= limit or page == 3:
             break
@@ -1403,9 +1403,10 @@ SONG_PROMPTS = {
     'song_how': 'באיזו דרך לחפש? להקלדה בעברית, הקישו 1. לחיפוש בדיבור, הקישו 2. להקלדה באנגלית, הקישו 3.',
     'artist_typehow': 'הקלידו את שם הזמר, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לסיום הקישו סולמית.',
     'song_artist_voice': 'אם בא לכם, אמרו גם את שם הזמר. דברו אחרי הצליל, ולסיום הקישו סולמית. לחיפוש בלי זמר, הקישו סולמית ישר.',
-    'song_mode': 'מה בא לכם? לחיפוש לפי שיר, הקישו 1. לחיפוש לפי זמר, הקישו 2. לחיפוש שיר בעזרת AI, הקישו 3.',
+    'song_mode': 'מה בא לכם? לחיפוש לפי שיר, הקישו 1. לחיפוש לפי זמר, הקישו 2. לחיפוש שיר בעזרת AI, הקישו 3. לחיפוש תוכן כללי ביוטיוב, הקישו 4.',
     'song_ai_ask': 'ספרו לי על השיר שאתם מחפשים. למשל מילים שאתם זוכרים, מי שר אותו, או על מה הוא. דברו אחרי הצליל, ולסיום הקישו סולמית.',
     'song_ai_unknown': 'לא הצלחתי לזהות את השיר, נסו לתאר אחרת.',
+    'song_gen_ask': 'מה תרצו לשמוע מיוטיוב? שיעור, הרצאה, כתבה, או כל דבר אחר. אמרו בכמה מילים, ולסיום הקישו סולמית.',
     'song_after_free': 'לשיר נוסף, הקישו 1. לסיום, הקישו 2.',
     'song_typehow': 'הקלידו את שם השיר, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לסיום הקישו סולמית.',
     'song_artist': 'עכשיו הקלידו את שם הזמר, או הקישו רק סולמית לדילוג.',
@@ -1454,9 +1455,9 @@ LIB_PROMPTS = ('lib_pick', 'lib_bad', 'lib_choose', 'lib_for', 'lib_for_list', '
 
 # prompts the extension-2 upgrade needs on Yemot; uploaded once by _auto_setup_song2
 SONG2_NEW_PROMPTS = ('song_mode', 'song_how', 'song_typehow', 'song_artist', 'song_artist_voice',
-                     'artist_typehow', 'song_ask', 'song_more', 'song_notfound', 'song_too_long', 'song_after',
+                     'artist_typehow', 'song_ask', 'song_gen_ask', 'song_more', 'song_notfound', 'song_too_long', 'song_after',
                      'song_artist_ask', 'song_auto_next', 'song_queue_done', 'song_radio_on', 'song_after_free', 'song_disk', 'song_ai_ask', 'song_ai_unknown', 'song_dlfail', 'song_loading')
-SONG2_PROMPT_VERSION = 'v_ai3_radiofix_20261007'
+SONG2_PROMPT_VERSION = 'v_gen4_20261030'
 
 ARTIST_RESULT_LIMIT = 60   # singer radio: everything the paginated search yields
 ARTIST_PAGE_LIMIT = 25     # results screen announces the first 25 (5 pages of 5)
@@ -2885,6 +2886,34 @@ def fetch_free_results(call_id, query):
         log.warning('free results failed call=%s: %s', call_id, e)
         job.update(status='error', err=str(e)[:200])
 
+def fetch_general_results(call_id, query):
+    """Key-4 general YouTube search: any content, no music-title filter."""
+    job = song_jobs.get(call_id)
+    if not job:
+        return
+    try:
+        results = yt_search_results(query, limit=15, relevant=False)
+        if not results:
+            raise ValueError('no results')
+        cid = re.sub(r'\D', '', call_id)[-6:]
+        pages = []
+        for p in range(0, len(results), 5):
+            chunk = results[p:p + 5]
+            parts = ['מצאתי את התוצאות האלה.'] if p == 0 else ['התוצאות הבאות.']
+            for i, (_vid, t) in enumerate(chunk, 1):
+                t = re.sub(r'\s+', ' ', (t or '')).strip()[:70]
+                parts.append(f'{i}. {t}.')
+            parts.append('הקישו את מספר התוצאה. לתוצאות נוספות, הקישו 0.')
+            name = f'res{cid}g{p // 5}'
+            ym_delete(f'{SONG_DIR}/{name}.wav')
+            ym_upload(tts_wav(' '.join(parts)), name + '.wav', f'{SONG_DIR}/{name}.wav')
+            pages.append(name)
+        job.update(status='ready', results=results, pages=pages, page_idx=0)
+        log.info('general results call=%s: %d results', call_id, len(results))
+    except Exception as e:
+        log.warning('general results failed call=%s: %s', call_id, e)
+        job.update(status='error', err=str(e)[:200])
+
 def _results_fn(job):
     return fetch_free_results if job.get('kind') == 'free' else fetch_results
 
@@ -3286,6 +3315,9 @@ def yemot_song():
             return text_response(f'read=f-song_ask=S1,no,record,{IN_DIR},,no')
         if how is not None:
             return text_response('read=f-song_how=HOW,no,1,1,10,No,yes,,,,,,,,no')
+        if mode == '4':
+            job.update(kind='general', ai=False, stage='gen_voice')
+            return text_response(f'read=f-song_gen_ask=S1,no,record,{IN_DIR},,no')
         if mode == '3':
             job.update(kind='song', ai=True, ai_tries=0, stage='ai_voice')
             return text_response(f'read=f-song_ai_ask=S1,no,record,{IN_DIR},,no')
@@ -3325,6 +3357,24 @@ def yemot_song():
                 return text_response('id_list_message=f-song_bye')
             job.update(stage='ask_artist_voice', query=clean_song_query(text))
             return text_response(f'read=f-song_artist_voice=S{turn+1},no,record,{IN_DIR},,no')
+
+        if stage == 'gen_voice':
+            if not s_val:
+                return text_response(f'read=f-didnt_hear.f-song_gen_ask=S{turn+1},no,record,{IN_DIR},,no')
+            rec_path = s_val if s_val.startswith('/') else f'{IN_DIR}/{s_val}'
+            wav = ym_download(rec_path)
+            text = groq_stt(wav)
+            ym_delete(rec_path)
+            log.info('general yt req call=%s: %s', call_id, (text or '')[:100])
+            if not text:
+                return text_response(f'read=f-didnt_hear.f-song_gen_ask=S{turn+1},no,record,{IN_DIR},,no')
+            if any(w in text for w in GOODBYE_WORDS) and len(text) < 25:
+                with lock:
+                    song_jobs.pop(call_id, None)
+                return text_response('id_list_message=f-song_bye')
+            job.update(stage='searching', status='working', kind='general', query=text, started=time.time())
+            threading.Thread(target=fetch_general_results, args=(call_id, text), daemon=True).start()
+            return text_response(play_chain('f-song_searching', f'S{turn+1}'))
 
         if stage == 'ai_voice':
             if not s_val:
