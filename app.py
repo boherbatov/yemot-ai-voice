@@ -200,21 +200,53 @@ def _cg_mb(name):
     except Exception:
         return None
 
-def _yt_wait_headroom(need_mb=None, max_wait=8.0):
-    """Wait (briefly) until the container has room for the solver, instead of starting it into an OOM kill."""
+def _cg_stat_mb(key):
+    """One value from /sys/fs/cgroup/memory.stat, in MB; None when unavailable or malformed."""
+    try:
+        for line in open('/sys/fs/cgroup/memory.stat'):
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == key:
+                return int(parts[1]) / 1048576
+    except Exception:
+        pass
+    return None
+
+def _yt_free_mb(lim, cur):
+    """Effective free memory for starting the solver.
+    memory.current includes the page cache; the kernel reclaims inactive_file under
+    pressure, so the working set is current - inactive_file. Falls back to plain
+    limit-current when the stat is unavailable or malformed (previous behaviour)."""
+    inact = _cg_stat_mb('inactive_file')
+    if inact is None or inact < 0:
+        return lim - cur
+    return lim - max(cur - min(inact, cur), 0)
+
+def _yt_wait_headroom(need_mb=None, max_wait=8.0, label=''):
+    """Wait (briefly) until the container has room for the solver, instead of starting it into an OOM kill.
+    Emits one bounded diagnostic per call: waited, need, warm/cold, runtime, current, inactive_file, effective free."""
     lim = _cg_mb('memory.max')
     if lim is None:
         return
+    warm = None
     if need_mb is None:
         warm = os.path.isdir(os.path.join(YT_CACHE_DIR, 'challenge-solver')) and bool(os.listdir(os.path.join(YT_CACHE_DIR, 'challenge-solver')))
         need_mb = 150 if warm else 270
     t0 = time.time()
-    while time.time() - t0 < max_wait:
+    waited = 0.0
+    cur = None
+    while waited < max_wait:
         cur = _cg_mb('memory.current')
-        if cur is None or lim - cur >= need_mb:
+        if cur is None:
             return
+        if _yt_free_mb(lim, cur) >= need_mb:
+            break
         time.sleep(0.5)
-    log.info('solver headroom wait expired: %.0f MB free of %.0f', lim - (_cg_mb('memory.current') or 0), lim)
+        waited = time.time() - t0
+    inact = _cg_stat_mb('inactive_file')
+    log.info('solver headroom: waited %.1fs (need %.0f MB%s, runtime %s, current %s, inactive_file %s, effective free %s of %.0f)',
+             waited, need_mb, ' warm' if warm else (' cold' if warm is not None else ''), label or 'n/a',
+             ('%.0f' % cur) if cur is not None else 'n/a', ('%.0f' % inact) if inact is not None else 'n/a',
+             ('%.0f' % _yt_free_mb(lim, cur)) if cur is not None else 'n/a', lim)
 
 class _SolverLogger:
     """Forwards yt-dlp messages (secrets redacted) and notes when the JS solver failed or was killed."""
@@ -774,7 +806,7 @@ def yt_download(video_id, outtmpl, allow_long=False):
             opts.update(_yt_runtime_opts(_rt))
             opts['logger'] = _lg
             _yt_cache_prune()
-            _yt_wait_headroom()
+            _yt_wait_headroom(label=_rt)
             try:
                 info = _ytdlp_serial(yt_dlp, opts, video_id)
                 break
@@ -2123,7 +2155,7 @@ def meminfo_route():
     stat = {}
     for line in (rd('/sys/fs/cgroup/memory.stat') or '').splitlines()[:40]:
         k, _, v = line.partition(' ')
-        if k in ('anon', 'file', 'shmem'):
+        if k in ('anon', 'file', 'inactive_file', 'shmem'):
             stat[k] = int(v)
     procs = []
     for pid in os.listdir('/proc'):
