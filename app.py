@@ -698,28 +698,53 @@ def yt_download_tv(video_id, outtmpl, allow_long=False):
     """yt-dlp download through the authenticated TV client (PS4 UA) with deno decipher."""
     import yt_dlp
     from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS
-    title, duration, status = yt_player(video_id)
-    if status != 'OK':
-        raise ValueError(f'player status {status}')
-    if duration and int(duration) > 600 and not allow_long:
-        raise ValueError('song too long')
-    tv = INNERTUBE_CLIENTS['tv']
-    tv['INNERTUBE_CONTEXT']['client']['userAgent'] = PS4_UA
-    tv['INNERTUBE_CONTEXT']['client']['clientVersion'] = TV_CLIENT_VER
-    opts = {
-        'format': 'bestaudio/18/best',
-        'outtmpl': outtmpl,
-        'quiet': True, 'no_warnings': True, 'noplaylist': True,
-        'remote_components': ['ejs:github'],
-        'http_headers': {'Authorization': f'Bearer {_yt_token()}',
-                         'User-Agent': PS4_UA},
-        'extractor_args': {'youtube': {'player_client': ['tv'],
-                                       'player_skip': ['webpage', 'configs', 'initial_data'],
-                                       'visitor_data': [_YT['vd']]}},
-    }
-    url = f'https://www.youtube.com/watch?v={video_id}'
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
+    # registered before the (slow) metadata call: cancel_yt_except covers every phase
+    st = {'ev': threading.Event(), 'running': False}
+    _yt_active[video_id] = st
+    def hook(d):
+        if st['ev'].is_set():
+            raise YtCancelled('cancelled')
+    try:
+        if st['ev'].is_set():
+            raise YtCancelled('cancelled')
+        title, duration, status = yt_player(video_id)
+        if st['ev'].is_set():
+            raise YtCancelled('cancelled')   # cancelled during metadata: never start the download
+        if status != 'OK':
+            raise ValueError(f'player status {status}')
+        if duration and int(duration) > 600 and not allow_long:
+            raise SongTooLongError('song too long')
+        tv = INNERTUBE_CLIENTS['tv']
+        tv['INNERTUBE_CONTEXT']['client']['userAgent'] = PS4_UA
+        tv['INNERTUBE_CONTEXT']['client']['clientVersion'] = TV_CLIENT_VER
+        opts = {
+            'format': 'bestaudio/18/best',
+            'outtmpl': outtmpl,
+            'quiet': True, 'no_warnings': True, 'noplaylist': True,
+            'remote_components': ['ejs:github'],
+            'http_headers': {'Authorization': f'Bearer {_yt_token()}',
+                             'User-Agent': PS4_UA},
+            'extractor_args': {'youtube': {'player_client': ['tv'],
+                                           'player_skip': ['webpage', 'configs', 'initial_data'],
+                                           'visitor_data': [_YT['vd']]}},
+        }
+        url = f'https://www.youtube.com/watch?v={video_id}'
+        # same small-host serialization and cancellation as the primary route:
+        # one YouTube download at a time, abortable via cancel_yt_except
+        opts['progress_hooks'] = [hook]
+        with _yt_dl_lock:
+            if st['ev'].is_set():
+                raise YtCancelled('cancelled')
+            st['running'] = True
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+    except Exception as e:
+        if st['ev'].is_set():
+            raise YtCancelled('cancelled') from None
+        raise
+    finally:
+        if _yt_active.get(video_id) is st:
+            _yt_active.pop(video_id, None)
     return title, duration
 class SongTooLongError(ValueError):
     pass
@@ -736,6 +761,10 @@ _yt_dl_lock = threading.Lock()   # one yt-dlp/deno solver run at a time: paralle
 _yt_active = {}   # video id -> {'ev': Event, 'running': bool}; lets a different pick abort a speculative download
 
 class YtCancelled(Exception):
+    pass
+
+class _YtCooldownOpened(Exception):
+    """Raised by the download-lock gate when the breaker opened while this call was queued."""
     pass
 
 def _kill_deno():
@@ -757,7 +786,7 @@ def cancel_yt_except(keep_video_id):
             if st['running']:
                 _kill_deno()
 
-def _ytdlp_serial(yt_dlp, opts, video_id):
+def _ytdlp_serial(yt_dlp, opts, video_id, gate=None, on_error=None):
     st = {'ev': threading.Event(), 'running': False}
     _yt_active[video_id] = st
     def hook(d):
@@ -768,9 +797,18 @@ def _ytdlp_serial(yt_dlp, opts, video_id):
         with _yt_dl_lock:
             if st['ev'].is_set():
                 raise YtCancelled('cancelled')
-            st['running'] = True
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=True)
+            try:
+                if gate is not None:
+                    gate()   # re-validate routing now that this run actually holds the lock
+                st['running'] = True
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=True)
+            except Exception as e:
+                if st['ev'].is_set():
+                    raise YtCancelled('cancelled') from None
+                if on_error is not None:
+                    on_error(e)   # inside the with: genuinely under the lock, before any waiter enters
+                raise
     except Exception as e:
         if st['ev'].is_set():
             raise YtCancelled('cancelled') from None
@@ -779,76 +817,255 @@ def _ytdlp_serial(yt_dlp, opts, video_id):
         if _yt_active.get(video_id) is st:
             _yt_active.pop(video_id, None)
 
+_YT_CB = {'fails': 0, 'open_until': 0.0, 'probe': None}   # probe: unique token while a half-open probe is in flight
+_YT_CB_LOCK = threading.Lock()
+_YT_CB_THRESHOLD = 2          # consecutive HTTP-403 primary failures before cooldown
+_YT_CB_COOLDOWN_S = 1200.0    # 20 min fallback-first, then one half-open primary probe
+
+def _yt_is_403(err):
+    # yt-dlp reports the status in the error text; the match stays tight so a video
+    # id or URL fragment containing '403' is never mistaken for an HTTP 403.
+    return re.search(r'HTTP Error 403[: ]', str(err)) is not None
+
+def _yt_cb_route():
+    """('tv', None) while the cooldown is active or another caller holds the probe;
+    ('probe', token) for the single caller owning the half-open probe slot;
+    ('primary', None) in normal operation. The token proves probe ownership: only
+    the holder may release the slot or record the probe's outcome."""
+    with _YT_CB_LOCK:
+        if _YT_CB['probe'] is not None or time.time() < _YT_CB['open_until']:
+            return 'tv', None
+        if _YT_CB['fails'] >= _YT_CB_THRESHOLD:
+            _YT_CB['probe'] = object()
+            return 'probe', _YT_CB['probe']
+        return 'primary', None
+
+def _yt_cb_would_route_tv():
+    """Pure read: would a caller routing right now be sent to the TV route? Used by the
+    download-lock gate; unlike _yt_cb_route it never claims the probe slot."""
+    with _YT_CB_LOCK:
+        return (_YT_CB['probe'] is not None or time.time() < _YT_CB['open_until']
+                or _YT_CB['fails'] >= _YT_CB_THRESHOLD)
+
+def _yt_cb_claim_probe():
+    """After a TV failure during cooldown, exactly one caller may probe the primary.
+    Returns the probe token, or None when another probe is already in flight."""
+    with _YT_CB_LOCK:
+        if _YT_CB['probe'] is not None:
+            return None
+        _YT_CB['probe'] = object()
+        return _YT_CB['probe']
+
+def _yt_cb_probe_done(token):
+    """Release the probe slot without recording an outcome (cancel/duration cap are
+    neutral). Only the holder's token releases; anything else is a no-op."""
+    with _YT_CB_LOCK:
+        if token is not None and _YT_CB['probe'] is token:
+            _YT_CB['probe'] = None
+
+def _yt_cb_record_403():
+    """One HTTP-403 primary failure, recorded the moment it happens (under the download
+    lock, per attempt): bump the consecutive-403 streak and open the cooldown at the
+    threshold. Never touches the probe slot - the probe keeps its token until its whole
+    retry chain settles, so an intermediate failure can never free it early."""
+    with _YT_CB_LOCK:
+        _YT_CB['fails'] += 1
+        if _YT_CB['fails'] >= _YT_CB_THRESHOLD:
+            _YT_CB['open_until'] = time.time() + _YT_CB_COOLDOWN_S
+            log.info('primary YouTube HTTP 403 x%d: cooling down %.0fs on the existing TV route',
+                     _YT_CB['fails'], _YT_CB_COOLDOWN_S)
+
+def _yt_cb_record(ok, err=None, token=None):
+    """Settle the FINAL outcome of a call's primary chain after media validation.
+    Success closes the breaker; a final non-403 failure breaks the streak; a final
+    403 was already counted by _yt_cb_record_403 at the moment it happened, so here it
+    only releases the probe. A probe outcome applies only from the holder's token; a
+    normal caller (token None) never touches the probe slot."""
+    with _YT_CB_LOCK:
+        if token is not None:
+            if _YT_CB['probe'] is not token:
+                return   # stale token: another probe owns the slot now
+            _YT_CB['probe'] = None
+        if ok:
+            _YT_CB['fails'] = 0
+            _YT_CB['open_until'] = 0.0
+        elif err is not None and _yt_is_403(err):
+            pass   # already counted at the moment it happened
+        else:
+            _YT_CB['fails'] = 0
+
+def _yt_snap(outtmpl):
+    """path -> (mtime_ns, size) of every file matching outtmpl right now."""
+    import glob
+    snap = {}
+    for p in glob.glob(outtmpl.replace('%(ext)s', '*')):
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        snap[p] = (st.st_mtime_ns, st.st_size)
+    return snap
+
+def _yt_media_new(outtmpl, snap):
+    """Complete media files new or changed since snap: only those prove the attempt
+    that ran after the snapshot produced media. An earlier attempt's leftover with
+    the same name is never credited to a later attempt."""
+    return [p for p, sig in _yt_snap(outtmpl).items()
+            if snap.get(p) != sig and sig[1] > 0
+            and not p.endswith(('.part', '.ytdl', '.json', '.jpg', '.webp', '.png'))]
+
+def _yt_attempt_cleanup(outtmpl, snap):
+    """Remove everything the failed attempt left behind (new or changed since snap),
+    so a later attempt - and the caller's own glob - never mistakes a failed attempt's
+    artifact (possibly a different extension) for the successful route's output."""
+    for p, sig in _yt_snap(outtmpl).items():
+        if snap.get(p) != sig:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
 def yt_download(video_id, outtmpl, allow_long=False):
     """Use the official mweb PO-token route; retain the old TV path as fallback.
-    allow_long skips the 10-minute cap (segmented playback downloads its source whole)."""
+    allow_long skips the 10-minute cap (segmented playback downloads its source whole).
+    After repeated 403-class primary failures the primary is skipped briefly (cooldown):
+    calls try the existing TV route first, and exactly one half-open primary probe runs
+    after the cooldown expires or when the TV route also fails. An attempt counts as
+    success only with media it provably produced (snapshot-validated). A call that
+    queued on the download lock before the cooldown opened re-checks admission under
+    the lock and joins the same validated TV lifecycle instead of running a stale
+    primary. The loop is bounded: gate diversion happens at most once (a probe holder
+    is never diverted), and every other path returns or raises."""
     import yt_dlp
     if not re.fullmatch(r'[A-Za-z0-9_-]{11}', str(video_id)):
         raise ValueError('invalid YouTube video id')
     if not _YT_SOLVER_READY.get('ok'):
         raise RuntimeError('YouTube solver unavailable')
-    try:
-        opts = {
-            'format': 'bestaudio/best', 'outtmpl': outtmpl,
-            'quiet': True, 'no_warnings': False, 'noplaylist': True,
-            'extractor_args': {'youtube': {'player_client': ['mweb']},
-                               'youtubepot-bgutilhttp': {'base_url': ['http://127.0.0.1:4416']}},
-            'socket_timeout': 20, 'retries': 1,
-        }
-        if not allow_long:
-            opts['match_filter'] = _song_duration_filter
-        cookie_file = _active_cookie_file()
-        if cookie_file:
-            opts['cookiefile'] = cookie_file
-        info = None
-        for _attempt, _rt in enumerate(_yt_runtime_choices()):
-            _lg = _SolverLogger()
-            opts.update(_yt_runtime_opts(_rt))
-            opts['logger'] = _lg
-            _yt_cache_prune()
-            _yt_wait_headroom(label=_rt)
+    tv_failed = False
+    route, probe = _yt_cb_route()
+
+    def _primary_gate():
+        # the route was chosen before queueing on the download lock; re-check under the
+        # lock so a queued caller never runs the primary after the cooldown opened
+        if probe is None and _yt_cb_would_route_tv():
+            raise _YtCooldownOpened('cooldown opened while queued')
+
+    def _primary_on_error(e):
+        # called by _ytdlp_serial while still holding the download lock, on every failed
+        # attempt: each real HTTP 403 lands on the streak immediately, so the breaker is
+        # already open before the next queued caller's admission check runs. Non-403
+        # failures wait for the chain's final outcome - the retry chain may still recover,
+        # and the probe token stays with this call until it settles.
+        if _yt_is_403(e):
+            _yt_cb_record_403()
+
+    while True:
+        if route == 'tv':
+            log.info('primary YouTube cooldown active for %s: trying existing TV route first', video_id)
+            tv_snap = _yt_snap(outtmpl)
             try:
-                info = _ytdlp_serial(yt_dlp, opts, video_id)
-                break
+                result = yt_download_tv(video_id, outtmpl, allow_long=allow_long)
+                if _yt_media_new(outtmpl, tv_snap):
+                    return result
+                log.warning('TV route returned without a new media file for %s', video_id)
+                raise ValueError('TV route produced no media file')
             except (SongTooLongError, YtCancelled):
                 raise
-            except Exception:
-                if _attempt == 0 and _lg.solver_failed:
-                    log.info('solver failed with %s for %s, retrying once', _rt, video_id)
-                    time.sleep(1.0)
-                    continue
-                raise
-        if not info:
-            log.warning('YouTube download refused: duration limit or no downloadable media')
-            raise ValueError('song too long or no downloadable media')
-        import glob
-        media_files = [p for p in glob.glob(outtmpl.replace('%(ext)s', '*'))
-                       if os.path.isfile(p) and os.path.getsize(p) > 0
-                       and not p.endswith(('.part', '.ytdl', '.json', '.jpg', '.webp', '.png'))]
-        if not media_files:
-            log.warning('YouTube download returned metadata but produced no media file')
-            raise ValueError('download produced no media file')
-        return info.get('title') or 'שיר', info.get('duration')
-    except (SongTooLongError, YtCancelled):
-        raise
-    except Exception as e:
-        authed = bool(_COOKIE_BOOT['configured'] or os.environ.get('YT_COOKIES_FILE'))
-        if authed:
-            # cookie details stay out of the logs; only the error class and a redacted short reason
-            reason = re.sub(r'[A-Za-z0-9_%./=+-]{40,}', '<redacted>', str(e))[:200]
-            log.warning('authenticated YouTube download failed for %s: %s: %s', video_id, type(e).__name__, reason)
-            if not YT_REFRESH_TOKEN:
-                raise RuntimeError('YouTube download unavailable') from None
-            log.info('trying TV-client fallback for %s', video_id)
-            try:
-                return yt_download_tv(video_id, outtmpl, allow_long=allow_long)
-            except SongTooLongError:
-                raise
             except Exception as e2:
-                log.warning('TV-client fallback failed for %s: %s', video_id, type(e2).__name__)
+                # the TV route is a fallback, not a replacement: when it also fails, the
+                # primary gets exactly one bounded probe instead of staying blocked
+                probe = _yt_cb_claim_probe()
+                if probe is None:
+                    raise
+                tv_failed = True
+                _yt_attempt_cleanup(outtmpl, tv_snap)   # failed TV attempt's artifacts must not survive into the probe
+                log.warning('TV route failed during primary cooldown for %s: %s; probing primary once',
+                            video_id, type(e2).__name__)
+                route = 'probe'
+        pre_snap = _yt_snap(outtmpl)
+        try:
+            opts = {
+                'format': 'bestaudio/best', 'outtmpl': outtmpl,
+                'quiet': True, 'no_warnings': False, 'noplaylist': True,
+                'extractor_args': {'youtube': {'player_client': ['mweb']},
+                                   'youtubepot-bgutilhttp': {'base_url': ['http://127.0.0.1:4416']}},
+                'socket_timeout': 20, 'retries': 1,
+            }
+            if not allow_long:
+                opts['match_filter'] = _song_duration_filter
+            cookie_file = _active_cookie_file()
+            if cookie_file:
+                opts['cookiefile'] = cookie_file
+            info = None
+            for _attempt, _rt in enumerate(_yt_runtime_choices()):
+                _lg = _SolverLogger()
+                opts.update(_yt_runtime_opts(_rt))
+                opts['logger'] = _lg
+                _yt_cache_prune()
+                _yt_wait_headroom(label=_rt)
+                attempt_snap = _yt_snap(outtmpl)
+                try:
+                    # gate on chain admission (first attempt) only: a permitted retry
+                    # completes its chain even if the chain's own recorded 403 just
+                    # opened the cooldown - the cooldown governs OTHER calls' admission
+                    info = _ytdlp_serial(yt_dlp, opts, video_id,
+                                         gate=_primary_gate if _attempt == 0 else None,
+                                         on_error=_primary_on_error)
+                    break
+                except (SongTooLongError, YtCancelled):
+                    raise
+                except Exception:
+                    if _attempt == 0 and _lg.solver_failed:
+                        # the failed attempt's artifacts (any extension) must not leak
+                        # into the retry or the caller's downstream glob
+                        _yt_attempt_cleanup(outtmpl, attempt_snap)
+                        log.info('solver failed with %s for %s, retrying once', _rt, video_id)
+                        time.sleep(1.0)
+                        continue
+                    raise
+            if not info:
+                log.warning('YouTube download refused: duration limit or no downloadable media')
+                raise ValueError('song too long or no downloadable media')
+            media_files = _yt_media_new(outtmpl, pre_snap)
+            if not media_files:
+                log.warning('YouTube download returned metadata but produced no media file')
+                raise ValueError('download produced no media file')
+            _yt_cb_record(ok=True, token=probe)
+            return info.get('title') or 'שיר', info.get('duration')
+        except (SongTooLongError, YtCancelled):
+            _yt_cb_probe_done(probe)
+            raise
+        except _YtCooldownOpened:
+            # neutral: the primary never ran, nothing to record; join the cooldown path
+            # and take the same validated TV lifecycle as any TV-routed call
+            log.info('primary skipped for %s: cooldown opened while queued; trying existing TV route', video_id)
+            route = 'tv'
+            continue
+        except Exception as e:
+            # settles the chain's final outcome: a 403 was already counted at the moment
+            # it happened; this releases the probe and applies the non-403 streak rule
+            _yt_cb_record(ok=False, err=e, token=probe)
+            _yt_attempt_cleanup(outtmpl, pre_snap)   # failed primary's artifacts must not reach the fallback or the caller's glob
+            if tv_failed:
+                # TV already failed during this call's cooldown probe; no second attempt.
                 raise RuntimeError('YouTube download unavailable') from None
-        log.warning('mweb PO-token download failed for %s: %s; trying existing TV route', video_id, e)
-        return yt_download_tv(video_id, outtmpl, allow_long=allow_long)
+            authed = bool(_COOKIE_BOOT['configured'] or os.environ.get('YT_COOKIES_FILE'))
+            if authed:
+                # cookie details stay out of the logs; only the error class and a redacted short reason
+                reason = re.sub(r'[A-Za-z0-9_%./=+-]{40,}', '<redacted>', str(e))[:200]
+                log.warning('authenticated YouTube download failed for %s: %s: %s', video_id, type(e).__name__, reason)
+                if not YT_REFRESH_TOKEN:
+                    raise RuntimeError('YouTube download unavailable') from None
+                log.info('trying TV-client fallback for %s', video_id)
+                try:
+                    return yt_download_tv(video_id, outtmpl, allow_long=allow_long)
+                except (SongTooLongError, YtCancelled):
+                    raise
+                except Exception as e2:
+                    log.warning('TV-client fallback failed for %s: %s', video_id, type(e2).__name__)
+                    raise RuntimeError('YouTube download unavailable') from None
+            log.warning('mweb PO-token download failed for %s: %s; trying existing TV route', video_id, e)
+            return yt_download_tv(video_id, outtmpl, allow_long=allow_long)
 
 EDGE_VOICE = os.environ.get('EDGE_VOICE', 'he-IL-HilaNeural')
 EDGE_RATE = os.environ.get('EDGE_RATE', '+25%')
