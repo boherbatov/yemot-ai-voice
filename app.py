@@ -1407,6 +1407,7 @@ SONG_PROMPTS = {
     'song_mode': 'מה בא לכם? לחיפוש לפי שיר, הקישו 1. לחיפוש לפי זמר, הקישו 2. לחיפוש שיר בעזרת AI, הקישו 3. לחיפוש תוכן כללי ביוטיוב, הקישו 4.',
     'song_ai_ask': 'ספרו לי על השיר שאתם מחפשים. למשל מילים שאתם זוכרים, מי שר אותו, או על מה הוא. דברו אחרי הצליל, ולסיום הקישו סולמית.',
     'song_ai_unknown': 'לא הצלחתי לזהות את השיר, נסו לתאר אחרת.',
+    'song_gen_type': 'הקלידו מה תרצו לשמוע מיוטיוב, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לסיום הקישו סולמית.',
     'song_gen_ask': 'מה תרצו לשמוע מיוטיוב? שיעור, הרצאה, כתבה, או כל דבר אחר. אמרו בכמה מילים, ולסיום הקישו סולמית.',
     'song_after_free': 'לשיר נוסף, הקישו 1. לסיום, הקישו 2.',
     'song_typehow': 'הקלידו את שם השיר, בלי סולמית בין האותיות. לאות נוספת על אותו מקש, הקישו כוכבית ביניהן. לרווח הקישו 0. לסיום הקישו סולמית.',
@@ -3358,8 +3359,8 @@ def yemot_song():
         if how is not None:
             return text_response('read=f-song_how=HOW,no,1,1,10,No,yes,,,,,,,,no')
         if mode == '4':
-            job.update(kind='general', ai=False, stage='gen_voice')
-            return text_response(f'read=f-song_gen_ask=S1,no,record,{IN_DIR},,no')
+            job.update(kind='general', ai=False, stage='gen_typed', tlang='he')
+            return text_response(multitap_read('f-song_gen_type', 'S1', allow_empty=True))
         if mode == '3':
             job.update(kind='song', ai=True, ai_tries=0, stage='ai_voice')
             return text_response(f'read=f-song_ai_ask=S1,no,record,{IN_DIR},,no')
@@ -3399,6 +3400,17 @@ def yemot_song():
                 return text_response('id_list_message=f-song_bye')
             job.update(stage='ask_artist_voice', query=clean_song_query(text))
             return text_response(f'read=f-song_artist_voice=S{turn+1},no,record,{IN_DIR},,no')
+
+        if stage == 'gen_typed':
+            # General search only: reuse the line's existing Hebrew keypad decoder.
+            # Never treat a recording path or malformed keypad value as search text.
+            text = multitap_decode(s_val, 'he') if re.fullmatch(r'[0-9*]+', s_val or '') else ''
+            if not text:
+                return text_response(multitap_read('f-song_gen_type', f'S{turn+1}', allow_empty=True))
+            log.info('general yt typed req call=%s: %s', call_id, text[:100])
+            job.update(stage='searching', status='working', kind='general', query=text, started=time.time())
+            threading.Thread(target=fetch_general_results, args=(call_id, text), daemon=True).start()
+            return text_response(play_chain('f-song_searching', f'S{turn+1}'))
 
         if stage == 'gen_voice':
             if not s_val:
@@ -6262,6 +6274,21 @@ def _auto_setup_song2():
         except Exception as e:
             log.warning('song2 prompt marker failed: %s', e)
 
+def _auto_setup_general_typing():
+    # Scoped input migration: add one prompt, without rewriting existing song assets.
+    if not (YM_SYSTEM and YM_PASS):
+        return
+    time.sleep(9)
+    name = 'song_gen_type'
+    try:
+        names = {f.get('name') for f in ym_list_files(f'ivr2:{SONG_DIR}')}
+        if name + '.wav' not in names:
+            if not ym_upload(tts_wav(SONG_PROMPTS[name]), name + '.wav', f'{SONG_DIR}/{name}.wav'):
+                raise RuntimeError('prompt upload failed')
+        log.info('general typing prompt ready')
+    except Exception as e:
+        log.warning('general typing prompt setup failed: %s', e)
+
 def _auto_setup_hub():
     # Idempotent startup migration: upload the extension-1 AI hub prompts once per version.
     if not (YM_SYSTEM and YM_PASS):
@@ -6450,6 +6477,7 @@ threading.Thread(target=_auto_setup_pod3, daemon=True).start()
 threading.Thread(target=_auto_setup_hub, daemon=True).start()
 
 threading.Thread(target=_auto_setup_song2, daemon=True).start()
+threading.Thread(target=_auto_setup_general_typing, daemon=True).start()
 
 # Extension 9 installer disabled by owner request; implementation retained.
 
