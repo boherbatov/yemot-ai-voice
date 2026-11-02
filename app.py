@@ -1785,6 +1785,8 @@ PREFETCH_EXTRA = int(os.environ.get('PREFETCH_EXTRA', '1'))          # results #
 SONG_POLL_BLOCK_S = float(os.environ.get('SONG_POLL_BLOCK_S', '2.0'))  # hold a poll this long before replaying a wait prompt (0 = off)
 SONG_MIN_RATIO = float(os.environ.get('SONG_MIN_RATIO', '0.85'))     # converted wav must cover this share of the known duration (0 = off)
 ARTIST_AUTOPLAY = os.environ.get('ARTIST_AUTOPLAY', '1') != '0'      # singer search plays every song in sequence, no menu
+# One extra bounded second only for a selected song, not menu/search polling.
+SONG_READY_BLOCK_S = SONG_POLL_BLOCK_S + 1.0 if SONG_POLL_BLOCK_S > 0 else 0.0
 _song_loading_ok = False   # set once the 'song_loading' prompt is confirmed on Yemot
 
 def _block_until(pred, secs):
@@ -2478,7 +2480,8 @@ def fetch_queue_song(call_id, idx):
                     ann_box['err'] = e_
             ann_th = threading.Thread(target=_mk_ann, daemon=True)
             ann_th.start()
-        if job.get(f'{key}_want') != idx or job.get(f'{key}_vwant') != video_id:
+        if (song_jobs.get(call_id) is not job or
+                job.get(f'{key}_want') != idx or job.get(f'{key}_vwant') != video_id):
             log.info('queue song superseded call=%s idx=%s, discarding', call_id, idx)
             return
         with open(out, 'rb') as f:
@@ -2509,10 +2512,16 @@ def fetch_queue_song(call_id, idx):
             job[f'{key}_ann'] = None
         if seg_plan:
             job.update(**{f'{key}_file': dest, f'{key}_seg': seg_plan})
+        # The menu may have failed, or the caller may have changed the pick
+        # while the upload was in flight. Never publish that stale slot.
+        if (song_jobs.get(call_id) is not job or
+                job.get(f'{key}_want') != idx or job.get(f'{key}_vwant') != video_id):
+            return
         job.update(**{f'{key}_status': 'ready', f'{key}_title': title, f'{key}_video': video_id})
         log.info('queue song ready call=%s idx=%s title=%s', call_id, idx, (title or '')[:60])
     except Exception as e:
-        if job.get(f'{key}_want') == idx and job.get(f'{key}_vwant') == vid0:
+        if (song_jobs.get(call_id) is job and
+                job.get(f'{key}_want') == idx and job.get(f'{key}_vwant') == vid0):
             log.warning('queue song failed call=%s idx=%s: %s', call_id, idx, e)
             job.update(**{f'{key}_status': 'error', f'{key}_err': 'disk' if isinstance(e, DiskLowError) else 'too_long' if isinstance(e, SongTooLongError) else str(e)[:200]})
     finally:
@@ -2562,7 +2571,7 @@ def reuse_or_start_prefetch(call_id, idx):
         return
     start_prefetch(call_id, idx, force=True)
 
-def speculative_prefetch(call_id, job, results):
+def speculative_prefetch(call_id, job, results, extras=True):
     """While the results menu plays, download+convert result #1 so a pick of it starts at once.
     Same pipeline (disk guard, too-long check); a different pick simply supersedes it."""
     try:
@@ -2575,7 +2584,8 @@ def speculative_prefetch(call_id, job, results):
         job['qidx'] = 0
         start_prefetch(call_id, 0)
         log.info('speculative prefetch call=%s video=%s', call_id, results[0][0])
-        prefetch_extras(call_id, job, results)
+        if extras:
+            prefetch_extras(call_id, job, results)
     except Exception as e:
         log.info('speculative prefetch skipped: %s', str(e)[:100])
 
@@ -3271,8 +3281,18 @@ def fetch_results(call_id, query):
         if not results:
             raise plain_err or ValueError('no video results')
         menu_started = time.monotonic()
-        pages = publish_result_pages(call_id, job, results, 'p', 'מצאתי את השירים האלה.')
-        speculative_prefetch(call_id, job, results)
+        # Start only result #1 beside page-1 TTS. Extras must wait until the
+        # menu has assigned its generation, and never race the first conversion.
+        speculative_prefetch(call_id, job, results, extras=False)
+        try:
+            pages = publish_result_pages(call_id, job, results, 'p', 'מצאתי את השירים האלה.')
+        except Exception:
+            # Invalidate the speculative slot before reporting a failed menu.
+            # Do not cancel another caller's YouTube worker or delete live files.
+            job.update(slot0_want=None, slot0_vwant=None)
+            raise
+        if song_jobs.get(call_id) is job and job.get('status') == 'ready':
+            prefetch_extras(call_id, job, results)
         log.info('song menu page1 ready elapsed=%.2fs pages=%d', time.monotonic()-menu_started, len(pages))
         log.info('song results call=%s: %d results, %d pages', call_id, len(results), len(pages))
     except Exception as e:
@@ -3418,7 +3438,7 @@ def _after_pick(call_id, job, turn):
     finishes within the hold window does too; otherwise play a short loading prompt."""
     idx = job.get('qidx', 0)
     key = f'slot{idx % 2}'
-    if _block_until(lambda: job.get(f'{key}_status') not in (None, 'working'), SONG_POLL_BLOCK_S):
+    if _block_until(lambda: job.get(f'{key}_status') not in (None, 'working'), SONG_READY_BLOCK_S):
         return wait_step(call_id, job, turn)
     return text_response(play_chain('f-song_loading' if _song_loading_ok else 'f-song_searching', f'S{turn+1}'))
 
@@ -3431,7 +3451,7 @@ def wait_step(call_id, job, turn):
         if time.time() - job.get('started', 0) > 150:
             st = 'error'
             job[f'{key}_status'] = 'error'
-        elif _block_until(lambda: job.get(f'{key}_status') not in (None, 'working'), SONG_POLL_BLOCK_S):
+        elif _block_until(lambda: job.get(f'{key}_status') not in (None, 'working'), SONG_READY_BLOCK_S):
             return wait_step(call_id, job, turn)       # finished inside the hold window: no prompt, no extra round trip
         else:
             return text_response(play_chain('f-song_wait', f'S{turn+1}'))
