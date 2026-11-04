@@ -425,6 +425,7 @@ def install(ns):
         return ns['yemot_song']()
     install_navigation(ns)
     install_test9(ns)
+    install_native90(ns)
 import hmac, re, threading
 from flask import request
 
@@ -656,3 +657,63 @@ def install_wiki_return(ns):
         return
     exec(compile(_WIKI_RETURN_SOURCE, '<wiki-return>', 'exec'), ns)
     ns['app'].view_functions['yemot_wiki'] = ns['yemot_wiki']
+
+"""Isolated /90 native playback trial. No acquisition, media copies or ordinary-route wrapping.
+Only three pre-existing synthetic/public-Wikipedia QA files are allowed.
+Offsets remain uncalibrated: recorded raw, never used for seek/resume math.
+"""
+import hmac,re,threading,time
+from flask import request,jsonify
+
+def install_native90(ns):
+    lock=threading.Lock();sessions={};events=[]
+    media=('/9/000','/4/486274/001','/9/001')
+    def reply(body):return ns['text_response'](body)
+    def handoff(idx):return 'go_to_folder_and_play=/90/1,'+media[idx]+',0'
+    def route():
+        p=request.values
+        if not hmac.compare_digest(str(p.get('secret','')),str(ns['BRIDGE_SECRET'])):return 'forbidden',403
+        call=p.get('ApiCallId','');phone=p.get('ApiPhone','');ext=p.get('ApiExtension','').strip('/')
+        if not call or len(call)>160 or not re.fullmatch(r'0\d{8,10}',phone):return 'invalid caller',400
+        if ext not in ('90','90/1'):return 'trial only',400
+        now=time.monotonic()
+        with lock:
+            for key in list(sessions):
+                if now-sessions[key]['touched']>7200:sessions.pop(key,None)
+            state=sessions.get(call)
+            if state and state['phone']!=phone:return 'caller mismatch',403
+            if p.get('hangup')=='yes':
+                if state:
+                    events.append({'call':call,'extension':ext,'what':p.get('what',''),'raw_offset':p.get('PlayStop',''),'reason':'hangup','timestamp':p.get('ApiTime','')})
+                    del events[:-200];sessions.pop(call,None)
+                return reply('')
+            if ext=='90':
+                if state is None:
+                    if len(sessions)>=100:return reply('go_to_folder=/')
+                    state={'phone':phone,'index':0,'generation':1,'touched':now,'last_event':None,'last_body':''};sessions[call]=state
+                state['touched']=now
+                return reply(handoff(state['index']))
+            if state is None:return reply('go_to_folder=/')
+            what=p.get('what','');raw=p.get('PlayStop','');key=p.get('PressKey','');stamp=p.get('ApiTime','')
+            event=(stamp,what,raw,key)
+            if stamp and event==state['last_event']:return reply(state['last_body'])
+            if what!='ivr2:'+media[state['index']]+'.wav':return reply('noop')
+            events.append({'call':call,'extension':ext,'what':what,'raw_offset':raw,'key':key,'generation':state['generation'],'timestamp':stamp});del events[:-200]
+            state['touched']=now
+            if not stamp:return reply('noop')
+            idx=state['index'];body='noop'
+            if key in ('2','4'):
+                target=max(0,min(len(media)-1,idx+(-1 if key=='2' else 1)))
+                if target!=idx:state['index']=target;state['generation']+=1;body=handoff(target)
+            elif key=='' and raw=='-1':
+                if idx+1<len(media):state['index']+=1;state['generation']+=1;body=handoff(state['index'])
+                else:body='go_to_folder=/'
+            state['last_event']=event;state['last_body']=body
+            return reply(body)
+    def diagnostics():
+        if not ns['admin_secret_ok']():return 'forbidden',403
+        with lock:
+            return jsonify({'trial':'90','offset_unit':'UNVERIFIED','sessions':len(sessions),'events':list(events),'media':list(media)})
+    ns['app'].add_url_rule('/yemot-player-trial90',endpoint='yemot_player_trial90',view_func=route,methods=['GET','POST'])
+    ns['app'].add_url_rule('/native90-diagnostics',endpoint='native90_diagnostics',view_func=diagnostics,methods=['GET'])
+    return {'sessions':sessions,'events':events}
