@@ -409,3 +409,66 @@ def install(ns):
             return navigate
         # emit needs the current call state, so keep it inside the request wrapper.
         app.view_functions[nav_endpoint]=make_navigation(original,store_name,nav_endpoint)
+
+    install_test9(ns)
+
+import hmac,re,threading
+from flask import request
+
+def install_test9(ns, offset_unit_ms=None):
+    if offset_unit_ms not in (None,1,1000):raise ValueError('explicit calibration only')
+    lock=threading.Lock();sessions={};checkpoints={};observations=[]
+    files=['/9/000','/9/001','/9/002'];duration=60000
+    def response(body):return ns['text_response'](body)
+    def play(index,offset=0):return response(f'go_to_folder_and_play=/9,{files[index]},{offset}')
+    def route():
+        p=request.values
+        if not hmac.compare_digest(str(p.get('secret','')),str(ns['BRIDGE_SECRET'])):return 'forbidden',403
+        call=p.get('ApiCallId','');phone=p.get('ApiPhone','')
+        if not call or not re.fullmatch(r'0\d{8,10}',phone):return 'invalid caller',400
+        if str(p.get('ApiExtension','')).strip('/')!='9':return 'test9 only',400
+        what=p.get('what','');key=p.get('PressKey','');raw=p.get('PlayStop','')
+        if what not in ['ivr2:'+f+'.wav' for f in files]:return 'invalid synthetic file',400
+        index=files.index(what.removeprefix('ivr2:').removesuffix('.wav'))
+        with lock:
+            previous=sessions.get(call)
+            if previous and (previous['phone']!=phone or previous['index']!=index):return response('noop')
+            s=sessions.setdefault(call,{'phone':phone,'index':index,'last_event':None,'last_response':'noop'})
+            # Retries from provider carry the same API timestamp and callback payload.
+            # Without a timestamp no mutation is accepted: identical repeated keypresses
+            # cannot otherwise be distinguished safely from a retry.
+            timestamp=p.get('ApiTime','')
+            observations.append({'call':call,'file':what,'key':key,'raw_offset':raw,'hangup':p.get('hangup')=='yes','timestamp':timestamp})
+            del observations[:-200]
+            event=(timestamp,what,key,raw,p.get('hangup',''))
+            if timestamp and event==s['last_event']:return response(s['last_response'])
+            offset=None
+            if raw not in ('','-1') and offset_unit_ms is not None:
+                try:
+                    offset=int(raw)*offset_unit_ms
+                    if not 0<=offset<=duration:offset=None
+                except ValueError:pass
+            if p.get('hangup')=='yes':
+                if offset is not None:checkpoints[(phone,'9')]={'file':files[index],'offset_ms':offset,'reason':'hangup'}
+                sessions.pop(call,None);return response('')
+            body='noop'
+            if timestamp:
+                target=index;position=0
+                if key in ('2','4'):target=max(0,min(2,index+(1 if key=='4' else -1)))
+                elif key in ('1','3') and offset is not None:
+                    absolute=max(0,min(3*duration,index*duration+offset+(10000 if key=='1' else -10000)))
+                    target=min(2,absolute//duration);position=absolute-target*duration
+                elif key=='' and raw=='-1':
+                    if index==2:body='go_to_folder=/'
+                    else:target=index+1
+                elif key in ('*','#'):
+                    if offset is not None:checkpoints[(phone,'9')]={'file':files[index],'offset_ms':offset,'reason':'exit'}
+                    body='go_to_folder=/'
+                else:return response('noop')
+                if body=='noop' and (key in ('2','4') or (key in ('1','3') and offset is not None) or (key=='' and raw=='-1')):
+                    body=f'go_to_folder_and_play=/9,{files[target]},{position}'
+                    s['index']=target
+                s['last_event']=event;s['last_response']=body
+            return response(body)
+    ns['app'].add_url_rule('/yemot-player-test9',endpoint='yemot_player_test9',view_func=route,methods=['GET','POST'])
+    return {'sessions':sessions,'checkpoints':checkpoints,'observations':observations}
