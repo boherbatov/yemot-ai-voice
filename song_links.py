@@ -769,6 +769,8 @@ def install_podcast_native_trial(ns):
         if not allowed(p):return 'forbidden',403
         call=p.get('ApiCallId');phone=p.get('ApiPhone','')
         if not call or not re.fullmatch(r'0\d{8,10}',phone):return 'invalid caller',400
+        if p.get('hangup')=='yes':
+            leave(call,ns['pod_jobs'].get(call,{}));marked.pop(call,None);ns['pod_jobs'].pop(call,None);return response('')
         with lock:
             if call not in marked and len(marked)>=100:return response('go_to_folder=/')
             marked[call]={'phone':phone,'time':time.monotonic(),'return':None}
