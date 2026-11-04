@@ -774,7 +774,9 @@ def install_podcast_native_trial(ns):
             marked[call]={'phone':phone,'time':time.monotonic(),'return':None}
         return response('go_to_folder=/3')
     def fetch(call,pod_idx,ep_idx,pod=None,episode_url=None,_captured=None):
-        if call not in marked:return original_fetch(call,pod_idx,ep_idx,pod,episode_url)
+        if call not in marked:
+            if _captured is not None:return
+            return original_fetch(call,pod_idx,ep_idx,pod,episode_url)
         job=ns['pod_jobs'].get(call)
         if not job:return
         if _captured is None:
