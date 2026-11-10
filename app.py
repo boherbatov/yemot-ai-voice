@@ -1,3 +1,4 @@
+from regular_isolation import owner as _call_work_owner, media_id as _call_media_id, check as _call_work_check
 import os, re, io, json, time, wave, asyncio, logging, threading, subprocess, shutil
 import requests
 import urllib.request
@@ -700,14 +701,19 @@ def yt_download_tv(video_id, outtmpl, allow_long=False):
     from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS
     # registered before the (slow) metadata call: cancel_yt_except covers every phase
     st = {'ev': threading.Event(), 'running': False}
-    _yt_active[video_id] = st
+    st['owner'] = _call_work_owner()
+    active_key = (st['owner'], video_id, id(st))
+    _yt_active[active_key] = st
     def hook(d):
+        _call_work_check()
         if st['ev'].is_set():
             raise YtCancelled('cancelled')
     try:
+        _call_work_check()
         if st['ev'].is_set():
             raise YtCancelled('cancelled')
         title, duration, status = yt_player(video_id)
+        _call_work_check()
         if st['ev'].is_set():
             raise YtCancelled('cancelled')   # cancelled during metadata: never start the download
         if status != 'OK':
@@ -739,12 +745,13 @@ def yt_download_tv(video_id, outtmpl, allow_long=False):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
     except Exception as e:
+        _call_work_check()
         if st['ev'].is_set():
             raise YtCancelled('cancelled') from None
         raise
     finally:
-        if _yt_active.get(video_id) is st:
-            _yt_active.pop(video_id, None)
+        if _yt_active.get(active_key) is st:
+            _yt_active.pop(active_key, None)
     return title, duration
 class SongTooLongError(ValueError):
     pass
@@ -777,19 +784,25 @@ def _kill_deno():
             except Exception:
                 pass
 
-def cancel_yt_except(keep_video_id):
-    """The caller picked keep_video_id: abort every other in-flight/queued YouTube download."""
-    for v, st in list(_yt_active.items()):
-        if v != keep_video_id and not st['ev'].is_set():
+def cancel_yt_except(keep_video_id, call_id=None):
+    """Cancel only downloads owned by this call; never another caller."""
+    call_id = call_id or _call_work_owner()
+    if not call_id:
+        return
+    for key, st in list(_yt_active.items()):
+        if st.get('owner') != call_id or key[1] == keep_video_id:
+            continue
+        if not st['ev'].is_set():
             st['ev'].set()
-            log.info('cancel speculative YouTube download %s (picked %s)', v, str(keep_video_id)[:14])
-            if st['running']:
-                _kill_deno()
+            # The progress hook aborts this owner. No process-wide solver kill.
 
 def _ytdlp_serial(yt_dlp, opts, video_id, gate=None, on_error=None):
     st = {'ev': threading.Event(), 'running': False}
-    _yt_active[video_id] = st
+    st['owner'] = _call_work_owner()
+    active_key = (st['owner'], video_id, id(st))
+    _yt_active[active_key] = st
     def hook(d):
+        _call_work_check()
         if st['ev'].is_set():
             raise YtCancelled('cancelled')
     opts = dict(opts, progress_hooks=list(opts.get('progress_hooks') or []) + [hook])
@@ -810,12 +823,13 @@ def _ytdlp_serial(yt_dlp, opts, video_id, gate=None, on_error=None):
                     on_error(e)   # inside the with: genuinely under the lock, before any waiter enters
                 raise
     except Exception as e:
+        _call_work_check()
         if st['ev'].is_set():
             raise YtCancelled('cancelled') from None
         raise
     finally:
-        if _yt_active.get(video_id) is st:
-            _yt_active.pop(video_id, None)
+        if _yt_active.get(active_key) is st:
+            _yt_active.pop(active_key, None)
 
 _YT_CB = {'fails': 0, 'open_until': 0.0, 'probe': None}   # probe: unique token while a half-open probe is in flight
 _YT_CB_LOCK = threading.Lock()
@@ -1388,7 +1402,7 @@ def play_chain(chain, var):
 
 def upload_reply(text, call_id, turn):
     wav = tts_wav(text)
-    name = f'T{call_id[-6:]}{turn}.wav'
+    name = f'T{_call_media_id(call_id)}{turn}.wav'
     ym_path = f'{EXT_DIR}/{name}'
     ym_upload(wav, name, ym_path)
     return name, ym_path
@@ -1774,7 +1788,7 @@ song_jobs = {}
 
 def slot_name(call_id, idx):
     """Alternating Yemot file slots so the next song can upload while this one plays."""
-    return ('song' if idx % 2 == 0 else 'next') + re.sub(r'\D', '', call_id)[-6:]
+    return ('song' if idx % 2 == 0 else 'next') + _call_media_id(call_id)
 
 class DiskLowError(RuntimeError):
     pass
@@ -2043,7 +2057,7 @@ def yt_stream_info(video_id):
 def _seg_name(call_id, idx, k):
     """Yemot file for segment k of the long item in slot idx; two alternating names per slot so segment
     k+1 can upload while k plays."""
-    return f'sg{idx % 2}{k % 2}' + re.sub(r'\D', '', call_id)[-6:]
+    return f'sg{idx % 2}{k % 2}' + _call_media_id(call_id)
 
 def _seg_src(plan, refresh=False):
     if plan['kind'] == 'gd':
@@ -2502,7 +2516,7 @@ def fetch_queue_song(call_id, idx):
                 raise ann_box.get('err') or RuntimeError('announcement TTS timed out')
             ann_wav = ann_box['wav']
         if ann_wav is not None:
-            ann = f'an{idx % 2}' + re.sub(r'\D', '', call_id)[-6:]
+            ann = f'an{idx % 2}' + _call_media_id(call_id)
             if job.get('link_list'):
                 job.setdefault('link_files', set()).add(ann)
             ym_delete(f'{SONG_DIR}/{ann}.wav')
@@ -2561,7 +2575,7 @@ def reuse_or_start_prefetch(call_id, idx):
         return
     key = f'slot{idx % 2}'
     vid = job['queue'][idx][0]
-    cancel_yt_except(str(vid))                    # a different pick aborts the speculative download at once
+    cancel_yt_except(str(vid), call_id)                    # a different pick aborts the speculative download at once
     st = job.get(f'{key}_status')
     if (job.get(f'{key}_want') == idx and job.get(f'{key}_vwant') == vid
             and (st in ('working', 'ready') or (st == 'error' and job.get(f'{key}_err') == 'too_long'))):
@@ -2590,7 +2604,7 @@ def speculative_prefetch(call_id, job, results, extras=True):
         log.info('speculative prefetch skipped: %s', str(e)[:100])
 
 def _pf_name(call_id, k):
-    return f'pf{k}' + re.sub(r'\D', '', call_id)[-6:]
+    return f'pf{k}' + _call_media_id(call_id)
 
 def _adopt_extra(call_id, job, idx, vid):
     """The picked song was pre-converted (or is being) as an extra: point the playing slot at its
@@ -2714,7 +2728,7 @@ def _tts_parts_wav(parts):
 def publish_result_pages(call_id, job, results, tag, intro_first, page_limit=None):
     """Page 1 is spoken as soon as it is uploaded (job ready); the other pages are built
     in parallel in the background and flagged in job['pages_ready'] / ['pages_failed']."""
-    cid = re.sub(r'\D', '', call_id)[-6:]
+    cid = _call_media_id(call_id)
     n = len(results) if page_limit is None else min(len(results), page_limit)
     starts = list(range(0, n, 5))
     names = [f'res{cid}{tag}{p // 5}' for p in starts]
@@ -2810,6 +2824,7 @@ def jamendo_download(tid, outpath):
         r.raise_for_status()
         with open(outpath, 'wb') as f:
             for chunk in r.iter_content(65536):
+                _call_work_check()
                 f.write(chunk)
     if os.path.getsize(outpath) < 2000:
         raise ValueError('jamendo audio too small')
@@ -2966,6 +2981,7 @@ def drive_download(fid, outpath):
             disk_guard(max(MIN_FREE_MB_DOWNLOAD, int(size * 2.3 / 1048576) + 5))   # file + its wav
             with open(outpath, 'wb') as f:
                 for chunk in r.iter_content(65536):
+                    _call_work_check()
                     f.write(chunk)
             break
     if os.path.getsize(outpath) < 2000:
@@ -3155,7 +3171,7 @@ def fetch_free_results(call_id, query):
         results = jamendo_search(query, limit=15)
         if not results:
             raise ValueError('no results')
-        cid = re.sub(r'\D', '', call_id)[-6:]
+        cid = _call_media_id(call_id)
         pages = []
         for p in range(0, len(results), 5):
             chunk = results[p:p + 5]
@@ -3183,7 +3199,7 @@ def fetch_general_results(call_id, query):
         results = yt_search_results(query, limit=15, relevant=False)
         if not results:
             raise ValueError('no results')
-        cid = re.sub(r'\D', '', call_id)[-6:]
+        cid = _call_media_id(call_id)
         pages = []
         for p in range(0, len(results), 5):
             chunk = results[p:p + 5]
@@ -5385,6 +5401,7 @@ def feed_enclosures(feed_url):
         # so the first chunk carries what a caller will ever pick.
         buf = b''
         for c in r.iter_content(1_048_576):
+            _call_work_check()
             buf += c
             if len(buf) >= 8_000_000:
                 break
@@ -5424,6 +5441,7 @@ def _pod_stream_parts(url, base):
             with requests.get(url, headers=POD_HEADERS, stream=True, timeout=(20, 45)) as r:
                 r.raise_for_status()
                 for c in r.iter_content(65536):
+                    _call_work_check()
                     proc.stdin.write(c)
         except Exception as e:
             errs.append(e)
@@ -5447,6 +5465,7 @@ def _pod_stream_parts(url, base):
         buf.clear()
     try:
         while True:
+            _call_work_check()
             d = proc.stdout.read(65536)
             if not d:
                 break
@@ -5490,6 +5509,7 @@ def fetch_pod(call_id, pod_idx, ep_idx, pod=None):
             base = 'pod' + safe_name(call_id)[-14:]
             try:
                 with _media_slots:
+                    _call_work_check()
                     names = _pod_stream_parts(url, base)
                 job.update(status='ready', name=names[0], names=names, ep=ep_idx)
                 log.info('pod ready (stream) call=%s %s ep %d parts=%d', call_id, pod['title'], ep_idx, len(names))
@@ -5501,6 +5521,7 @@ def fetch_pod(call_id, pod_idx, ep_idx, pod=None):
         # Stream the download to a file. The bundled ffmpeg does not support
         # HTTPS on every host, so only requests handles the network input.
         with _media_slots:
+            _call_work_check()
             _tmp_janitor_once()
             free = shutil.disk_usage('/tmp').free
             if free < 12 * 1048576:
@@ -5512,6 +5533,7 @@ def fetch_pod(call_id, pod_idx, ep_idx, pod=None):
                               stream=True, timeout=(20, 45)) as r:
                 r.raise_for_status()
                 for chunk in r.iter_content(65536):
+                    _call_work_check()
                     if len(source) + len(chunk) > 64 * 1048576:
                         raise RuntimeError('podcast source exceeds safe memory limit')
                     source.extend(chunk)
@@ -5709,7 +5731,7 @@ threading.Thread(target=curated_boot_check, daemon=True).start()
 
 def pod_pick_chain(call_id, found):
     """Upload per-option TTS prompts for a podcast results screen; return the f- chain."""
-    sfx = re.sub(r'\D', '', call_id)[-6:] or call_id[-6:]
+    sfx = _call_media_id(call_id) or call_id[-6:]
     names = []
     for i, it in enumerate(found, 1):
         try:
@@ -6051,7 +6073,7 @@ def yemot_wiki():
                 if typed:
                     return text_response(multitap_read('f-wiki_typehow', f'S{turn+1}'))
                 return text_response(f'read=f-didnt_hear=S{turn+1},no,record,{IN_DIR},,no')
-            sub = re.sub(r'\D', '', call_id)[-6:] or '1'
+            sub = _call_media_id(call_id) or '1'
             try:
                 titles = wiki_search_titles(text)
             except Exception as e:
@@ -6079,7 +6101,7 @@ def yemot_wiki():
                 return text_response(f'read=f-{rname}=S{turn+1},no,1,1,10,No,yes,,,,,,,,no')
             try: ym_delete(f'/4/{rname}.wav')
             except Exception: pass
-            sub = job.get('sub') or (re.sub(r'\D', '', call_id)[-6:] or '1')
+            sub = job.get('sub') or (_call_media_id(call_id) or '1')
             job.update(stage='wiki_wait', status='working', started=time.time(), sub=sub)
             threading.Thread(target=fetch_wiki, args=(call_id, titles[n - 1], sub), daemon=True).start()
             return text_response(play_chain('f-wiki_searching', f'S{turn+1}'))
@@ -6784,6 +6806,8 @@ threading.Thread(target=_yt_prewarm, daemon=True).start()
 
 from song_links import install as install_song_links
 install_song_links(globals())
+from regular_isolation import install as install_regular_isolation
+install_regular_isolation(globals())
 if os.environ.get('ENABLE_ADMIN_SONG_LINKS', '0') == '1':
     ROOT_MENU_TEXT += ' לניהול רשימות השירים החדשות, הקישו 5.'
 
