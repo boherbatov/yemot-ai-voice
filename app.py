@@ -3398,8 +3398,7 @@ def dedupe_by_title(results):
     """Same song from two sources (Drive copy + YouTube etc.): keep the first, in source order."""
     seen, out = set(), []
     for vid, title in results:
-        key = _gd_norm(re.sub(r'\s*-\s*[^-]*$', '', title or '') if ' - ' in (title or '') else (title or ''))
-        key = re.sub(r'\.(mp3|m4a|wav|mp4)$', '', key)
+        key = _gd_norm(re.sub(r'\.(mp3|m4a|wav|mp4)$', '', str(title or '').strip(), flags=re.I))
         if key and key in seen:
             continue
         seen.add(key)
